@@ -1,0 +1,8 @@
+[package]
+name = "rubix"
+version = "0.1.0"
+edition = "2024"
+description = "A Wayland compositor with a Rubik's-cube spatial model"
+license = "MIT"
+
+[dependencies]

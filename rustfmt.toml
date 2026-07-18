@@ -1,0 +1,5 @@
+# Rubix formatting policy.
+# Stable-rustfmt options only — this project uses the Arch system Rust (no nightly),
+# so nightly-only niceties (imports_granularity, group_imports) are intentionally omitted.
+edition = "2024"
+max_width = 100
