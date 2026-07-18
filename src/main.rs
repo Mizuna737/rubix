@@ -1,6 +1,14 @@
+
+
+
+
+
+
 mod model;
 use model::tiling::{TilingNode, SplitDirection};
 use model::grid::{Group, Column, Monitor};
+use model::traits::{CountWindows};
+
 fn main() {
     let window_1 = TilingNode::Leaf {window_id: 1 };
     let window_2 = TilingNode::Leaf {window_id: 2 };
@@ -30,10 +38,10 @@ fn main() {
     let group_1 = Group {
         layout: split_3
     };
-    let window_5 = TilingNode::Leaf {window_id: 1 };
-    let window_6 = TilingNode::Leaf {window_id: 2 };
-    let window_7 = TilingNode::Leaf {window_id: 3 };
-    let window_8 = TilingNode::Leaf {window_id: 4 };
+    let window_5 = TilingNode::Leaf {window_id: 5 };
+    let window_6 = TilingNode::Leaf {window_id: 6 };
+    let window_7 = TilingNode::Leaf {window_id: 7 };
+    let window_8 = TilingNode::Leaf {window_id: 8 };
 
     let split_4 = TilingNode::Split {
         split_direction: SplitDirection::Horizontal,

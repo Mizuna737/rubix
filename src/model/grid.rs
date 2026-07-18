@@ -1,11 +1,11 @@
-use super::tiling::TilingNode;
-
+use super::tiling::{TilingNode};
+use super::traits::{CountWindows, sum_windows};
 pub struct Group {
     pub layout: TilingNode,
 }
 
-impl Group {
-    pub fn count_windows(&self) -> usize {
+impl CountWindows for Group {
+    fn count_windows(&self) -> usize {
         self.layout.count_windows()
     }
 }
@@ -17,7 +17,6 @@ pub struct Column {
 }
 
 impl Column {
-
     pub fn new(width: u32) -> Self {
         Column {
             width,
@@ -25,16 +24,16 @@ impl Column {
             groups: Vec::new(),
         }
     }
-
-    pub fn count_windows(&self) -> usize {
-        self.groups.iter().map(|g| g.count_windows()).sum()
-    }
-
-    pub fn add_group(&mut self, group_id: Group) -> () {
-        self.groups.push(group_id)
+    pub fn add_group(&mut self, group: Group) {
+        self.groups.push(group)
     }
 }
 
+impl CountWindows for Column {
+    fn count_windows(&self) -> usize {
+        sum_windows(&self.groups)
+    }
+}
 pub struct Monitor {
     id: u32,
     visible_columns: usize,
@@ -43,7 +42,6 @@ pub struct Monitor {
 }
 
 impl Monitor {
-
     pub fn new(id: u32, visible_columns: usize, viewport_offset: usize) -> Self {
         Monitor {
             id,
@@ -53,11 +51,13 @@ impl Monitor {
         }
     }
 
-    pub fn count_windows(&self) -> usize {
-        self.columns.iter().map(|c| c.count_windows()).sum()
+    pub fn add_column(&mut self, column: Column) {
+        self.columns.push(column)
     }
+}
 
-    pub fn add_column(&mut self, column_id: Column) -> () {
-        self.columns.push(column_id)
+impl CountWindows for Monitor {
+    fn count_windows(&self) -> usize {
+        sum_windows(&self.columns)
     }
 }
