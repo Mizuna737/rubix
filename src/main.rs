@@ -35,9 +35,7 @@ fn main() {
         right_child: Box::new(split_2)
     };
 
-    let group_1 = Group {
-        layout: split_3
-    };
+    let group_1 = Group::new(split_3);
     let window_5 = TilingNode::Leaf {window_id: 5 };
     let window_6 = TilingNode::Leaf {window_id: 6 };
     let window_7 = TilingNode::Leaf {window_id: 7 };
@@ -63,15 +61,13 @@ fn main() {
         right_child: Box::new(split_5)
     };
 
-    let group_2 = Group {
-        layout: split_6
-    };
+    let group_2 = Group::new(split_6);
     let mut column_1 = Column::new(50);
     
     column_1.add_group(group_1);
     column_1.add_group(group_2);
 
-    let mut monitor_1 = Monitor::new(1, 3, 0);
+    let mut monitor_1 = Monitor::new(1, 3);
     monitor_1.add_column(column_1);
 
     println!("windows: {}", monitor_1.count_windows());
