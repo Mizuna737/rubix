@@ -1,75 +1,60 @@
+#![allow(irrefutable_let_patterns)]
 
+mod handlers;
 
-
-
-
-
+mod grabs;
+mod input;
 mod model;
-use model::tiling::{TilingNode, SplitDirection};
-use model::grid::{Group, Column, Monitor};
-use model::traits::{CountWindows};
+mod state;
+mod winit;
 
-fn main() {
-    let window_1 = TilingNode::Leaf {window_id: 1 };
-    let window_2 = TilingNode::Leaf {window_id: 2 };
-    let window_3 = TilingNode::Leaf {window_id: 3 };
-    let window_4 = TilingNode::Leaf {window_id: 4 };
+use smithay::reexports::{
+    calloop::EventLoop,
+    wayland_server::{Display, DisplayHandle},
+};
+pub use state::RubixState;
 
-    let split_1 = TilingNode::Split {
-        split_direction: SplitDirection::Horizontal,
-        split_ratio: 0.3,
-        left_child: Box::new(window_1),
-        right_child: Box::new(window_2)
-    };
-    let split_2 = TilingNode::Split {
-        split_direction: SplitDirection::Vertical,
-        split_ratio: 0.2,
-        left_child: Box::new(window_3),
-        right_child: Box::new(window_4)
-    };
-    
-    let split_3 = TilingNode::Split {
-        split_direction: SplitDirection::Vertical,
-        split_ratio: 0.5,
-        left_child: Box::new(split_1),
-        right_child: Box::new(split_2)
-    };
+pub struct CalloopData {
+    state: RubixState,
+    display_handle: DisplayHandle,
+}
 
-    let group_1 = Group::new(split_3);
-    let window_5 = TilingNode::Leaf {window_id: 5 };
-    let window_6 = TilingNode::Leaf {window_id: 6 };
-    let window_7 = TilingNode::Leaf {window_id: 7 };
-    let window_8 = TilingNode::Leaf {window_id: 8 };
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    } else {
+        tracing_subscriber::fmt().init();
+    }
 
-    let split_4 = TilingNode::Split {
-        split_direction: SplitDirection::Horizontal,
-        split_ratio: 0.3,
-        left_child: Box::new(window_5),
-        right_child: Box::new(window_6)
-    };
-    let split_5 = TilingNode::Split {
-        split_direction: SplitDirection::Vertical,
-        split_ratio: 0.2,
-        left_child: Box::new(window_7),
-        right_child: Box::new(window_8)
-    };
-    
-    let split_6 = TilingNode::Split {
-        split_direction: SplitDirection::Vertical,
-        split_ratio: 0.5,
-        left_child: Box::new(split_4),
-        right_child: Box::new(split_5)
+    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+
+    let display: Display<RubixState> = Display::new()?;
+    let display_handle = display.handle();
+    let state = RubixState::new(&mut event_loop, display);
+
+    let mut data = CalloopData {
+        state,
+        display_handle,
     };
 
-    let group_2 = Group::new(split_6);
-    let mut column_1 = Column::new(50);
-    
-    column_1.add_group(group_1);
-    column_1.add_group(group_2);
+    crate::winit::init_winit(&mut event_loop, &mut data)?;
 
-    let mut monitor_1 = Monitor::new(1, 3);
-    monitor_1.add_column(column_1);
+    let mut args = std::env::args().skip(1);
+    let flag = args.next();
+    let arg = args.next();
 
-    println!("windows: {}", monitor_1.count_windows());
+    match (flag.as_deref(), arg) {
+        (Some("-c") | Some("--command"), Some(command)) => {
+            std::process::Command::new(command).spawn().ok();
+        }
+        _ => {
+            std::process::Command::new("alacritty").spawn().ok();
+        }
+    }
 
+    event_loop.run(None, &mut data, move |_| {
+        // RubixState is running
+    })?;
+
+    Ok(())
 }
