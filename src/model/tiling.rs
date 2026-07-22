@@ -1,5 +1,6 @@
 use super::traits::{CountWindows};
 
+#[derive(Clone,Copy)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,

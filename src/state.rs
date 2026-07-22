@@ -25,8 +25,8 @@ use smithay::{
 use crate::{
     config::Config,
     model::{
-        geometry::{compute_layout, Rect},
-        grid::Group,
+        geometry::Rect,
+        grid::{Column, Group, Monitor},
     },
     CalloopData,
 };
@@ -43,10 +43,10 @@ pub struct RubixState {
     pub config: Config,
 
     // Rubix model + translation registry.
-    // `group` is the pure tiling model; `windows` maps its synthetic u32 ids to
-    // the live Smithay handles; `next_id` mints those ids (starts at 1 -- 0 is
-    // TilingNode::remove_window's transient placeholder, never a real window).
-    pub group: Group,
+    // `monitor` is the pure tiling model (fixed column slots); `windows` maps its
+    // synthetic u32 ids to live Smithay handles; `next_id` mints those ids (starts
+    // at 1 -- 0 is TilingNode::remove_window's transient placeholder, never real).
+    pub monitor: Monitor,
     pub windows: HashMap<u32, Window>,
     pub next_id: u32,
 
@@ -99,6 +99,20 @@ impl RubixState {
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
 
+        // Seed the monitor with exactly visible_columns column slots so the
+        // active-column cursor (rem_euclid(visible_columns)) always indexes a real
+        // column. Columns are fixed slots -- never removed below this floor. Each
+        // slot carries one empty-layout placeholder group so `groups[active_row]`
+        // is always valid (rotate_columns swaps it; the layout walk renders a
+        // `layout: None` group as a blank band). The 0 width is a placeholder; the
+        // walk derives band width from output geometry.
+        let mut monitor = Monitor::new(0, config.visible_columns);
+        for _ in 0..config.visible_columns {
+            let mut column = Column::new(0);
+            column.add_group(Group { layout: None });
+            monitor.add_column(column);
+        }
+
         Self {
             start_time,
             display_handle: dh,
@@ -109,7 +123,7 @@ impl RubixState {
 
             config,
 
-            group: Group { layout: None },
+            monitor,
             windows: HashMap::new(),
             next_id: 1,
 
@@ -201,13 +215,10 @@ impl RubixState {
             height: output_geo.size.h.max(0) as u32,
         };
 
-        // Borrow the tree only long enough to compute; `placements` is owned, so
-        // the immutable borrow of `self.group` is released before we touch
+        // Borrow the model only long enough to compute; `placements` is owned, so
+        // the immutable borrow of `self.monitor` is released before we touch
         // `self.space` / `self.windows` mutably below.
-        let Some(root) = self.group.layout.as_ref() else {
-            return;
-        };
-        let placements = compute_layout(root, bounds);
+        let placements = self.monitor.compute_layout(bounds);
 
         for (id, rect) in placements {
             let Some(window) = self.windows.get(&id).cloned() else {

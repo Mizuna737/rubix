@@ -51,7 +51,7 @@ impl XdgShellHandler for RubixState {
                 .find(|(_, w)| w.toplevel().unwrap().wl_surface() == &surface)
                 .map(|(id, _)| *id)
         });
-        self.group.add_window(SplitDirection::Horizontal, id, focused_id.unwrap_or(0));
+        self.monitor.add_window(SplitDirection::Horizontal, id, focused_id.unwrap_or(0));
         self.apply_layout();
     }
 
@@ -66,7 +66,7 @@ impl XdgShellHandler for RubixState {
             .map(|(id, _)| *id);
 
         if let Some(id) = destroyed_id {
-            self.group.remove_window(id);
+            self.monitor.remove_window(id);
             self.windows.remove(&id);
             self.apply_layout();
         }

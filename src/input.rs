@@ -180,6 +180,13 @@ impl RubixState {
     /// confirms the chord reached us (and never reached the client). Steps 2-3
     /// promote the model to a Monitor and wire scroll/rotate/move here.
     fn dispatch_nav(&mut self, action: NavAction) {
-        tracing::info!(?action, "nav chord intercepted");
+        match action {
+            NavAction::RotateColumnsLeft => self.monitor.rotate_columns(-1),
+            NavAction::RotateColumnsRight => self.monitor.rotate_columns(1),
+            NavAction::ScrollColumnUp => self.monitor.scroll_active_column(-1),
+            NavAction::ScrollColumnDown => self.monitor.scroll_active_column(1),
+            NavAction:: MoveToNewColumn => { /* TODO: move focus to a new column */ }
+        }
+        self.apply_layout();
     }
 }

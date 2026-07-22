@@ -1,5 +1,6 @@
 use super::tiling::{TilingNode, SplitDirection, RemoveResult};
 use super::traits::{CountWindows, sum_windows};
+use super::geometry::{compute_layout, Rect};
 pub struct Group {
     pub layout: Option<TilingNode>,
 }
@@ -40,6 +41,21 @@ impl Group {
                 self.layout = Some(TilingNode::new(window_id));
             },
         };
+    }
+    pub fn try_add_window(&mut self, direction: SplitDirection, window_id: u32, focused_id: u32) -> bool {
+        match &mut self.layout {
+            Some(root_node) => {
+                let focused_node = root_node.find_window_mut(focused_id);
+                match focused_node {
+                    Some(focused_node) => {
+                        TilingNode::split_window(focused_node,direction,window_id);
+                        true
+                    },
+                    None => false
+                }
+            },
+            None => false
+        }
     }
 }
 
@@ -85,6 +101,7 @@ impl CountWindows for Column {
 pub struct Monitor {
     id: u32,
     visible_columns: usize,
+    active_column: usize,
     columns: Vec<Column>
 }
 
@@ -93,6 +110,7 @@ impl Monitor {
         Monitor {
             id,
             visible_columns,
+            active_column: 0,
             columns: Vec::new(),
         }
     }
@@ -101,7 +119,7 @@ impl Monitor {
         self.columns.push(column)
     }
 
-    fn rotate_columns(&mut self, motion: isize) { // Positive motion rotates right, negative
+    pub fn rotate_columns(&mut self, motion: isize) { // Positive motion rotates right, negative
                                                   // rotates left.
         let k = motion.rem_euclid(self.columns.len() as isize);
         for _i in 0..k {
@@ -112,6 +130,86 @@ impl Monitor {
                std::mem::swap(&mut column_a[0].groups[active_row_a],&mut column_b[0].groups[active_row_b]);
            }
         }
+    }
+
+    pub fn move_active_column(&mut self, motion: isize) {
+        let signed_active_column = self.active_column as isize;
+        self.active_column = (signed_active_column + motion).rem_euclid(self.visible_columns as isize) as usize
+    }
+    pub fn scroll_active_column(&mut self, motion: isize) {
+        let column = &mut self.columns[self.active_column];
+        if !column.groups.is_empty() { column.scroll_column(motion)};
+    }
+    /// The group new windows land in: the active column's active group. Seeds one
+    /// empty group in the active column if it has none yet (mirrors Group::add_window
+    /// seeding its root leaf on first insert). Relies on the startup invariant that
+    /// active_column always indexes a real column.
+    pub fn active_group_mut(&mut self) -> &mut Group {
+        let column = &mut self.columns[self.active_column];
+        if column.groups.is_empty() {
+            column.groups.push(Group { layout: None });
+            column.active_row = 0;
+        }
+        &mut column.groups[column.active_row]
+    }
+
+    /// Evict a window from wherever it lives, searching every column's every group.
+    /// Returns Removed on the first hit, NotFound if the id isn't present anywhere.
+    /// TODO(max): does NOT prune a group that becomes empty -- empty-row pruning is
+    /// a row-policy call that belongs to the scroll/row model.
+    pub fn remove_window(&mut self, window_id: u32) -> RemoveResult {
+        for column in &mut self.columns {
+            for group in &mut column.groups {
+                if matches!(group.remove_window(window_id), RemoveResult::Removed) {
+                    return RemoveResult::Removed;
+                }
+            }
+        }
+        RemoveResult::NotFound
+    }
+
+    pub fn add_window(&mut self, direction: SplitDirection, id: u32, focused_id: u32) {
+        for column in &mut self.columns {
+            for group in &mut column.groups {
+                if group.try_add_window(direction, id, focused_id) { return; }
+            }
+        }
+        self.active_group_mut().add_window(direction,id,focused_id);
+    }
+
+    /// STUB -- the Monitor layout walk. Returns empty for now, so nothing tiles.
+    /// TODO(max): Piece 3. Slice `bounds.width` into `visible_columns` equal bands
+    /// left-to-right; for each visible column render its active group
+    /// (`groups[active_row]`) via the free `compute_layout(tree, band_rect)`;
+    /// concatenate the resulting Vec<(u32, Rect)> into one. An empty column, or a
+    /// column whose active group has `layout: None`, reserves its band as blank
+    /// space (do NOT collapse -- fixed-slot model). Band pixel width derives from
+    /// `bounds` here; the stored Column.width field is unused for now.
+    pub fn compute_layout(&self, bounds: Rect) -> Vec<(u32, Rect)> {
+        let column_width = (bounds.width / self.visible_columns as u32) as usize;
+        let columns = self.columns.iter().enumerate().take(self.visible_columns);
+        let mut monitor_vec = Vec::new();
+        for (i, c) in columns {
+            match c.groups.get(c.active_row) {
+                None => (),
+                Some(group) => {
+                    match &group.layout {
+                        None => (),
+                        Some(layout) => {
+                            let column_bounds = Rect {
+                                x: bounds.x + (i * column_width) as u32,
+                                y: bounds.y,
+                                width: column_width as u32,
+                                height: bounds.height,
+                            };
+                            let column_vec = compute_layout(layout, column_bounds);
+                            monitor_vec.extend(column_vec);
+                        }
+                    }
+                }
+            }
+        }
+        monitor_vec
     }
 }
 
