@@ -1,4 +1,4 @@
-use std::{ffi::OsString, sync::Arc};
+use std::{collections::HashMap, ffi::OsString, sync::Arc};
 
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
@@ -22,7 +22,13 @@ use smithay::{
     },
 };
 
-use crate::CalloopData;
+use crate::{
+    model::{
+        geometry::{compute_layout, Rect},
+        grid::Group,
+    },
+    CalloopData,
+};
 
 pub struct RubixState {
     pub start_time: std::time::Instant,
@@ -31,6 +37,14 @@ pub struct RubixState {
 
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
+
+    // Rubix model + translation registry.
+    // `group` is the pure tiling model; `windows` maps its synthetic u32 ids to
+    // the live Smithay handles; `next_id` mints those ids (starts at 1 -- 0 is
+    // TilingNode::remove_window's transient placeholder, never a real window).
+    pub group: Group,
+    pub windows: HashMap<u32, Window>,
+    pub next_id: u32,
 
     // Smithay State
     pub compositor_state: CompositorState,
@@ -88,6 +102,10 @@ impl RubixState {
             space,
             loop_signal,
             socket_name,
+
+            group: Group { layout: None },
+            windows: HashMap::new(),
+            next_id: 1,
 
             compositor_state,
             xdg_shell_state,
@@ -148,6 +166,57 @@ impl RubixState {
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
         })
+    }
+
+    /// Mint the next synthetic window id. Monotonic, never reused within a run.
+    pub fn next_window_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Reconcile the model onto the Space. Runs the pure geometry pass over the
+    /// active group's tree, then for each computed rectangle pushes position
+    /// (via `map_element`) and size (via an xdg configure) onto the live window.
+    /// Idempotent -- call it after every model mutation; re-mapping a window at
+    /// an unchanged rect is a no-op and `send_pending_configure` only emits when
+    /// the pending size actually differs.
+    pub fn apply_layout(&mut self) {
+        let Some(output) = self.space.outputs().next().cloned() else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            return;
+        };
+        let bounds = Rect {
+            x: output_geo.loc.x.max(0) as u32,
+            y: output_geo.loc.y.max(0) as u32,
+            width: output_geo.size.w.max(0) as u32,
+            height: output_geo.size.h.max(0) as u32,
+        };
+
+        // Borrow the tree only long enough to compute; `placements` is owned, so
+        // the immutable borrow of `self.group` is released before we touch
+        // `self.space` / `self.windows` mutably below.
+        let Some(root) = self.group.layout.as_ref() else {
+            return;
+        };
+        let placements = compute_layout(root, bounds);
+
+        for (id, rect) in placements {
+            let Some(window) = self.windows.get(&id).cloned() else {
+                continue;
+            };
+
+            // Force the tiled size via a configure (same handshake as resize_grab).
+            let toplevel = window.toplevel().unwrap();
+            toplevel.with_pending_state(|state| {
+                state.size = Some((rect.width as i32, rect.height as i32).into());
+            });
+            toplevel.send_pending_configure();
+
+            self.space.map_element(window, (rect.x as i32, rect.y as i32), false);
+        }
     }
 }
 

@@ -2,10 +2,10 @@ use super::tiling::{TilingNode, SplitDirection};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub fn compute_layout(node: &TilingNode, bounds: Rect) -> Vec<(u32, Rect)> {

@@ -24,6 +24,7 @@ use smithay::{
 
 use crate::{
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
+    model::tiling::SplitDirection,
     RubixState,
 };
 
@@ -33,8 +34,42 @@ impl XdgShellHandler for RubixState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Register the window, then insert it into the model. It is not mapped
+        // here -- apply_layout maps it once the model knows where it goes.
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), false);
+        let id = self.next_window_id();
+        self.windows.insert(id, window);
+
+        // Split the currently-focused window (via seat keyboard focus, reverse
+        // -looked-up to its id); an unfocused/empty case falls through to 0,
+        // which add_window treats as "no target" (seeds the root if empty).
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let focus = keyboard.current_focus();
+        let focused_id = focus.and_then(|surface| {
+            self.windows
+                .iter()
+                .find(|(_, w)| w.toplevel().unwrap().wl_surface() == &surface)
+                .map(|(id, _)| *id)
+        });
+        self.group.add_window(SplitDirection::Horizontal, id, focused_id.unwrap_or(0));
+        self.apply_layout();
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Reverse-lookup the destroyed surface's id, then evict it from both the
+        // model and the registry and re-tile. Skips cleanly if the window was
+        // never tracked (nothing to remove).
+        let destroyed_id = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.toplevel().unwrap().wl_surface() == surface.wl_surface())
+            .map(|(id, _)| *id);
+
+        if let Some(id) = destroyed_id {
+            self.group.remove_window(id);
+            self.windows.remove(&id);
+            self.apply_layout();
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

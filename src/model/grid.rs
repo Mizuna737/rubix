@@ -1,4 +1,4 @@
-use super::tiling::{TilingNode, RemoveResult};
+use super::tiling::{TilingNode, SplitDirection, RemoveResult};
 use super::traits::{CountWindows, sum_windows};
 pub struct Group {
     pub layout: Option<TilingNode>,
@@ -24,6 +24,22 @@ impl Group {
                 RemoveResult::Removed
             }
         }
+    }
+    pub fn add_window(&mut self, direction: SplitDirection, window_id: u32, focused_id: u32) {
+        match &mut self.layout {
+            Some(root_node) => {
+                let focused_node = root_node.find_window_mut(focused_id);
+                match focused_node {
+                    None => (), // TODO: handle add_window in unfocused group. Currently leaks.
+                    Some(focused_node) => {
+                        TilingNode::split_window(focused_node, direction, window_id)
+                    }
+                }
+            },
+            None => {
+                self.layout = Some(TilingNode::new(window_id));
+            },
+        };
     }
 }
 
@@ -189,4 +205,63 @@ mod tests {
         assert_eq!(active_window(&mon.columns[1]), 3);
         assert_eq!(active_window(&mon.columns[2]), 1);
   }
+
+    // ---- add_window ----
+    fn empty_group() -> Group {
+        Group { layout: None }
+    }
+
+    // is `id` present anywhere in the group's tree?
+    fn has_window(g: &Group, id: u32) -> bool {
+        g.layout.as_ref().is_some_and(|n| n.find_window(id).is_some())
+    }
+
+    #[test]
+    fn add_to_empty_group_seeds_the_root_leaf() {
+        // First window into an empty group becomes the bare root. focused_id is
+        // irrelevant here (no tree to search), so a nonsense value must still work.
+        let mut g = empty_group();
+        g.add_window(SplitDirection::Horizontal, 1, 999);
+        assert!(g.layout.is_some());
+        assert_eq!(g.count_windows(), 1);
+        assert!(has_window(&g, 1));
+    }
+
+    #[test]
+    fn add_splits_the_focused_leaf() {
+        // group holding leaf(1); add 2 focused on 1 -> both present, count 2.
+        let mut g = leaf_group(1);
+        g.add_window(SplitDirection::Horizontal, 2, 1);
+        assert_eq!(g.count_windows(), 2);
+        assert!(has_window(&g, 1));
+        assert!(has_window(&g, 2));
+    }
+
+    #[test]
+    fn add_splits_the_focused_leaf_deep_in_the_tree() {
+        // split(1, 2); add 3 focused on 2 -> split(1, split(2, 3)). The unfocused
+        // sibling (window 1) must be left structurally untouched at the root's left.
+        let mut g = split_group(1, 2);
+        g.add_window(SplitDirection::Horizontal, 3, 2);
+        assert_eq!(g.count_windows(), 3);
+        assert!(has_window(&g, 3));
+        match g.layout.as_ref().unwrap() {
+            TilingNode::Split { left_child, .. } => {
+                assert!(matches!(**left_child, TilingNode::Leaf { window_id: 1 }));
+            }
+            _ => panic!("root should still be a split"),
+        }
+    }
+
+    #[test]
+    fn add_with_an_unfocused_target_is_dropped() {
+        // focused_id isn't in this group's tree -> the None arm fires and the new
+        // window is silently dropped. Documents the known leak (see the TODO on
+        // add_window); update this test when that branch learns to place it.
+        let mut g = leaf_group(1);
+        g.add_window(SplitDirection::Horizontal, 2, 99);
+        assert_eq!(g.count_windows(), 1);
+        assert!(has_window(&g, 1));
+        assert!(!has_window(&g, 2));
+    }
 }

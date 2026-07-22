@@ -16,6 +16,9 @@ pub enum RemoveResult {
     NotFound,
 }
 impl TilingNode {
+    pub fn new(id: u32) -> Self {
+        TilingNode::Leaf { window_id: id }
+    }
     pub fn change_split_ratio(&mut self, value: f32) {
         match self {
             TilingNode::Leaf { .. } => (),
@@ -86,11 +89,7 @@ impl TilingNode {
             }
         }
     }
-
     pub fn remove_window(&mut self, target_id: u32) -> RemoveResult {
-
-
-
         match self {
             TilingNode::Leaf { window_id } => {
                 if *window_id == target_id {
