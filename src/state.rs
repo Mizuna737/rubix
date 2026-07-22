@@ -23,6 +23,7 @@ use smithay::{
 };
 
 use crate::{
+    config::Config,
     model::{
         geometry::{compute_layout, Rect},
         grid::Group,
@@ -37,6 +38,9 @@ pub struct RubixState {
 
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
+
+    // User configuration (keybinds + layout), resolved at startup.
+    pub config: Config,
 
     // Rubix model + translation registry.
     // `group` is the pure tiling model; `windows` maps its synthetic u32 ids to
@@ -59,7 +63,7 @@ pub struct RubixState {
 }
 
 impl RubixState {
-    pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>) -> Self {
+    pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>, config: Config) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
@@ -102,6 +106,8 @@ impl RubixState {
             space,
             loop_signal,
             socket_name,
+
+            config,
 
             group: Group { layout: None },
             windows: HashMap::new(),

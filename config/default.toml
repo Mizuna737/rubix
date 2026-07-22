@@ -1,0 +1,20 @@
+# Rubix default configuration.
+# Copy to $XDG_CONFIG_HOME/rubix/config.toml (or ~/.config/rubix/config.toml) to override.
+
+[layout]
+# Number of columns instantiated on the monitor at startup.
+# Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.
+visible_columns = 3
+
+# Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
+# variant name -- serde deserializes it straight into the enum, so there is no
+# translation table in code. Chord syntax: modifier tokens (Super/Alt/Ctrl/Shift,
+# case-insensitive) joined with '+', ending in an xkb keysym name ("Return", "h").
+# Alt-based defaults so the binds survive nested testing under a host WM that
+# grabs Super; switch to Super for a real TTY session.
+[keybinds]
+"Alt+h" = "RotateColumnsLeft"
+"Alt+l" = "RotateColumnsRight"
+"Alt+j" = "ScrollColumnDown"
+"Alt+k" = "ScrollColumnUp"
+"Alt+Return" = "MoveToNewColumn"

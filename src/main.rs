@@ -2,6 +2,7 @@
 
 mod handlers;
 
+mod config;
 mod grabs;
 mod input;
 mod model;
@@ -30,7 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let display: Display<RubixState> = Display::new()?;
     let display_handle = display.handle();
-    let state = RubixState::new(&mut event_loop, display);
+    let config = crate::config::Config::load();
+    let state = RubixState::new(&mut event_loop, display, config);
 
     let mut data = CalloopData {
         state,

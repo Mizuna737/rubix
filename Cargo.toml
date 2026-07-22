@@ -7,5 +7,8 @@ license = "MIT"
 
 [dependencies]
 bitflags = "2"
+serde = { version = "1", features = ["derive"] }
 smithay = { version = "0.7", default-features = false, features = ["backend_winit", "backend_egl", "renderer_gl", "wayland_frontend", "desktop"] }
+toml = "0.8"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
