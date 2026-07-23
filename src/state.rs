@@ -188,6 +188,30 @@ impl RubixState {
         })
     }
 
+    /// Hot-reload keybinds from the user config file. Only the keybind set is
+    /// swapped; `visible_columns` is structural (it seeds the monitor's fixed
+    /// column slots at startup), so a live change is logged and ignored until a
+    /// restart. On a parse failure `Config::reload` returns `None` and the
+    /// current binds stay in place (keep-last-good). The swap is live on the
+    /// next keypress -- `process_input_event` reads `config.keybinds` fresh each
+    /// time, so no re-registration is needed.
+    pub fn reload_config(&mut self) {
+        let Some(new) = Config::reload() else {
+            return;
+        };
+        if new.visible_columns != self.config.visible_columns {
+            tracing::info!(
+                "config visible_columns {} -> {} needs a restart to take effect; keeping {}",
+                self.config.visible_columns,
+                new.visible_columns,
+                self.config.visible_columns,
+            );
+        }
+        let count = new.keybinds.len();
+        self.config.keybinds = new.keybinds;
+        tracing::info!("reloaded config: {count} keybinds active");
+    }
+
     /// Mint the next synthetic window id. Monotonic, never reused within a run.
     pub fn next_window_id(&mut self) -> u32 {
         let id = self.next_id;

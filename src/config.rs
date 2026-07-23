@@ -89,10 +89,24 @@ impl Config {
             keybinds,
         }
     }
+
+    /// Re-read and resolve the *user* config from disk for hot-reload. Returns
+    /// `None` if the file is missing or fails to parse -- the caller keeps its
+    /// current config (keep-last-good), so a broken edit never disturbs the
+    /// running session. Distinct from [`load`](Self::load), which substitutes the
+    /// built-in default at startup: on reload we deliberately do *not* fall back
+    /// to default, preserving the last set of working binds.
+    pub fn reload() -> Option<Config> {
+        let text = std::fs::read_to_string(config_path()?).ok()?;
+        let raw: RawConfig = toml::from_str(&text)
+            .map_err(|e| tracing::warn!("config reload failed to parse ({e}); keeping current config"))
+            .ok()?;
+        Some(Config::resolve(raw))
+    }
 }
 
 /// `$XDG_CONFIG_HOME/rubix/config.toml`, falling back to `~/.config/rubix/config.toml`.
-fn config_path() -> Option<PathBuf> {
+pub fn config_path() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return Some(PathBuf::from(xdg).join("rubix/config.toml"));
@@ -101,6 +115,41 @@ fn config_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|home| PathBuf::from(home).join(".config/rubix/config.toml"))
+}
+
+/// Directory + filename to hand the file watcher. We watch the *parent dir*
+/// (not the file) so a save survives an editor's atomic rename -- a direct file
+/// watch goes deaf once the inode is swapped. The path is canonicalized so a
+/// stow symlink is followed to the real file under the dotfiles repo (watching
+/// the symlink's own dir would miss writes to the target). Returns `None` when
+/// there's no user config and no dir to watch -- the compiled-in default can't
+/// be hot-reloaded, so there is simply nothing to watch.
+pub fn config_watch_target() -> Option<(PathBuf, std::ffi::OsString)> {
+    let path = config_path()?;
+    // File present: canonicalize it, watch the real inode's parent dir.
+    if let Ok(real) = path.canonicalize() {
+        return Some((real.parent()?.to_path_buf(), real.file_name()?.to_os_string()));
+    }
+    // File absent: watch the (canonicalized) parent dir so a later create fires.
+    let dir = path.parent()?.canonicalize().ok()?;
+    Some((dir, path.file_name()?.to_os_string()))
+}
+
+/// True when a filesystem event warrants a config reload: it names the config
+/// file and is a content or create change. Bare metadata touches are filtered
+/// out -- our own read bumps the file's access time, and reacting to that would
+/// feed back into an endless reload loop (self-limiting under `relatime`, but
+/// cheap to rule out regardless).
+pub fn should_reload(event: &calloop_notify::notify::Event, file_name: &std::ffi::OsStr) -> bool {
+    use calloop_notify::notify::event::{EventKind, ModifyKind};
+
+    let touches = event.paths.iter().any(|p| p.file_name() == Some(file_name));
+    let is_write = match &event.kind {
+        EventKind::Create(_) => true,
+        EventKind::Modify(kind) => !matches!(kind, ModifyKind::Metadata(_)),
+        _ => false,
+    };
+    touches && is_write
 }
 
 /// Parse a chord like `"Alt+Return"` into a resolved [`Keybind`]. Modifier tokens
@@ -165,5 +214,43 @@ mod tests {
     #[test]
     fn unknown_key_drops_the_bind() {
         assert!(parse_chord("Alt+Nonsense", NavAction::MoveToNewColumn).is_none());
+    }
+
+    // ---- hot-reload event filtering ----
+
+    use calloop_notify::notify::{
+        event::{CreateKind, DataChange, EventKind, MetadataKind, ModifyKind},
+        Event,
+    };
+    use std::ffi::OsStr;
+
+    fn event(kind: EventKind, path: &str) -> Event {
+        Event::new(kind).add_path(PathBuf::from(path))
+    }
+
+    #[test]
+    fn reload_fires_on_content_write_to_the_config() {
+        let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/config.toml");
+        assert!(should_reload(&e, OsStr::new("config.toml")));
+    }
+
+    #[test]
+    fn reload_fires_on_create_of_the_config() {
+        let e = event(EventKind::Create(CreateKind::File), "/cfg/config.toml");
+        assert!(should_reload(&e, OsStr::new("config.toml")));
+    }
+
+    // The atime-feedback guard: our own read bumps access time, surfacing as a
+    // metadata-only Modify. Reacting to it would loop, so it must be dropped.
+    #[test]
+    fn reload_ignores_bare_metadata_touch() {
+        let e = event(EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)), "/cfg/config.toml");
+        assert!(!should_reload(&e, OsStr::new("config.toml")));
+    }
+
+    #[test]
+    fn reload_ignores_events_for_other_files() {
+        let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/other.toml");
+        assert!(!should_reload(&e, OsStr::new("config.toml")));
     }
 }
