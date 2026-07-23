@@ -129,6 +129,15 @@ impl TilingNode {
             }
         }
     }
+
+    pub fn find_first_leaf_id(& self) -> u32 {
+        match self {
+            TilingNode::Leaf { window_id } => *window_id,
+            TilingNode::Split { left_child, .. } => {
+                left_child.find_first_leaf_id()
+            }
+        }
+    }
 }
 
 impl CountWindows for TilingNode {

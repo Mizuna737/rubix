@@ -118,6 +118,13 @@ impl Monitor {
         }
     }
 
+    pub fn active_window(&self) -> Option<u32> {
+        let column = self.columns.get(self.active_column)?;
+        let group = column.groups.get(column.active_row)?;
+
+        group.layout.as_ref().map(|node| node.find_first_leaf_id())
+    }
+
     pub fn add_column(&mut self, column: Column) {
         self.columns.push(column)
     }

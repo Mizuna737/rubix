@@ -183,6 +183,19 @@ impl RubixState {
     /// confirms the chord reached us (and never reached the client). Steps 2-3
     /// promote the model to a Monitor and wire scroll/rotate/move here.
     fn dispatch_nav(&mut self, action: NavAction) {
+        // Motion actions reposition the active column/group, so keyboard focus
+        // should follow to whatever now sits in the active slot. Spawn (its focus
+        // is a separate on-map concern) and the MoveToNewColumn stub do not.
+        let refocus = matches!(
+            action,
+            NavAction::RotateColumnsLeft
+                | NavAction::RotateColumnsRight
+                | NavAction::ScrollColumnUp
+                | NavAction::ScrollColumnDown
+                | NavAction::MoveActiveColumnLeft
+                | NavAction::MoveActiveColumnRight
+        );
+
         match action {
             NavAction::RotateColumnsLeft => self.monitor.rotate_columns(-1),
             NavAction::RotateColumnsRight => self.monitor.rotate_columns(1),
@@ -196,5 +209,42 @@ impl RubixState {
             }
         }
         self.apply_layout();
+        if refocus {
+            self.focus_active_window();
+        }
+    }
+
+    /// Move keyboard focus to the model's current active window, mirroring the
+    /// pointer-click focus path (raise + activate-toggle + set_focus). Derived
+    /// fresh from the model each call -- `active_window` walks active_column ->
+    /// active_row -> first leaf, so it always tracks the latest nav. A `None`
+    /// target (empty active band) clears focus; nav chords still work because
+    /// the input filter intercepts them regardless of who holds focus.
+    fn focus_active_window(&mut self) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let target = self
+            .monitor
+            .active_window()
+            .and_then(|id| self.windows.get(&id).cloned());
+
+        match target {
+            Some(window) => {
+                self.space.raise_element(&window, true);
+                let surface = window.toplevel().unwrap().wl_surface().clone();
+                self.space.elements().for_each(|w| {
+                    w.set_activated(w == &window);
+                    w.toplevel().unwrap().send_pending_configure();
+                });
+                keyboard.set_focus(self, Some(surface), serial);
+            }
+            None => {
+                self.space.elements().for_each(|w| {
+                    w.set_activated(false);
+                    w.toplevel().unwrap().send_pending_configure();
+                });
+                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            }
+        }
     }
 }
