@@ -20,4 +20,5 @@ visible_columns = 3
 "Alt+Return" = "MoveToNewColumn"
 "Alt+Shift+H" = "MoveActiveColumnLeft"
 "Alt+Shift+L" = "MoveActiveColumnRight"
+"Alt+n" = "NewGroup"
 "Alt+Shift+space" = { Spawn = "alacritty" }

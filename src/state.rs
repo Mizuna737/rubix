@@ -1,4 +1,8 @@
-use std::{collections::HashMap, ffi::OsString, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    sync::Arc,
+};
 
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
@@ -220,11 +224,12 @@ impl RubixState {
     }
 
     /// Reconcile the model onto the Space. Runs the pure geometry pass over the
-    /// active group's tree, then for each computed rectangle pushes position
-    /// (via `map_element`) and size (via an xdg configure) onto the live window.
-    /// Idempotent -- call it after every model mutation; re-mapping a window at
-    /// an unchanged rect is a no-op and `send_pending_configure` only emits when
-    /// the pending size actually differs.
+    /// active group's tree, unmaps any owned window that fell out of the visible
+    /// set (hiding scrolled-away or rotated-out groups), then for each computed
+    /// rectangle pushes position (via `map_element`) and size (via an xdg
+    /// configure) onto the live window. Idempotent -- call it after every model
+    /// mutation; re-mapping a window at an unchanged rect is a no-op and
+    /// `send_pending_configure` only emits when the pending size actually differs.
     pub fn apply_layout(&mut self) {
         let Some(output) = self.space.outputs().next().cloned() else {
             return;
@@ -243,6 +248,23 @@ impl RubixState {
         // the immutable borrow of `self.monitor` is released before we touch
         // `self.space` / `self.windows` mutably below.
         let placements = self.monitor.compute_layout(bounds);
+        let visible: HashSet<u32> = placements.iter().map(|(id, _)| *id).collect();
+
+        // Reconcile is subtractive as well as additive: any window we own that
+        // isn't in the current placement set -- a scrolled-away group's row, an
+        // off-screen column, a group rotated out of view -- must be unmapped so
+        // it leaves the viewport. `unmap_elem` only hides it (the client stays
+        // alive in `self.windows`); a later nav that brings its group back maps
+        // it again. Without this, stale groups linger on screen.
+        let stale: Vec<Window> = self
+            .windows
+            .iter()
+            .filter(|(id, _)| !visible.contains(id))
+            .map(|(_, window)| window.clone())
+            .collect();
+        for window in stale {
+            self.space.unmap_elem(&window);
+        }
 
         for (id, rect) in placements {
             let Some(window) = self.windows.get(&id).cloned() else {

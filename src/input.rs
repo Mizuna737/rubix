@@ -28,6 +28,7 @@ pub(crate) enum NavAction {
     MoveToNewColumn,    // promote the focused group into a new column
     MoveActiveColumnRight, // move the active_column pointer through the list of visible columns
     MoveActiveColumnLeft,  // without actually mutating the list.
+    NewGroup,           // insert a fresh empty group after the active one and make it active
     Spawn(String),                 // Spawn a new command.
 }
 
@@ -194,6 +195,7 @@ impl RubixState {
                 | NavAction::ScrollColumnDown
                 | NavAction::MoveActiveColumnLeft
                 | NavAction::MoveActiveColumnRight
+                | NavAction::NewGroup
         );
 
         match action {
@@ -204,6 +206,7 @@ impl RubixState {
             NavAction::MoveToNewColumn => { /* TODO: move focus to a new column */ },
             NavAction::MoveActiveColumnLeft => self.monitor.move_active_column(-1),
             NavAction::MoveActiveColumnRight => self.monitor.move_active_column(1),
+            NavAction::NewGroup => self.monitor.grow_active_column(),
             NavAction::Spawn(command) => {
                 std::process::Command::new("sh").arg("-c").arg(&command).spawn().ok();
             }
