@@ -31,7 +31,10 @@ impl Group {
             Some(root_node) => {
                 let focused_node = root_node.find_window_mut(focused_id);
                 match focused_node {
-                    None => (), // TODO: handle add_window in unfocused group. Currently leaks.
+                    None => {
+                        let first_leaf = root_node.find_first_leaf_mut();
+                        TilingNode::split_window(first_leaf,direction,window_id)
+                    },
                     Some(focused_node) => {
                         TilingNode::split_window(focused_node, direction, window_id)
                     }
@@ -352,14 +355,38 @@ mod tests {
     }
 
     #[test]
-    fn add_with_an_unfocused_target_is_dropped() {
-        // focused_id isn't in this group's tree -> the None arm fires and the new
-        // window is silently dropped. Documents the known leak (see the TODO on
-        // add_window); update this test when that branch learns to place it.
+    fn add_with_an_unfocused_target_splits_the_first_leaf() {
+        // focused_id isn't in this group's tree -> fall back to splitting the
+        // leftmost leaf rather than dropping. This is the old leak, now closed:
+        // group holds leaf(1); add 2 focused on a nonexistent 99 -> both present.
         let mut g = leaf_group(1);
         g.add_window(SplitDirection::Horizontal, 2, 99);
-        assert_eq!(g.count_windows(), 1);
+        assert_eq!(g.count_windows(), 2);
         assert!(has_window(&g, 1));
-        assert!(!has_window(&g, 2));
+        assert!(has_window(&g, 2));
+    }
+
+    #[test]
+    fn add_with_no_focus_targets_the_leftmost_leaf() {
+        // split(1, 2); spawn with no focus (id 0 is never a real window) -> the
+        // new window splits the leftmost leaf (1), giving split(split(1, 3), 2).
+        // The right sibling (2) must be left structurally untouched.
+        let mut g = split_group(1, 2);
+        g.add_window(SplitDirection::Horizontal, 3, 0);
+        assert_eq!(g.count_windows(), 3);
+        assert!(has_window(&g, 3));
+        match g.layout.as_ref().unwrap() {
+            TilingNode::Split { left_child, right_child, .. } => {
+                assert!(matches!(**right_child, TilingNode::Leaf { window_id: 2 }));
+                match &**left_child {
+                    TilingNode::Split { left_child: ll, right_child: lr, .. } => {
+                        assert!(matches!(**ll, TilingNode::Leaf { window_id: 1 }));
+                        assert!(matches!(**lr, TilingNode::Leaf { window_id: 3 }));
+                    }
+                    _ => panic!("left child should have become split(1, 3)"),
+                }
+            }
+            _ => panic!("root should be a split"),
+        }
     }
 }

@@ -121,6 +121,14 @@ impl TilingNode {
             }
         }
     }
+    pub fn find_first_leaf_mut(&mut self) -> &mut TilingNode {
+        match self {
+            TilingNode::Leaf { .. } => self,
+            TilingNode::Split { left_child, .. } => {
+                left_child.find_first_leaf_mut()
+            }
+        }
+    }
 }
 
 impl CountWindows for TilingNode {
@@ -217,6 +225,32 @@ mod tests {
     fn find_window_mut_misses_return_none() {
         let mut tree = split(leaf(1), leaf(2));
         assert!(tree.find_window_mut(3).is_none());
+    }
+
+    // ---- find_first_leaf_mut ----
+    #[test]
+    fn find_first_leaf_mut_on_a_bare_leaf_returns_that_leaf() {
+        let mut tree = leaf(5);
+        assert_eq!(leaf_id(tree.find_first_leaf_mut()), Some(5));
+    }
+
+    #[test]
+    fn find_first_leaf_mut_descends_left_regardless_of_ids() {
+        // split(split(9, 2), 3): leftmost leaf is 9, though it's the largest id.
+        // Resolution is positional (recurse left_child), never by value.
+        let mut tree = split(split(leaf(9), leaf(2)), leaf(3));
+        assert_eq!(leaf_id(tree.find_first_leaf_mut()), Some(9));
+    }
+
+    #[test]
+    fn find_first_leaf_mut_allows_mutation_through_the_reference() {
+        // the returned &mut is a live handle: rename the leftmost leaf, see it stick.
+        let mut tree = split(leaf(1), leaf(2));
+        match tree.find_first_leaf_mut() {
+            TilingNode::Leaf { window_id } => *window_id = 7,
+            _ => panic!("leftmost node should be a leaf"),
+        }
+        assert_eq!(split_leaf_ids(&tree), Some((7, 2)));
     }
 
     // ---- split_window ----

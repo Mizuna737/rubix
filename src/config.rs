@@ -152,7 +152,7 @@ mod tests {
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.visible_columns, 3);
         assert_eq!(cfg.keybinds.len(), bind_count, "a keybind was dropped during resolution");
-        assert_eq!(bind_count, 5);
+        assert_eq!(bind_count, 8);
     }
 
     #[test]

@@ -19,13 +19,16 @@ use crate::state::RubixState;
 /// is this variant's exact name -- serde deserializes it straight into the enum,
 /// so there is no chord-name translation table in code. The direction is baked
 /// into the variant name; the motion sign is derived once at the dispatch site.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) enum NavAction {
     ScrollColumnDown,   // scroll rows within the active column
     ScrollColumnUp,     //  "
     RotateColumnsRight, // rotate active groups across columns
     RotateColumnsLeft,  //  "
     MoveToNewColumn,    // promote the focused group into a new column
+    MoveActiveColumnRight, // move the active_column pointer through the list of visible columns
+    MoveActiveColumnLeft,  // without actually mutating the list.
+    Spawn(String),                 // Spawn a new command.
 }
 
 impl RubixState {
@@ -48,7 +51,7 @@ impl RubixState {
                     |state, mods, handle| {
                         let sym = handle.modified_sym().raw();
                         match state.config.keybinds.iter().find(|kb| kb.matches(mods, sym)) {
-                            Some(kb) => FilterResult::Intercept(kb.action),
+                            Some(kb) => FilterResult::Intercept(kb.action.clone()),
                             None => FilterResult::Forward,
                         }
                     },
@@ -185,7 +188,12 @@ impl RubixState {
             NavAction::RotateColumnsRight => self.monitor.rotate_columns(1),
             NavAction::ScrollColumnUp => self.monitor.scroll_active_column(-1),
             NavAction::ScrollColumnDown => self.monitor.scroll_active_column(1),
-            NavAction:: MoveToNewColumn => { /* TODO: move focus to a new column */ }
+            NavAction::MoveToNewColumn => { /* TODO: move focus to a new column */ },
+            NavAction::MoveActiveColumnLeft => self.monitor.move_active_column(-1),
+            NavAction::MoveActiveColumnRight => self.monitor.move_active_column(1),
+            NavAction::Spawn(command) => {
+                std::process::Command::new("sh").arg("-c").arg(&command).spawn().ok();
+            }
         }
         self.apply_layout();
     }
