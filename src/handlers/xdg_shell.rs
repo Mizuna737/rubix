@@ -26,12 +26,15 @@ use crate::{
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
     model::tiling::SplitDirection,
     RubixState,
+    model::geometry::Rect,
 };
 
 impl XdgShellHandler for RubixState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
+
+
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // Register the window, then insert it into the model. It is not mapped
@@ -43,15 +46,12 @@ impl XdgShellHandler for RubixState {
         // Split the currently-focused window (via seat keyboard focus, reverse
         // -looked-up to its id); an unfocused/empty case falls through to 0,
         // which add_window treats as "no target" (seeds the root if empty).
-        let keyboard = self.seat.get_keyboard().unwrap();
-        let focus = keyboard.current_focus();
-        let focused_id = focus.and_then(|surface| {
-            self.windows
-                .iter()
-                .find(|(_, w)| w.toplevel().unwrap().wl_surface() == &surface)
-                .map(|(id, _)| *id)
-        });
-        self.monitor.add_window(SplitDirection::Horizontal, id, focused_id.unwrap_or(0));
+        let focused_id = self.focused_window_id();
+        let direction = focused_id
+            .and_then(|fid| self.window_rect(fid))
+            .map(Rect::longer_axis)
+            .unwrap_or(SplitDirection::Horizontal);
+        self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
         self.apply_layout();
         tracing::info!(
             "new toplevel -> window {id} ({} tracked, {} mapped in space)",
@@ -76,6 +76,8 @@ impl XdgShellHandler for RubixState {
             self.apply_layout();
         }
     }
+
+
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         self.unconstrain_popup(&surface);
@@ -255,4 +257,28 @@ impl RubixState {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
     }
+    fn focused_window_id(& self) -> Option<u32> {
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let focus = keyboard.current_focus();
+        let focused_id = focus.and_then(|surface| {
+            self.windows
+                .iter()
+                .find(|(_, w)| w.toplevel().unwrap().wl_surface() == &surface)
+                .map(|(id, _)| *id)
+        });
+        focused_id
+    }
+
+    pub fn move_focused_window_to_new_column(&mut self) {
+        let Some(id) = self.focused_window_id() else { return };
+        self.monitor.move_window_to_new_column(id);
+        self.apply_layout();
+    }
+
+    pub fn flip_focused_parent_split_direction(&mut self) {
+        let Some(id) = self.focused_window_id() else { return };
+        self.monitor.flip_split_direction(id);
+        self.apply_layout();
+    }
+
 }

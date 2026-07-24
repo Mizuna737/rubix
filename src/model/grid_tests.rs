@@ -206,3 +206,33 @@
         assert!(has_window(&col.groups[1], 2), "the grown-from group stays at row 1");
         assert!(has_window(&col.groups[3], 3), "the row below shifted down, not overwritten");
     }
+
+    // ---- add_window threads the split direction through to the node ----
+    // Every add_window test above uses Horizontal and never inspects the axis,
+    // so a dropped or hardcoded direction here would go unnoticed. These pin it.
+    fn group_axis(g: &Group) -> Option<SplitDirection> {
+        match g.layout.as_ref()? {
+            TilingNode::Split { split_direction, .. } => Some(*split_direction),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn add_window_honors_a_vertical_split() {
+        // leaf(1) + add 2 focused on 1, Vertical -> the group's root becomes a
+        // Vertical split, proving the direction survives the grid->tiling hop.
+        let mut g = leaf_group(1);
+        g.add_window(SplitDirection::Vertical, 2, 1);
+        assert_eq!(g.count_windows(), 2);
+        assert!(matches!(group_axis(&g), Some(SplitDirection::Vertical)));
+    }
+
+    #[test]
+    fn seeding_an_empty_group_ignores_direction_and_makes_no_split() {
+        // The first window into an empty group is a bare leaf regardless of the
+        // requested direction -- nothing to split yet, so no axis applies.
+        let mut g = empty_group();
+        g.add_window(SplitDirection::Vertical, 1, 0);
+        assert!(matches!(g.layout.as_ref(), Some(TilingNode::Leaf { window_id: 1 })));
+        assert!(group_axis(&g).is_none());
+    }

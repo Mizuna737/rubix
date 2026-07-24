@@ -237,12 +237,12 @@ impl RubixState {
     /// configure) onto the live window. Idempotent -- call it after every model
     /// mutation; re-mapping a window at an unchanged rect is a no-op and
     /// `send_pending_configure` only emits when the pending size actually differs.
-    pub fn apply_layout(&mut self) {
+    fn output_bounds(&self) -> Option<Rect> {
         let Some(output) = self.space.outputs().next().cloned() else {
-            return;
+            return None;
         };
         let Some(output_geo) = self.space.output_geometry(&output) else {
-            return;
+            return None;
         };
         let bounds = Rect {
             x: output_geo.loc.x.max(0) as u32,
@@ -250,7 +250,20 @@ impl RubixState {
             width: output_geo.size.w.max(0) as u32,
             height: output_geo.size.h.max(0) as u32,
         };
+        Some(bounds)
+    }
+    
+    pub fn window_rect(&self, id: u32) -> Option<Rect> {
+        let bounds = self.output_bounds()?;
+        self.monitor
+            .compute_layout(bounds)
+            .into_iter()
+            .find(|(wid, _)| *wid == id)
+            .map(|(_, rect)| rect)
+    }
 
+    pub fn apply_layout(&mut self) {
+        let Some(bounds) = self.output_bounds() else { return };
         // Borrow the model only long enough to compute; `placements` is owned, so
         // the immutable borrow of `self.monitor` is released before we touch
         // `self.space` / `self.windows` mutably below.

@@ -20,7 +20,12 @@ visible_columns = 3
 "Alt+Return" = "MoveToNewColumn"
 "Alt+Shift+H" = "MoveActiveColumnLeft"
 "Alt+Shift+L" = "MoveActiveColumnRight"
+# Zoom the cube: more visible columns (narrower bands) / fewer (wider bands).
+"Alt+Shift+J" = "IncrementVisibleColumns"
+"Alt+Shift+K" = "DecrementVisibleColumns"
 "Alt+n" = "NewGroup"
+# Flip the focused window's parent split between horizontal and vertical.
+"Alt+r" = "FlipSplitDirection"
 "Alt+Shift+space" = { Spawn = "alacritty" }
 # Exit the compositor. On the TTY backend this is the only in-session quit (winit
 # also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.

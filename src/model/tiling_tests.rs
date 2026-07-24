@@ -207,3 +207,97 @@
         assert!(matches!(tree.remove_window(2), RemoveResult::NotFound));
         assert_eq!(leaf_id(&tree), Some(1));
     }
+
+    // ---- split direction is recorded, not hardcoded ----
+    // SplitDirection has no PartialEq, so read it out by copy and match on it.
+    fn split_axis(node: &TilingNode) -> Option<SplitDirection> {
+        match node {
+            TilingNode::Split { split_direction, .. } => Some(*split_direction),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn split_window_records_a_vertical_split() {
+        let mut node = leaf(1);
+        TilingNode::split_window(&mut node, SplitDirection::Vertical, 2);
+        assert!(matches!(split_axis(&node), Some(SplitDirection::Vertical)));
+    }
+
+    #[test]
+    fn split_window_records_a_horizontal_split() {
+        // Guards the other way: a hardcode to Vertical would fail this one.
+        let mut node = leaf(1);
+        TilingNode::split_window(&mut node, SplitDirection::Horizontal, 2);
+        assert!(matches!(split_axis(&node), Some(SplitDirection::Horizontal)));
+    }
+
+    #[test]
+    fn split_direction_is_per_node_not_global() {
+        // Root split(1, 2) is Horizontal (the `split` helper); then split leaf 2
+        // vertically. The root must stay Horizontal while the new inner node is
+        // Vertical -- proving direction lives on each Split, not one shared axis.
+        let mut tree = split(leaf(1), leaf(2));
+        {
+            let target = tree.find_window_mut(2).expect("window 2 exists");
+            TilingNode::split_window(target, SplitDirection::Vertical, 3);
+        }
+        assert!(matches!(split_axis(&tree), Some(SplitDirection::Horizontal)));
+        match &tree {
+            TilingNode::Split { right_child, .. } => {
+                assert!(matches!(split_axis(right_child), Some(SplitDirection::Vertical)));
+            }
+            _ => panic!("root should still be a split"),
+        }
+    }
+
+    // ---- SplitDirection::toggled ----
+    #[test]
+    fn toggled_swaps_the_axis_both_ways() {
+        assert!(matches!(SplitDirection::Horizontal.toggled(), SplitDirection::Vertical));
+        assert!(matches!(SplitDirection::Vertical.toggled(), SplitDirection::Horizontal));
+    }
+
+    // ---- flip_parent_split_direction ----
+    #[test]
+    fn flip_toggles_the_immediate_parents_axis_both_ways() {
+        // split(1, 2) is Horizontal; flipping a child flips that split, and
+        // flipping again returns it -- proving the toggle is actually stored.
+        let mut tree = split(leaf(1), leaf(2));
+        assert!(tree.flip_parent_split_direction(2));
+        assert!(matches!(split_axis(&tree), Some(SplitDirection::Vertical)));
+        assert!(tree.flip_parent_split_direction(1));
+        assert!(matches!(split_axis(&tree), Some(SplitDirection::Horizontal)));
+    }
+
+    #[test]
+    fn flip_touches_only_the_immediate_parent_not_ancestors() {
+        // split(1, split(2, 3)); both splits start Horizontal. Flipping window 2
+        // must flip ONLY the inner split (2's direct parent). The root -- an
+        // ancestor, not the parent -- stays Horizontal. This is the bubble-up bug.
+        let mut tree = split(leaf(1), split(leaf(2), leaf(3)));
+        assert!(tree.flip_parent_split_direction(2));
+        assert!(matches!(split_axis(&tree), Some(SplitDirection::Horizontal)), "root untouched");
+        match &tree {
+            TilingNode::Split { right_child, .. } => {
+                assert!(matches!(split_axis(right_child), Some(SplitDirection::Vertical)), "inner flipped");
+            }
+            _ => panic!("root should still be a split"),
+        }
+    }
+
+    #[test]
+    fn flip_on_a_lone_leaf_finds_it_but_changes_nothing() {
+        // "Found" contract: locating the window reports true even on a bare leaf.
+        // There's no parent split, so nothing flips -- the tree is left untouched.
+        let mut tree = leaf(1);
+        assert!(tree.flip_parent_split_direction(1)); // found
+        assert!(matches!(&tree, TilingNode::Leaf { window_id: 1 })); // but unchanged
+    }
+
+    #[test]
+    fn flip_a_missing_window_reports_false_and_changes_nothing() {
+        let mut tree = split(leaf(1), leaf(2));
+        assert!(!tree.flip_parent_split_direction(99));
+        assert!(matches!(split_axis(&tree), Some(SplitDirection::Horizontal)));
+    }

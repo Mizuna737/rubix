@@ -28,12 +28,15 @@ pub(crate) enum NavAction {
     ScrollColumnUp,     //  "
     RotateColumnsRight, // rotate active groups across columns
     RotateColumnsLeft,  //  "
-    MoveToNewColumn,    // promote the focused group into a new column
+    MoveToNewColumn,    // Promote the focused window into a new column
     MoveActiveColumnRight, // move the active_column pointer through the list of visible columns
     MoveActiveColumnLeft,  // without actually mutating the list.
     NewGroup,           // insert a fresh empty group after the active one and make it active
     Spawn(String),                 // Spawn a new command.
     Quit,               // stop the compositor (the only in-session exit on the TTY backend)
+    IncrementVisibleColumns,
+    DecrementVisibleColumns,
+    FlipSplitDirection,
 }
 
 /// The outcome of the keyboard filter: either a config-bound navigation action,
@@ -230,17 +233,20 @@ impl RubixState {
             NavAction::RotateColumnsRight => self.monitor.rotate_columns(1),
             NavAction::ScrollColumnUp => self.monitor.scroll_active_column(-1),
             NavAction::ScrollColumnDown => self.monitor.scroll_active_column(1),
-            NavAction::MoveToNewColumn => { /* TODO: move focus to a new column */ },
+            NavAction::MoveToNewColumn => { self.move_focused_window_to_new_column() },
             NavAction::MoveActiveColumnLeft => self.monitor.move_active_column(-1),
             NavAction::MoveActiveColumnRight => self.monitor.move_active_column(1),
             NavAction::NewGroup => self.monitor.grow_active_column(),
             NavAction::Spawn(command) => {
                 std::process::Command::new("sh").arg("-c").arg(&command).spawn().ok();
-            }
+            },
             NavAction::Quit => {
                 tracing::info!("quit requested; stopping event loop");
                 self.loop_signal.stop();
-            }
+            },
+            NavAction::IncrementVisibleColumns => self.monitor.increment_visible_columns(1),
+            NavAction::DecrementVisibleColumns => self.monitor.increment_visible_columns(-1),
+            NavAction::FlipSplitDirection => self.flip_focused_parent_split_direction(),
         }
         self.apply_layout();
         if refocus {

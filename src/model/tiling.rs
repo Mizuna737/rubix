@@ -6,7 +6,14 @@ pub enum SplitDirection {
     Vertical,
 }
 
-
+impl SplitDirection {
+    pub fn toggled(self) -> Self {
+        match self {
+            SplitDirection::Horizontal => SplitDirection::Vertical,
+            SplitDirection::Vertical => SplitDirection::Horizontal
+        }
+    }
+}
 pub enum TilingNode {
 Split   { split_direction: SplitDirection, split_ratio: f32, left_child: Box<TilingNode>, right_child: Box<TilingNode> },
 Leaf    { window_id: u32 },
@@ -29,6 +36,31 @@ impl TilingNode {
                 right_child.change_split_ratio(value);
 
                 *split_ratio = value;
+            }
+        }
+    }
+
+    fn is_leaf(&self, id: u32) -> bool {
+        if matches!(self, TilingNode::Leaf { window_id } if *window_id == id ) { true } else { false }
+    }
+    pub fn flip_parent_split_direction(&mut self, target_id: u32) -> bool {
+        match self {
+            TilingNode::Leaf { window_id }=> {
+                if *window_id == target_id {
+                    true
+                }
+                else {
+                    false
+                }
+            }
+            TilingNode::Split { split_direction, left_child, right_child, .. } => {
+                if left_child.is_leaf(target_id) || right_child.is_leaf(target_id) {
+                    *split_direction = split_direction.toggled();
+                    true
+                }
+                else {
+                    left_child.flip_parent_split_direction(target_id) || right_child.flip_parent_split_direction(target_id)
+                }
             }
         }
     }

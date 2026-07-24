@@ -101,3 +101,34 @@
         assert_eq!(layout.len(), 3);
         assert_eq!(covered_area(&layout), 800 * 600);
     }
+
+    #[test]
+    fn uneven_vertical_ratio_leaves_no_gap_via_remainder() {
+        // Vertical analog of the horizontal remainder test: 0.333 * 50 = 16
+        // (truncated), so the bottom child must take the remaining 34, not 33.
+        let tree = vsplit(0.333, leaf(1), leaf(2));
+        let layout = compute_layout(&tree, rect(0, 0, 100, 50));
+        let (top, bottom) = (find(&layout, 1), find(&layout, 2));
+        assert_eq!(top.height, 16);
+        assert_eq!(bottom.height, 34);
+        assert_eq!(bottom.y, 16); // bottom begins exactly where top ends
+        assert_eq!(top.height + bottom.height, 50); // exact, no seam
+    }
+
+    // ---- longer_axis (auto-split heuristic) ----
+    #[test]
+    fn longer_axis_picks_horizontal_for_a_wide_rect() {
+        // wider than tall -> split side-by-side, keeping cells squarish
+        assert!(matches!(rect(0, 0, 800, 300).longer_axis(), SplitDirection::Horizontal));
+    }
+
+    #[test]
+    fn longer_axis_picks_vertical_for_a_tall_rect() {
+        assert!(matches!(rect(0, 0, 300, 800).longer_axis(), SplitDirection::Vertical));
+    }
+
+    #[test]
+    fn longer_axis_breaks_a_square_tie_toward_horizontal() {
+        // exactly square: the `>=` tie-break must land on Horizontal, not Vertical
+        assert!(matches!(rect(0, 0, 500, 500).longer_axis(), SplitDirection::Horizontal));
+    }

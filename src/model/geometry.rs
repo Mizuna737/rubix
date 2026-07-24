@@ -7,7 +7,11 @@ pub struct Rect {
     pub width: u32,
     pub height: u32,
 }
-
+impl Rect {
+    pub fn longer_axis(self) -> SplitDirection {
+        if self.width >= self.height { SplitDirection::Horizontal } else { SplitDirection::Vertical }
+    }
+}
 pub fn compute_layout(node: &TilingNode, bounds: Rect) -> Vec<(u32, Rect)> {
     match node {
         TilingNode::Leaf { window_id } => {

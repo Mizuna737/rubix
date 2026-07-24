@@ -118,6 +118,11 @@ impl Monitor {
         }
     }
 
+    pub fn increment_visible_columns(&mut self, change: isize) {
+        let new = self.visible_columns as isize + change;
+        self.visible_columns = new.clamp(1,self.columns.len().max(1) as isize) as usize;
+    }
+
     pub fn active_window(&self) -> Option<u32> {
         let column = self.columns.get(self.active_column)?;
         let group = column.groups.get(column.active_row)?;
@@ -129,8 +134,44 @@ impl Monitor {
         self.columns.push(column)
     }
 
-    pub fn rotate_columns(&mut self, motion: isize) { // Positive motion rotates right, negative
-                                                  // rotates left.
+    pub fn grow_columns(&mut self) -> &mut Column {
+        let mut column = Column::new(0);
+        column.add_group(Group { layout: None });
+        let index = self.active_column + 1;
+        self.columns.insert(index, column);
+        &mut self.columns[index]
+    }
+
+    fn detach_window(&mut self, window_id: u32) -> bool {
+        for column in &mut self.columns {
+            for group in &mut column.groups {
+                if matches!(group.remove_window(window_id), RemoveResult::Removed) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn flip_split_direction(&mut self, id: u32) {
+        for column in &mut self.columns {
+            for group in &mut column.groups {
+                if let Some(node) = group.layout.as_mut() {
+                    if node.flip_parent_split_direction(id) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    pub fn move_window_to_new_column(&mut self, window_id: u32) {
+        if !self.detach_window(window_id) {
+            return;
+        }
+        let new_column = self.grow_columns();
+        new_column.groups[0].add_window(SplitDirection::Horizontal, window_id, 0);
+    }
+    pub fn rotate_columns(&mut self, motion: isize) {
         let k = motion.rem_euclid(self.columns.len() as isize);
         for _i in 0..k {
            for j in 0..self.columns.len()-1 {
@@ -141,7 +182,6 @@ impl Monitor {
            }
         }
     }
-
     pub fn move_active_column(&mut self, motion: isize) {
         let signed_active_column = self.active_column as isize;
         self.active_column = (signed_active_column + motion).rem_euclid(self.visible_columns as isize) as usize
@@ -192,14 +232,6 @@ impl Monitor {
         self.active_group_mut().add_window(direction,id,focused_id);
     }
 
-    /// STUB -- the Monitor layout walk. Returns empty for now, so nothing tiles.
-    /// TODO(max): Piece 3. Slice `bounds.width` into `visible_columns` equal bands
-    /// left-to-right; for each visible column render its active group
-    /// (`groups[active_row]`) via the free `compute_layout(tree, band_rect)`;
-    /// concatenate the resulting Vec<(u32, Rect)> into one. An empty column, or a
-    /// column whose active group has `layout: None`, reserves its band as blank
-    /// space (do NOT collapse -- fixed-slot model). Band pixel width derives from
-    /// `bounds` here; the stored Column.width field is unused for now.
     pub fn compute_layout(&self, bounds: Rect) -> Vec<(u32, Rect)> {
         let column_width = (bounds.width / self.visible_columns as u32) as usize;
         let columns = self.columns.iter().enumerate().take(self.visible_columns);
