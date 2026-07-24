@@ -7,6 +7,7 @@ mod grabs;
 mod input;
 mod model;
 mod state;
+mod udev;
 mod winit;
 
 use smithay::reexports::{
@@ -18,6 +19,34 @@ pub use state::RubixState;
 pub struct CalloopData {
     state: RubixState,
     display_handle: DisplayHandle,
+}
+
+/// Which rendering/input backend to drive.
+enum Backend {
+    /// Nested window under a host compositor (winit) -- dev/testing.
+    Winit,
+    /// Direct DRM/KMS + libinput on a bare TTY (Track B).
+    Udev,
+}
+
+/// Pick a backend. An explicit `RUBIX_BACKEND=winit|udev|tty` wins; otherwise run
+/// nested when a host display is present (`WAYLAND_DISPLAY`/`DISPLAY` set) and drive
+/// the TTY when it isn't. Detection runs before `init_winit` clobbers
+/// `WAYLAND_DISPLAY` with our own socket, so it sees the host environment.
+fn detect_backend() -> Backend {
+    match std::env::var("RUBIX_BACKEND").as_deref() {
+        Ok("winit") => Backend::Winit,
+        Ok("udev") | Ok("tty") => Backend::Udev,
+        _ => {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+                || std::env::var_os("DISPLAY").is_some()
+            {
+                Backend::Winit
+            } else {
+                Backend::Udev
+            }
+        }
+    }
 }
 
 /// Watch the user config file for live keybind reload. Best-effort: any failure
@@ -61,11 +90,37 @@ fn init_config_watch(event_loop: &EventLoop<CalloopData>) {
     }
 }
 
+/// Open `$XDG_CACHE_HOME/rubix/rubix.log` (or `~/.cache/rubix/rubix.log`),
+/// creating the directory. Returns `None` if neither env var is set or the file
+/// can't be created -- logging then falls back to stderr only. On the TTY backend
+/// stderr scrolls off an unreachable console, so the file is the only way to see
+/// what happened; this makes a log exist without the user having to redirect.
+fn open_log_file() -> Option<std::fs::File> {
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?
+        .join("rubix");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::File::create(dir.join("rubix.log")).ok()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    } else {
-        tracing_subscriber::fmt().init();
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Always tee to a file (survives the TTY), plus stderr for nested dev runs.
+    match open_log_file() {
+        Some(file) => {
+            let writer = std::sync::Mutex::new(file).and(std::io::stderr);
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(writer)
+                .init();
+        }
+        None => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
     }
 
     let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
@@ -80,7 +135,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         display_handle,
     };
 
-    crate::winit::init_winit(&mut event_loop, &mut data)?;
+    match detect_backend() {
+        Backend::Winit => {
+            tracing::info!("starting winit (nested) backend");
+            crate::winit::init_winit(&mut event_loop, &mut data)?;
+        }
+        Backend::Udev => {
+            tracing::info!("starting udev (TTY/DRM) backend");
+            crate::udev::init_udev(&mut event_loop, &mut data)?;
+        }
+    }
 
     init_config_watch(&event_loop);
 
@@ -97,8 +161,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    event_loop.run(None, &mut data, move |_| {
-        // RubixState is running
+    // After every dispatch cycle: refresh the space (enter/leave bookkeeping),
+    // clean up dead popups, and -- critically -- flush queued events out to
+    // clients. Without the flush, a client's opening registry roundtrip never
+    // completes, so it blocks before ever creating a window (the winit backend
+    // got away with flushing only in its Redraw handler; the udev render loop
+    // doesn't, so this backend-neutral flush is what lets clients start at all).
+    event_loop.run(None, &mut data, move |data| {
+        data.state.space.refresh();
+        data.state.popups.cleanup();
+        let _ = data.display_handle.flush_clients();
     })?;
 
     Ok(())

@@ -9,7 +9,26 @@ license = "MIT"
 bitflags = "2"
 calloop-notify = "0.2"
 serde = { version = "1", features = ["derive"] }
-smithay = { version = "0.7", default-features = false, features = ["backend_winit", "backend_egl", "renderer_gl", "wayland_frontend", "desktop"] }
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "backend_egl",
+    "renderer_gl",
+    "renderer_pixman",
+    "renderer_multi",
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "use_system_lib",
+    "wayland_frontend",
+    "desktop",
+] }
+# default-features off drops the `display-info` (EDID name-parsing) feature: its
+# libdisplay-info-sys pins `< 0.3.0` but the system ships 0.3.0. We only need the
+# always-available `drm_scanner` (CRTC/connector scanning); monitor names fall
+# back to the connector id (e.g. "DP-1"), which is fine for first-light.
+smithay-drm-extras = { version = "0.1", default-features = false }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

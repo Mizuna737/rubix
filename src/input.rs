@@ -4,7 +4,10 @@ use smithay::{
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
-        keyboard::FilterResult,
+        keyboard::{
+            keysyms::{KEY_XF86Switch_VT_1, KEY_XF86Switch_VT_12},
+            FilterResult,
+        },
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -30,6 +33,19 @@ pub(crate) enum NavAction {
     MoveActiveColumnLeft,  // without actually mutating the list.
     NewGroup,           // insert a fresh empty group after the active one and make it active
     Spawn(String),                 // Spawn a new command.
+    Quit,               // stop the compositor (the only in-session exit on the TTY backend)
+}
+
+/// The outcome of the keyboard filter: either a config-bound navigation action,
+/// or a VT switch. VT switching is a backend/session concern (only the udev
+/// backend owns a session), so the filter can't act on it directly -- it stashes
+/// the target VT in [`RubixState::pending_vt`] for the backend's input source to
+/// consume. Resolving the chord here reuses the seat's live xkb state (the
+/// keymap turns Ctrl+Alt+Fn into an `XF86Switch_VT_n` keysym) instead of
+/// re-deriving modifiers in the backend.
+enum KeyAction {
+    Nav(NavAction),
+    SwitchVt(i32),
 }
 
 impl RubixState {
@@ -43,7 +59,7 @@ impl RubixState {
                 // The filter intercepts our Super chords on BOTH press and release
                 // (so the client never sees an orphaned edge) and returns the resolved
                 // NavAction. Everything else forwards to the focused client unchanged.
-                let action = self.seat.get_keyboard().unwrap().input::<NavAction, _>(
+                let action = self.seat.get_keyboard().unwrap().input::<KeyAction, _>(
                     self,
                     event.key_code(),
                     key_state,
@@ -51,8 +67,14 @@ impl RubixState {
                     time,
                     |state, mods, handle| {
                         let sym = handle.modified_sym().raw();
+                        // Ctrl+Alt+Fn resolves (via xkb) to an XF86Switch_VT_n keysym.
+                        // These are contiguous, so the VT number is the offset + 1.
+                        if (KEY_XF86Switch_VT_1..=KEY_XF86Switch_VT_12).contains(&sym) {
+                            let vt = (sym - KEY_XF86Switch_VT_1 + 1) as i32;
+                            return FilterResult::Intercept(KeyAction::SwitchVt(vt));
+                        }
                         match state.config.keybinds.iter().find(|kb| kb.matches(mods, sym)) {
-                            Some(kb) => FilterResult::Intercept(kb.action.clone()),
+                            Some(kb) => FilterResult::Intercept(KeyAction::Nav(kb.action.clone())),
                             None => FilterResult::Forward,
                         }
                     },
@@ -61,8 +83,13 @@ impl RubixState {
                 // Act on the press edge only; the release was swallowed above purely
                 // to keep the client's key state consistent.
                 if key_state == KeyState::Pressed {
-                    if let Some(action) = action {
-                        self.dispatch_nav(action);
+                    match action {
+                        Some(KeyAction::Nav(action)) => self.dispatch_nav(action),
+                        // Backend-neutral hand-off: the udev input source picks this
+                        // up after the event and calls `session.change_vt`. winit has
+                        // no session, so it simply never reads the field.
+                        Some(KeyAction::SwitchVt(vt)) => self.pending_vt = Some(vt),
+                        None => {}
                     }
                 }
             }
@@ -209,6 +236,10 @@ impl RubixState {
             NavAction::NewGroup => self.monitor.grow_active_column(),
             NavAction::Spawn(command) => {
                 std::process::Command::new("sh").arg("-c").arg(&command).spawn().ok();
+            }
+            NavAction::Quit => {
+                tracing::info!("quit requested; stopping event loop");
+                self.loop_signal.stop();
             }
         }
         self.apply_layout();

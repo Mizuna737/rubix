@@ -22,3 +22,8 @@ visible_columns = 3
 "Alt+Shift+L" = "MoveActiveColumnRight"
 "Alt+n" = "NewGroup"
 "Alt+Shift+space" = { Spawn = "alacritty" }
+# Exit the compositor. On the TTY backend this is the only in-session quit (winit
+# also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
+# Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the
+# chord's final token must be the shifted form (matching Alt+Shift+H / +L above).
+"Alt+Shift+Q" = "Quit"

@@ -53,6 +53,11 @@ impl XdgShellHandler for RubixState {
         });
         self.monitor.add_window(SplitDirection::Horizontal, id, focused_id.unwrap_or(0));
         self.apply_layout();
+        tracing::info!(
+            "new toplevel -> window {id} ({} tracked, {} mapped in space)",
+            self.windows.len(),
+            self.space.elements().count(),
+        );
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {

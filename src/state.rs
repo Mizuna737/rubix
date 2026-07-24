@@ -43,6 +43,12 @@ pub struct RubixState {
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
 
+    // Backend-neutral VT-switch request. The keyboard filter sets this when it
+    // sees an XF86Switch_VT chord; the udev input source consumes it and calls
+    // `session.change_vt` (the session lives in the backend, not here). winit
+    // never reads it. `Option` so a single chord fires exactly one switch.
+    pub pending_vt: Option<i32>,
+
     // User configuration (keybinds + layout), resolved at startup.
     pub config: Config,
 
@@ -123,6 +129,7 @@ impl RubixState {
 
             space,
             loop_signal,
+            pending_vt: None,
             socket_name,
 
             config,
