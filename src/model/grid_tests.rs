@@ -236,3 +236,121 @@
         assert!(matches!(g.layout.as_ref(), Some(TilingNode::Leaf { window_id: 1 })));
         assert!(group_axis(&g).is_none());
     }
+
+    // ---- directional move across the group grid ----
+    // Build a monitor from a column spec: each inner slice lists the window id
+    // in each group's single leaf (rows top-to-bottom); `active_rows` seeds each
+    // column's cursor. Enough to exercise ragged-grid row selection. Columns
+    // here are always non-empty -- the empty-group cases are built by hand below.
+    fn monitor_from(columns: &[&[u32]], active_rows: &[usize]) -> Monitor {
+        let mut mon = Monitor::new(0, columns.len().max(1));
+        for (ci, ids) in columns.iter().enumerate() {
+            let mut col = Column::new(0);
+            for &id in ids.iter() {
+                col.add_group(leaf_group(id));
+            }
+            col.active_row = active_rows[ci];
+            mon.add_column(col);
+        }
+        mon
+    }
+
+    #[test]
+    fn find_column_and_row_locates_a_window_in_a_ragged_grid() {
+        // window 4 lives in column 1, row 2 -- the finder must return exactly that.
+        let mon = monitor_from(&[&[1], &[2, 3, 4]], &[0, 0]);
+        assert_eq!(mon.find_column_and_row_by_window_id(4), Some((1, 2)));
+        assert_eq!(mon.find_column_and_row_by_window_id(1), Some((0, 0)));
+        assert_eq!(mon.find_column_and_row_by_window_id(99), None);
+    }
+
+    #[test]
+    fn direction_up_down_walk_rows_within_the_column() {
+        // single column [1,2,3]; window 2 (row 1) resolves to row 0 up / row 2 down.
+        let mon = monitor_from(&[&[1, 2, 3]], &[0]);
+        assert_eq!(mon.find_group_by_direction(2, Direction::Up), Some((0, 0)));
+        assert_eq!(mon.find_group_by_direction(2, Direction::Down), Some((0, 2)));
+    }
+
+    #[test]
+    fn vertical_moves_no_op_at_the_column_edges() {
+        // top row can't go up, bottom row can't go down -- both None, no wrap.
+        let mon = monitor_from(&[&[1, 2, 3]], &[0]);
+        assert_eq!(mon.find_group_by_direction(1, Direction::Up), None);
+        assert_eq!(mon.find_group_by_direction(3, Direction::Down), None);
+    }
+
+    #[test]
+    fn horizontal_moves_no_op_at_the_outer_columns() {
+        // lone column: nothing to the left or right of window 1.
+        let mon = monitor_from(&[&[1]], &[0]);
+        assert_eq!(mon.find_group_by_direction(1, Direction::Left), None);
+        assert_eq!(mon.find_group_by_direction(1, Direction::Right), None);
+    }
+
+    #[test]
+    fn horizontal_move_lands_in_the_destination_columns_active_row() {
+        // The ragged-grid contract: moving across columns ignores the *source*
+        // row and targets the destination column's active_row. Column 1's cursor
+        // sits on row 2, so Right from column 0 lands at (1, 2) -- not (1, 0),
+        // and not a clamp of the source row.
+        let mon = monitor_from(&[&[1], &[2, 3, 4]], &[0, 2]);
+        assert_eq!(mon.find_group_by_direction(1, Direction::Right), Some((1, 2)));
+        // Left from the deep column resolves against the shallow column's
+        // active_row (0), which is in-bounds even though source row 2 has no
+        // counterpart in column 0.
+        assert_eq!(mon.find_group_by_direction(4, Direction::Left), Some((0, 0)));
+    }
+
+    #[test]
+    fn find_group_by_direction_reports_none_for_a_missing_window() {
+        let mon = monitor_from(&[&[1, 2]], &[0]);
+        assert_eq!(mon.find_group_by_direction(99, Direction::Down), None);
+    }
+
+    #[test]
+    fn move_window_into_an_empty_group_relocates_and_moves_the_cursor() {
+        // column 0: [leaf(1)]; column 1: [empty group]. Move 1 into (1, 0).
+        let mut mon = Monitor::new(0, 2);
+        let mut c0 = Column::new(0);
+        c0.add_group(leaf_group(1));
+        mon.add_column(c0);
+        let mut c1 = Column::new(0);
+        c1.add_group(empty_group());
+        mon.add_column(c1);
+
+        mon.move_window_to_group(1, 1, 0, SplitDirection::Horizontal);
+
+        assert!(!has_window(&mon.columns[0].groups[0], 1), "source no longer holds it");
+        assert!(mon.columns[0].groups[0].layout.is_none(), "emptied source is kept, not pruned");
+        assert!(has_window(&mon.columns[1].groups[0], 1), "landed in the destination group");
+        assert!(
+            matches!(mon.columns[1].groups[0].layout.as_ref(), Some(TilingNode::Leaf { window_id: 1 })),
+            "seeding an empty group makes a bare leaf, no split"
+        );
+        assert_eq!(mon.active_column, 1, "cursor followed to the destination column");
+        assert_eq!(mon.columns[1].active_row, 0, "cursor followed to the destination row");
+    }
+
+    #[test]
+    fn move_window_into_a_populated_group_splits_along_the_given_axis() {
+        // column 0: [leaf(1)]; column 1: [leaf(2)]. Move 1 into (1, 0) Vertical:
+        // the destination leaf(2) splits vertically to hold both windows, and the
+        // axis is exactly the one handed to move_window_to_group (policy decides
+        // it upstream; the model only threads it through).
+        let mut mon = Monitor::new(0, 2);
+        let mut c0 = Column::new(0);
+        c0.add_group(leaf_group(1));
+        mon.add_column(c0);
+        let mut c1 = Column::new(0);
+        c1.add_group(leaf_group(2));
+        mon.add_column(c1);
+
+        mon.move_window_to_group(1, 1, 0, SplitDirection::Vertical);
+
+        let dest = &mon.columns[1].groups[0];
+        assert!(has_window(dest, 1));
+        assert!(has_window(dest, 2));
+        assert_eq!(dest.count_windows(), 2);
+        assert!(matches!(group_axis(dest), Some(SplitDirection::Vertical)));
+    }

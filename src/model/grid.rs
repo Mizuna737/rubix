@@ -1,6 +1,14 @@
 use super::tiling::{TilingNode, SplitDirection, RemoveResult};
 use super::traits::{CountWindows, sum_windows};
 use super::geometry::{compute_layout, Rect};
+
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 pub struct Group {
     pub layout: Option<TilingNode>,
 }
@@ -153,6 +161,44 @@ impl Monitor {
         false
     }
 
+    fn find_column_and_row_by_window_id(&self, window_id: u32) -> Option<(usize,usize)> {
+        for c in 0 .. self.columns.len() {
+            for g in 0 .. self.columns[c].groups.len() {
+                if self.columns[c].groups[g].layout.as_ref()
+                    .is_some_and(|node| node.find_window(window_id).is_some())
+                {
+                    return Some((c, g));
+                }
+            }
+        }
+        None
+    }
+    pub fn find_group_by_direction(&self, window_id: u32, direction: Direction) -> Option<(usize,usize)> {
+        let Some((c,g)) = self.find_column_and_row_by_window_id(window_id) else {
+            return None;
+        };
+        match direction {
+            Direction::Up if g > 0 => Some((c, g - 1)),
+            Direction::Down if g < self.columns[c].groups.len() - 1 => Some((c, g + 1)),
+            Direction::Left if c > 0 => Some((c - 1, self.columns[c - 1].active_row)),
+            Direction::Right if c < self.columns.len() - 1 => Some((c + 1, self.columns[c + 1].active_row)),
+            _ => None,
+        }
+    }
+    pub fn find_first_leaf_id(&self, target_c: usize, target_g: usize) -> Option<u32> {
+        let column = self.columns.get(target_c)?;
+        let group = column.groups.get(target_g)?;
+        group.layout.as_ref().map(|node| node.find_first_leaf_id())
+    }
+    pub fn move_window_to_group(&mut self, window_id: u32, target_c: usize, target_g: usize, split_direction: SplitDirection) {
+        if !self.detach_window(window_id) {
+            return;
+        }
+        self.active_column = target_c;
+        self.columns[target_c].active_row = target_g;
+        self.columns[target_c].groups[target_g]
+            .add_window(split_direction, window_id, 0);
+    }
     pub fn flip_split_direction(&mut self, id: u32) {
         for column in &mut self.columns {
             for group in &mut column.groups {

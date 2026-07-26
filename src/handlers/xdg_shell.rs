@@ -24,9 +24,12 @@ use smithay::{
 
 use crate::{
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
-    model::tiling::SplitDirection,
+    model::{
+        tiling::SplitDirection,
+        geometry::Rect,
+        grid::Direction,
+    },
     RubixState,
-    model::geometry::Rect,
 };
 
 impl XdgShellHandler for RubixState {
@@ -281,4 +284,14 @@ impl RubixState {
         self.apply_layout();
     }
 
+    pub fn move_focused_window_by_direction(&mut self,direction: Direction) {
+        let Some(focused_id) = self.focused_window_id() else { return };
+        let Some((c,g)) = self.monitor.find_group_by_direction(focused_id, direction) else { return };
+        let split_direction = self.monitor.find_first_leaf_id(c,g)
+            .and_then(|target_id| self.window_rect(target_id))
+            .map(Rect::longer_axis)
+            .unwrap_or(SplitDirection::Horizontal);
+        self.monitor.move_window_to_group(focused_id, c, g, split_direction);
+        self.apply_layout();
+    }
 }

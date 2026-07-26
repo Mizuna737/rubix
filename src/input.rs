@@ -17,6 +17,7 @@ use smithay::{
 use serde::Deserialize;
 
 use crate::state::RubixState;
+use crate::model::grid::Direction;
 
 /// A Rubix navigation chord. Bound to a chord in `config.toml`, where the value
 /// is this variant's exact name -- serde deserializes it straight into the enum,
@@ -37,6 +38,10 @@ pub(crate) enum NavAction {
     IncrementVisibleColumns,
     DecrementVisibleColumns,
     FlipSplitDirection,
+    MoveFocusedWindowUp,
+    MoveFocusedWindowDown,
+    MoveFocusedWindowLeft,
+    MoveFocusedWindowRight,
 }
 
 /// The outcome of the keyboard filter: either a config-bound navigation action,
@@ -247,6 +252,10 @@ impl RubixState {
             NavAction::IncrementVisibleColumns => self.monitor.increment_visible_columns(1),
             NavAction::DecrementVisibleColumns => self.monitor.increment_visible_columns(-1),
             NavAction::FlipSplitDirection => self.flip_focused_parent_split_direction(),
+            NavAction::MoveFocusedWindowUp => self.move_focused_window_by_direction(Direction::Up),
+            NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),
+            NavAction::MoveFocusedWindowLeft => self.move_focused_window_by_direction(Direction::Left),
+            NavAction::MoveFocusedWindowRight => self.move_focused_window_by_direction(Direction::Right),
         }
         self.apply_layout();
         if refocus {

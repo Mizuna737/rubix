@@ -20,6 +20,13 @@ visible_columns = 3
 "Alt+Return" = "MoveToNewColumn"
 "Alt+Shift+H" = "MoveActiveColumnLeft"
 "Alt+Shift+L" = "MoveActiveColumnRight"
+# Relocate the focused window across the group grid: h/l cross columns (landing in
+# the destination column's active row), j/k walk rows within the column. j=Down /
+# k=Up to match the ScrollColumn binds above.
+"Alt+Control+h" = "MoveFocusedWindowLeft"
+"Alt+Control+l" = "MoveFocusedWindowRight"
+"Alt+Control+j" = "MoveFocusedWindowDown"
+"Alt+Control+k" = "MoveFocusedWindowUp"
 # Zoom the cube: more visible columns (narrower bands) / fewer (wider bands).
 "Alt+Shift+J" = "IncrementVisibleColumns"
 "Alt+Shift+K" = "DecrementVisibleColumns"
