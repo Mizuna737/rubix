@@ -14,6 +14,29 @@
         assert_eq!(bind_count, 17);
     }
 
+    // ---- animation duration ----
+
+    #[test]
+    fn default_config_resolves_animation_duration_to_250ms() {
+        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.animation_duration, std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn config_omitting_animation_section_defaults_to_250ms() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [animation] still parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.animation_duration, std::time::Duration::from_millis(250));
+    }
+
     #[test]
     fn chord_parses_modifiers_and_keysym() {
         let kb = parse_chord("Alt+Return", NavAction::MoveToNewColumn).unwrap();

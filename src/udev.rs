@@ -52,6 +52,8 @@ use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::damage::Error as OutputDamageTrackerError;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiRenderer};
@@ -70,10 +72,11 @@ use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{DeviceFd, Physical, Point, Scale, Transform};
 
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
+use crate::state::Pos;
 use crate::{CalloopData, RubixState};
 
 // The four `DrmOutputManager`/`DrmOutput` generics never vary in this backend:
@@ -639,6 +642,8 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, c
         return;
     };
 
+    let animating = data.state.step_animations();
+
     let result = render_surface(surface, &mut renderer, &mut data.state);
 
     let reschedule = match result {
@@ -650,11 +655,13 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, c
             // Nothing to draw -- no flip, so nothing wakes us. Arm a heartbeat.
             true
         }
-        Err(err) => {
+      Err(ref err) => {
             tracing::warn!("render error on {crtc:?}: {err}");
             !matches!(err, SwapBuffersError::ContextLost(_))
         }
     };
+
+    let reschedule = reschedule || (animating && !matches!(&result, Ok(true)));
 
     let frame_duration = surface.frame_duration;
     // Send frame callbacks so clients keep producing content.
@@ -681,9 +688,34 @@ fn render_surface(
     renderer: &mut RubixRenderer<'_>,
     state: &mut RubixState,
 ) -> Result<bool, SwapBuffersError> {
-    let elements: Vec<SpaceRenderElements<_, _>> =
+    let mut elements: Vec<SpaceRenderElements<_, _>> =
         space_render_elements(renderer, [&state.space], &surface.output, 1.0)
             .map_err(|_| SwapBuffersError::TemporaryFailure(Box::new(RenderNoMode)))?;
+
+    // Ghost elements for any in-flight rotation wrap, built from
+    // `active_ghosts` (populated by `step_animations` right before this call,
+    // same frame). Collect the (window, pos) pairs first so the immutable
+    // borrow of `state` is released before calling `render_elements`, which
+    // needs the separate `&mut renderer` already in scope. Output scale is 1.0
+    // here, so a logical Pos maps numerically to physical directly -- if that
+    // ever changes, this needs `.to_physical_precise_round(scale)` from a
+    // logical point instead. Inserted at the front so ghosts draw top-most.
+    let ghost_windows: Vec<(Window, Pos)> = state
+        .active_ghosts
+        .iter()
+        .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
+        .collect();
+    for (window, pos) in ghost_windows {
+        let ghosts = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'_>>>(
+            renderer,
+            Point::<i32, Physical>::from((pos.x, pos.y)),
+            Scale::from(1.0),
+            1.0,
+        );
+        for g in ghosts {
+            elements.insert(0, SpaceRenderElements::Surface(g));
+        }
+    }
 
     let frame = surface
         .drm_output

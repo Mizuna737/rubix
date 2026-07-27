@@ -3,13 +3,15 @@ use std::time::Duration;
 use smithay::{
     backend::{
         renderer::{
-            damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer,
+            damage::OutputDamageTracker,
+            element::{surface::WaylandSurfaceRenderElement, AsRenderElements},
+            gles::GlesRenderer,
         },
         winit::{self, WinitEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
-    utils::{Rectangle, Transform},
+    utils::{Physical, Point, Rectangle, Scale, Transform},
 };
 
 use crate::{CalloopData, RubixState};
@@ -73,8 +75,31 @@ pub fn init_winit(
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
 
+                state.step_animations();
+
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
+
+                    // Ghost elements for any in-flight rotation wrap, built from
+                    // `active_ghosts` (populated by `step_animations` above, same
+                    // frame). Output scale is 1.0 here, so a logical Pos maps
+                    // numerically to physical directly -- if that ever changes,
+                    // this needs `.to_physical_precise_round(scale)` from a
+                    // logical point instead.
+                    let ghost_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+                        .active_ghosts
+                        .iter()
+                        .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
+                        .flat_map(|(w, pos)| {
+                            w.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                                renderer,
+                                Point::<i32, Physical>::from((pos.x, pos.y)),
+                                Scale::from(1.0),
+                                1.0,
+                            )
+                        })
+                        .collect();
+
                     smithay::desktop::space::render_output::<
                         _,
                         WaylandSurfaceRenderElement<GlesRenderer>,
@@ -87,7 +112,7 @@ pub fn init_winit(
                         1.0,
                         0,
                         [&state.space],
-                        &[],
+                        &ghost_elements,
                         &mut damage_tracker,
                         [0.1, 0.1, 0.1, 1.0],
                     )

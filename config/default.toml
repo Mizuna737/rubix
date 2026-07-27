@@ -6,6 +6,11 @@
 # Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.
 visible_columns = 3
 
+[animation]
+# Duration of scroll/rotate slide tweens, in milliseconds. Omitting this
+# section entirely is fine -- it defaults to 250.
+duration_ms = 250
+
 # Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
 # variant name -- serde deserializes it straight into the enum, so there is no
 # translation table in code. Chord syntax: modifier tokens (Super/Alt/Ctrl/Shift,

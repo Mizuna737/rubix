@@ -16,7 +16,7 @@ use smithay::{
 
 use serde::Deserialize;
 
-use crate::state::RubixState;
+use crate::state::{RubixState, Transition};
 use crate::model::grid::Direction;
 
 /// A Rubix navigation chord. Bound to a chord in `config.toml`, where the value
@@ -234,10 +234,10 @@ impl RubixState {
         );
 
         match action {
-            NavAction::RotateColumnsLeft => self.monitor.rotate_columns(-1),
-            NavAction::RotateColumnsRight => self.monitor.rotate_columns(1),
-            NavAction::ScrollColumnUp => self.monitor.scroll_active_column(-1),
-            NavAction::ScrollColumnDown => self.monitor.scroll_active_column(1),
+            NavAction::RotateColumnsLeft => { self.pending_transition = Some(Transition::Rotate); self.monitor.rotate_columns(-1); },
+            NavAction::RotateColumnsRight => { self.pending_transition = Some(Transition::Rotate); self.monitor.rotate_columns(1); },
+            NavAction::ScrollColumnUp => { self.pending_transition = Some(Transition::Scroll { down: false }); self.monitor.scroll_active_column(-1); },
+            NavAction::ScrollColumnDown => { self.pending_transition = Some(Transition::Scroll { down: true }); self.monitor.scroll_active_column(1); },
             NavAction::MoveToNewColumn => { self.move_focused_window_to_new_column() },
             NavAction::MoveActiveColumnLeft => self.monitor.move_active_column(-1),
             NavAction::MoveActiveColumnRight => self.monitor.move_active_column(1),

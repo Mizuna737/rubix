@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 use smithay::input::keyboard::{
@@ -19,6 +20,7 @@ const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 pub struct Config {
     pub visible_columns: usize,
     pub keybinds: Vec<Keybind>,
+    pub animation_duration: Duration,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -51,12 +53,32 @@ impl Keybind {
 #[derive(Deserialize)]
 struct RawConfig {
     layout: RawLayout,
+    #[serde(default)]
+    animation: RawAnimation,
     keybinds: HashMap<String, NavAction>,
 }
 
 #[derive(Deserialize)]
 struct RawLayout {
     visible_columns: usize,
+}
+
+// Optional section: a config omitting `[animation]` entirely still parses,
+// falling back to `default_duration_ms` below.
+#[derive(Deserialize)]
+struct RawAnimation {
+    #[serde(default = "default_duration_ms")]
+    duration_ms: u64,
+}
+
+impl Default for RawAnimation {
+    fn default() -> Self {
+        RawAnimation { duration_ms: default_duration_ms() }
+    }
+}
+
+fn default_duration_ms() -> u64 {
+    250
 }
 
 impl Config {
@@ -87,6 +109,7 @@ impl Config {
         Config {
             visible_columns: raw.layout.visible_columns,
             keybinds,
+            animation_duration: Duration::from_millis(raw.animation.duration_ms),
         }
     }
 

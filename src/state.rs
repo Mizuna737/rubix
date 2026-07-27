@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     sync::Arc,
+    time::Instant,
 };
 
 use smithay::{
@@ -35,6 +36,41 @@ use crate::{
     CalloopData,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Pos {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TweenKind { Enter, Leave, Move }
+
+// The exiting "ghost" trajectory for a wrapping rotate Move: a second copy of
+// the same surface, drawn only for the duration of the tween, sliding off the
+// near edge while the Space-mapped copy slides in from the far edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GhostTrack {
+    from: Pos,
+    to: Pos,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tween {
+    kind: TweenKind,
+    from: Pos,
+    to: Pos,
+    start: Instant,
+    ghost: Option<GhostTrack>,
+}
+
+// The kind of spatial-nav transition that just happened. Carries the slide
+// axis/sign, which cannot be recovered from a set diff.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Transition {
+    Scroll { down: bool },
+    Rotate,
+}
+
 pub struct RubixState {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -59,6 +95,13 @@ pub struct RubixState {
     pub monitor: Monitor,
     pub windows: HashMap<u32, Window>,
     pub next_id: u32,
+
+    animations: HashMap<u32, Tween>,
+    pub(crate) pending_transition: Option<Transition>,
+    // The exiting-ghost render positions for the in-flight frame, rebuilt fresh
+    // by `step_animations` each call. Consumed by the backends right after, to
+    // inject a second draw of the wrapping surface. Not Space state.
+    pub(crate) active_ghosts: Vec<(u32, Pos)>,
 
     // Smithay State
     pub compositor_state: CompositorState,
@@ -137,6 +180,9 @@ impl RubixState {
             monitor,
             windows: HashMap::new(),
             next_id: 1,
+            animations: HashMap::new(),
+            pending_transition: None,
+            active_ghosts: Vec::new(),
 
             compositor_state,
             xdg_shell_state,
@@ -220,6 +266,7 @@ impl RubixState {
         }
         let count = new.keybinds.len();
         self.config.keybinds = new.keybinds;
+        self.config.animation_duration = new.animation_duration;
         tracing::info!("reloaded config: {count} keybinds active");
     }
 
@@ -262,46 +309,291 @@ impl RubixState {
             .map(|(_, rect)| rect)
     }
 
-    pub fn apply_layout(&mut self) {
-        let Some(bounds) = self.output_bounds() else { return };
-        // Borrow the model only long enough to compute; `placements` is owned, so
-        // the immutable borrow of `self.monitor` is released before we touch
-        // `self.space` / `self.windows` mutably below.
-        let placements = self.monitor.compute_layout(bounds);
-        let visible: HashSet<u32> = placements.iter().map(|(id, _)| *id).collect();
+    fn ease(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        1.0 - (1.0 - t).powi(3)
+    }
 
-        // Reconcile is subtractive as well as additive: any window we own that
-        // isn't in the current placement set -- a scrolled-away group's row, an
-        // off-screen column, a group rotated out of view -- must be unmapped so
-        // it leaves the viewport. `unmap_elem` only hides it (the client stays
-        // alive in `self.windows`); a later nav that brings its group back maps
-        // it again. Without this, stale groups linger on screen.
-        let stale: Vec<Window> = self
-            .windows
+    // Position-only interpolation, signed -- no clamp, no size (tweens carry
+    // only a top-left position; size is configured once, up front).
+    fn lerp_pos(from: Pos, to: Pos, t: f32) -> Pos {
+        let lerp = |a: i32, b: i32| (a as f32 + (b - a) as f32 * t).round() as i32;
+        Pos { x: lerp(from.x, to.x), y: lerp(from.y, to.y) }
+    }
+
+    /// Plan the tween set for a transition. PURE -- caller supplies current
+    /// on-screen positions (read from Space) and the target layout. `bounds`
+    /// gives the off-screen slide distance (height for Scroll, width for
+    /// Rotate). Endpoints are signed `Pos` -- an off-screen coordinate above
+    /// or left of the origin is a plain negative number, not clamped.
+    fn plan_transition(
+        current: &HashMap<u32, Pos>,
+        targets: &[(u32, Rect)],
+        transition: Transition,
+        bounds: Rect,
+        now: Instant,
+    ) -> HashMap<u32, Tween> {
+        let targets_map: HashMap<u32, Pos> = targets
             .iter()
-            .filter(|(id, _)| !visible.contains(id))
-            .map(|(_, window)| window.clone())
+            .map(|(id, r)| (*id, Pos { x: r.x as i32, y: r.y as i32 }))
             .collect();
-        for window in stale {
-            self.space.unmap_elem(&window);
+        let mut tweens: HashMap<u32, Tween> = HashMap::new();
+
+        // Enter: in targets only
+        for &(id, rect) in targets {
+            if !current.contains_key(&id) {
+                let target = Pos { x: rect.x as i32, y: rect.y as i32 };
+                let from = Self::enter_from(transition, target, bounds);
+                tweens.insert(id, Tween { kind: TweenKind::Enter, from, to: target, start: now, ghost: None });
+            }
         }
 
-        for (id, rect) in placements {
-            let Some(window) = self.windows.get(&id).cloned() else {
-                continue;
+        // Leave: in current only
+        for (&id, &cur) in current {
+            if !targets_map.contains_key(&id) {
+                let to = Self::leave_to(transition, cur, bounds);
+                tweens.insert(id, Tween { kind: TweenKind::Leave, from: cur, to, start: now, ghost: None });
+            }
+        }
+
+        // Move: in both. Rotate wraps a window whose straight-across delta is
+        // longer than the shorter cross-edge path; Scroll never wraps.
+        for (&id, &cur) in current {
+            if let Some(&target) = targets_map.get(&id) {
+                let tween = match transition {
+                    Transition::Rotate => Self::plan_rotate_move(cur, target, bounds, now),
+                    Transition::Scroll { .. } => {
+                        Tween { kind: TweenKind::Move, from: cur, to: target, start: now, ghost: None }
+                    }
+                };
+                tweens.insert(id, tween);
+            }
+        }
+
+        tweens
+    }
+
+    /// Plan a single Rotate Move, detecting a band-wrap. `orig_from`/`orig_to`
+    /// are the window's current and target `Pos`. STRICT `>` on the threshold:
+    /// an exact `width/2` delta (e.g. a 2-column full swap) is NOT a wrap, and
+    /// both windows cross through the middle -- intentional for now (see spec
+    /// known-limitations; a possible future follow-up).
+    fn plan_rotate_move(orig_from: Pos, orig_to: Pos, bounds: Rect, now: Instant) -> Tween {
+        let long_delta = orig_to.x - orig_from.x;
+        if long_delta.abs() > (bounds.width as i32) / 2 {
+            let wrap_delta = if long_delta > 0 {
+                long_delta - bounds.width as i32
+            } else {
+                long_delta + bounds.width as i32
             };
-
-            // Force the tiled size via a configure (same handshake as resize_grab).
-            let toplevel = window.toplevel().unwrap();
-            toplevel.with_pending_state(|state| {
-                state.size = Some((rect.width as i32, rect.height as i32).into());
+            // Space-mapped copy enters from the far edge and lands at the real
+            // destination -- LOAD-BEARING: this copy must end at `orig_to`
+            // because the next transition reads `current` from
+            // `space.element_location`, and focus/input hit-testing use the
+            // Space location.
+            let from = Pos { x: orig_to.x - wrap_delta, y: orig_to.y };
+            let to = orig_to;
+            // Ghost copy exits off the near edge, starting where the window is now.
+            let ghost = Some(GhostTrack {
+                from: orig_from,
+                to: Pos { x: orig_from.x + wrap_delta, y: orig_from.y },
             });
-            toplevel.send_pending_configure();
+            Tween { kind: TweenKind::Move, from, to, start: now, ghost }
+        } else {
+            Tween { kind: TweenKind::Move, from: orig_from, to: orig_to, start: now, ghost: None }
+        }
+    }
 
-            self.space.map_element(window, (rect.x as i32, rect.y as i32), false);
+    /// Off-screen starting position for an Enter tween, by transition kind.
+    fn enter_from(transition: Transition, target: Pos, bounds: Rect) -> Pos {
+        match transition {
+            // down == true (content moves up): enter from BELOW.
+            // down == false (content moves down): enter from ABOVE.
+            Transition::Scroll { down } => {
+                let dy = bounds.height as i32;
+                Pos { x: target.x, y: if down { target.y + dy } else { target.y - dy } }
+            }
+            // Nearest-edge: a target on the left half came from off-screen
+            // LEFT; right half came from off-screen RIGHT.
+            Transition::Rotate => {
+                let dx = bounds.width as i32;
+                let midpoint = bounds.x as i32 + dx / 2;
+                if target.x < midpoint {
+                    Pos { x: target.x - dx, y: target.y }
+                } else {
+                    Pos { x: target.x + dx, y: target.y }
+                }
+            }
+        }
+    }
+
+    /// Off-screen ending position for a Leave tween, by transition kind.
+    fn leave_to(transition: Transition, cur: Pos, bounds: Rect) -> Pos {
+        match transition {
+            // down == true (content moves up): leave to TOP.
+            // down == false (content moves down): leave to BOTTOM.
+            Transition::Scroll { down } => {
+                let dy = bounds.height as i32;
+                Pos { x: cur.x, y: if down { cur.y - dy } else { cur.y + dy } }
+            }
+            // Nearest-edge: a window currently on the left half exits LEFT;
+            // right half exits RIGHT.
+            Transition::Rotate => {
+                let dx = bounds.width as i32;
+                let midpoint = bounds.x as i32 + dx / 2;
+                if cur.x < midpoint {
+                    Pos { x: cur.x - dx, y: cur.y }
+                } else {
+                    Pos { x: cur.x + dx, y: cur.y }
+                }
+            }
+        }
+    }
+
+    /// Settle in-flight tweens so Space is a clean baseline. Leave any windows
+    /// still owned in `self.windows` mapped at their final rect; unmapping only
+    /// for Leave tweens (windows that fell out of the visible set).
+    fn settle_tweens(&mut self) {
+        let done: Vec<u32> = self.animations.keys().copied().collect();
+        for id in done {
+            if let Some(tween) = self.animations.remove(&id) {
+                if let Some(window) = self.windows.get(&id) {
+                    match tween.kind {
+                        TweenKind::Leave => {
+                            self.space.unmap_elem(window);
+                        }
+                        _ => {
+                            self.space.map_element(window.clone(), (tween.to.x, tween.to.y), false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Advance every active tween one frame. Returns true while any tween is live.
+    /// Touches nothing when `self.animations` is empty (otherwise the udev backend
+    /// never idles).
+    pub fn step_animations(&mut self) -> bool {
+        // Cleared FIRST, before the empty-animations guard below: otherwise the
+        // last wrap's ghost would leak forever, since the guard returns early
+        // on every subsequent idle frame and the list never gets rebuilt.
+        self.active_ghosts.clear();
+        if self.animations.is_empty() { return false; }
+        let duration_secs = self.config.animation_duration.as_secs_f32();
+        let now = Instant::now();
+        let mut done: Vec<u32> = Vec::new();
+        for (id, tween) in self.animations.iter() {
+            let t = (now - tween.start).as_secs_f32() / duration_secs;
+            let e = Self::ease(t);
+            let pos = Self::lerp_pos(tween.from, tween.to, e);
+            if let Some(window) = self.windows.get(id) {
+                self.space.map_element(window.clone(), (pos.x, pos.y), false);
+            }
+            if let Some(g) = tween.ghost {
+                let gpos = Self::lerp_pos(g.from, g.to, e);
+                self.active_ghosts.push((*id, gpos));
+            }
+            if t >= 1.0 { done.push(*id); }
+        }
+        for id in done {
+            if let Some(tween) = self.animations.remove(&id) {
+                if let Some(window) = self.windows.get(&id) {
+                    match tween.kind {
+                        TweenKind::Leave => { self.space.unmap_elem(window); }
+                        _ => { self.space.map_element(window.clone(), (tween.to.x, tween.to.y), false); }
+                    }
+                }
+            }
+        }
+        !self.animations.is_empty()
+    }
+
+    pub fn apply_layout(&mut self) {
+        let Some(bounds) = self.output_bounds() else { return };
+        let targets = self.monitor.compute_layout(bounds);
+
+        match self.pending_transition.take() {
+            None => {
+                // SNAP PATH — byte-for-byte today's behavior.
+                // Settle in-flight animations first (safety): for each tween,
+                // if Leave -> unmap; else map_element at tween.to. Clear the map.
+                self.settle_tweens();
+
+                let visible: HashSet<u32> = targets.iter().map(|(id, _)| *id).collect();
+
+                let stale: Vec<Window> = self
+                    .windows
+                    .iter()
+                    .filter(|(id, _)| !visible.contains(id))
+                    .map(|(_, window)| window.clone())
+                    .collect();
+                for window in stale {
+                    self.space.unmap_elem(&window);
+                }
+
+                for (id, rect) in targets {
+                    let Some(window) = self.windows.get(&id).cloned() else {
+                        continue;
+                    };
+
+                    let toplevel = window.toplevel().unwrap();
+                    toplevel.with_pending_state(|state| {
+                        state.size = Some((rect.width as i32, rect.height as i32).into());
+                    });
+                    toplevel.send_pending_configure();
+
+                    self.space.map_element(window, (rect.x as i32, rect.y as i32), false);
+                }
+            }
+            Some(transition) => {
+                // ANIMATE PATH
+                // 1. Settle in-flight tweens first so Space is a clean baseline.
+                self.settle_tweens();
+
+                // 2. Build current positions from windows still mapped in Space.
+                let mut current: HashMap<u32, Pos> = HashMap::new();
+                for (id, window) in &self.windows {
+                    if let Some(loc) = self.space.element_location(window) {
+                        current.insert(*id, Pos { x: loc.x, y: loc.y });
+                    }
+                }
+
+                // 3. For every target id: send the size configure.
+                for (id, rect) in &targets {
+                    let Some(window) = self.windows.get(id).cloned() else {
+                        continue;
+                    };
+                    let toplevel = window.toplevel().unwrap();
+                    toplevel.with_pending_state(|state| {
+                        state.size = Some((rect.width as i32, rect.height as i32).into());
+                    });
+                    toplevel.send_pending_configure();
+                }
+
+                // 4-6. Plan tweens, map enter/move at from-position, store.
+                let plan = Self::plan_transition(&current, &targets, transition, bounds, Instant::now());
+                for (id, tween) in &plan {
+                    if let Some(window) = self.windows.get(id).cloned() {
+                        match tween.kind {
+                            TweenKind::Enter | TweenKind::Move => {
+                                self.space.map_element(window, (tween.from.x, tween.from.y), false);
+                            }
+                            TweenKind::Leave => {
+                                // Leave it mapped where it is; step_animations unmaps at completion.
+                            }
+                        }
+                    }
+                }
+                self.animations = plan;
+            }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod tests;
 
 #[derive(Default)]
 pub struct ClientState {
