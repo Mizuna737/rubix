@@ -537,7 +537,7 @@ impl RubixState {
                         continue;
                     };
 
-                    let toplevel = window.toplevel().unwrap();
+                    let Some(toplevel) = window.toplevel() else { continue; };
                     toplevel.with_pending_state(|state| {
                         state.size = Some((rect.width as i32, rect.height as i32).into());
                     });
@@ -564,7 +564,7 @@ impl RubixState {
                     let Some(window) = self.windows.get(id).cloned() else {
                         continue;
                     };
-                    let toplevel = window.toplevel().unwrap();
+                    let Some(toplevel) = window.toplevel() else { continue; };
                     toplevel.with_pending_state(|state| {
                         state.size = Some((rect.width as i32, rect.height as i32).into());
                     });

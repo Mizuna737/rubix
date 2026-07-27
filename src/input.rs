@@ -67,7 +67,7 @@ impl RubixState {
                 // The filter intercepts our Super chords on BOTH press and release
                 // (so the client never sees an orphaned edge) and returns the resolved
                 // NavAction. Everything else forwards to the focused client unchanged.
-                let action = self.seat.get_keyboard().unwrap().input::<KeyAction, _>(
+                let action = self.seat.get_keyboard().expect("keyboard added to seat at startup").input::<KeyAction, _>(
                     self,
                     event.key_code(),
                     key_state,
@@ -103,15 +103,15 @@ impl RubixState {
             }
             InputEvent::PointerMotion { .. } => {}
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let output = self.space.outputs().next().unwrap();
+                let Some(output) = self.space.outputs().next() else { return; };
 
-                let output_geo = self.space.output_geometry(output).unwrap();
+                let Some(output_geo) = self.space.output_geometry(output) else { return; };
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
 
                 let serial = SERIAL_COUNTER.next_serial();
 
-                let pointer = self.seat.get_pointer().unwrap();
+                let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
 
                 let under = self.surface_under(pos);
 
@@ -127,8 +127,8 @@ impl RubixState {
                 pointer.frame(self);
             }
             InputEvent::PointerButton { event, .. } => {
-                let pointer = self.seat.get_pointer().unwrap();
-                let keyboard = self.seat.get_keyboard().unwrap();
+                let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
+                let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
 
                 let serial = SERIAL_COUNTER.next_serial();
 
@@ -143,18 +143,21 @@ impl RubixState {
                         .map(|(w, l)| (w.clone(), l))
                     {
                         self.space.raise_element(&window, true);
+                        let Some(toplevel) = window.toplevel() else { return; };
                         keyboard.set_focus(
                             self,
-                            Some(window.toplevel().unwrap().wl_surface().clone()),
+                            Some(toplevel.wl_surface().clone()),
                             serial,
                         );
                         self.space.elements().for_each(|window| {
-                            window.toplevel().unwrap().send_pending_configure();
+                            let Some(toplevel) = window.toplevel() else { return; };
+                            toplevel.send_pending_configure();
                         });
                     } else {
                         self.space.elements().for_each(|window| {
                             window.set_activated(false);
-                            window.toplevel().unwrap().send_pending_configure();
+                            let Some(toplevel) = window.toplevel() else { return; };
+                            toplevel.send_pending_configure();
                         });
                         keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                     }
@@ -206,7 +209,7 @@ impl RubixState {
                     }
                 }
 
-                let pointer = self.seat.get_pointer().unwrap();
+                let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
                 pointer.axis(self, frame);
                 pointer.frame(self);
             }
@@ -271,7 +274,7 @@ impl RubixState {
     /// the input filter intercepts them regardless of who holds focus.
     fn focus_active_window(&mut self) {
         let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
         let target = self
             .monitor
             .active_window()
@@ -280,17 +283,20 @@ impl RubixState {
         match target {
             Some(window) => {
                 self.space.raise_element(&window, true);
-                let surface = window.toplevel().unwrap().wl_surface().clone();
+                let Some(toplevel) = window.toplevel() else { return; };
+                let surface = toplevel.wl_surface().clone();
                 self.space.elements().for_each(|w| {
                     w.set_activated(w == &window);
-                    w.toplevel().unwrap().send_pending_configure();
+                    let Some(toplevel) = w.toplevel() else { return; };
+                    toplevel.send_pending_configure();
                 });
                 keyboard.set_focus(self, Some(surface), serial);
             }
             None => {
                 self.space.elements().for_each(|w| {
                     w.set_activated(false);
-                    w.toplevel().unwrap().send_pending_configure();
+                    let Some(toplevel) = w.toplevel() else { return; };
+                    toplevel.send_pending_configure();
                 });
                 keyboard.set_focus(self, Option::<WlSurface>::None, serial);
             }
