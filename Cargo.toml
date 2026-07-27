@@ -32,3 +32,4 @@ smithay-drm-extras = { version = "0.1", default-features = false }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xcursor = "0.3"

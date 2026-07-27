@@ -77,6 +77,7 @@ use smithay::utils::{DeviceFd, Physical, Point, Scale, Transform};
 
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
+use crate::cursor::{pointer_render_elements, RubixRenderElement};
 use crate::state::Pos;
 use crate::{CalloopData, RubixState};
 
@@ -751,14 +752,22 @@ fn render_surface(
         ));
     }
 
-    let mut elements: Vec<SpaceRenderElements<RubixRenderer<'_>, WaylandSurfaceRenderElement<RubixRenderer<'_>>>> =
-        Vec::new();
-    elements.extend(overlay.into_iter().map(SpaceRenderElements::Surface));
-    elements.extend(top.into_iter().map(SpaceRenderElements::Surface));
-    elements.extend(ghosts.into_iter().map(SpaceRenderElements::Surface));
-    elements.extend(space_elements.into_iter().map(SpaceRenderElements::Surface));
-    elements.extend(bottom.into_iter().map(SpaceRenderElements::Surface));
-    elements.extend(background.into_iter().map(SpaceRenderElements::Surface));
+    // Cursor built last (it also needs `renderer`), same "collect before the
+    // combined render call" discipline as the ghost/layer lists above so the
+    // mutable borrow is released before `drm_output.render_frame` below.
+    let cursor_elements =
+        pointer_render_elements(renderer, &state.cursor_status, state.pointer_location, scale);
+
+    // Cursor prepended -- front of the Vec is topmost, and it must draw above
+    // everything else, including overlay layers.
+    let mut elements: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
+    elements.extend(cursor_elements);
+    elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(top.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(background.into_iter().map(RubixRenderElement::Surface));
 
     let frame = surface
         .drm_output

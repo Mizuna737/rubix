@@ -7,7 +7,10 @@ use std::{
 
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
-    input::{Seat, SeatState},
+    input::{
+        pointer::CursorImageStatus,
+        Seat, SeatState,
+    },
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_server::{
@@ -115,6 +118,14 @@ pub struct RubixState {
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
+
+    // Single source of truth for the software cursor's logical position, kept
+    // in sync by BOTH input paths (relative + absolute) in `input.rs`. The
+    // cursor render element (src/cursor.rs) reads this each frame.
+    pub pointer_location: Point<f64, Logical>,
+    // The client-requested cursor image (named/surface/hidden), set by the
+    // `SeatHandler::cursor_image` callback in handlers/mod.rs.
+    pub cursor_status: CursorImageStatus,
 }
 
 impl RubixState {
@@ -154,6 +165,23 @@ impl RubixState {
 
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
+
+        // No output is mapped into `space` yet at construction time (the
+        // winit/udev backends map their output right after `RubixState::new`
+        // returns), so this always takes the `(0.0, 0.0)` branch today. The
+        // `space.outputs()` lookup is kept anyway so this stays correct if
+        // that ordering ever changes.
+        let pointer_location = space
+            .outputs()
+            .next()
+            .and_then(|o| space.output_geometry(o))
+            .map(|geo| {
+                Point::<f64, Logical>::from((
+                    geo.loc.x as f64 + geo.size.w as f64 / 2.0,
+                    geo.loc.y as f64 + geo.size.h as f64 / 2.0,
+                ))
+            })
+            .unwrap_or_else(|| (0.0, 0.0).into());
 
         // Seed the monitor with exactly visible_columns column slots so the
         // active-column cursor (rem_euclid(visible_columns)) always indexes a real
@@ -196,6 +224,9 @@ impl RubixState {
             data_device_state,
             popups,
             seat,
+
+            pointer_location,
+            cursor_status: CursorImageStatus::default_named(),
         }
     }
 

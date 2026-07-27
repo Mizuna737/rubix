@@ -3,6 +3,7 @@
 mod handlers;
 
 mod config;
+mod cursor;
 mod grabs;
 mod input;
 mod model;

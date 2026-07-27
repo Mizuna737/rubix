@@ -1,7 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
         keyboard::{
@@ -101,13 +101,43 @@ impl RubixState {
                     }
                 }
             }
-            InputEvent::PointerMotion { .. } => {}
+            // Relative motion (udev/libinput mice): mirrors the absolute arm
+            // below, but the new location is accumulated from a delta instead
+            // of read off the device directly. Single-monitor clamp for now --
+            // see src/cursor.rs module doc for the multi-monitor caveat.
+            InputEvent::PointerMotion { event, .. } => {
+                let Some(output) = self.space.outputs().next().cloned() else { return; };
+                let Some(output_geo) = self.space.output_geometry(&output) else { return; };
+
+                let mut loc = self.pointer_location + event.delta();
+                loc.x = loc.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
+                loc.y = loc.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
+                self.pointer_location = loc;
+
+                let serial = SERIAL_COUNTER.next_serial();
+                let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
+                let under = self.surface_under(loc);
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location: loc,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(output) = self.space.outputs().next() else { return; };
 
                 let Some(output_geo) = self.space.output_geometry(output) else { return; };
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                // Keep the single source of truth in sync with the relative
+                // path above -- the cursor renderer (src/cursor.rs) reads
+                // `pointer_location` regardless of which input path moved it.
+                self.pointer_location = pos;
 
                 let serial = SERIAL_COUNTER.next_serial();
 

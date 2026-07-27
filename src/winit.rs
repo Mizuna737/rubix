@@ -16,6 +16,7 @@ use smithay::{
     wayland::shell::wlr_layer::Layer,
 };
 
+use crate::cursor::{pointer_render_elements, RubixRenderElement};
 use crate::{CalloopData, RubixState};
 
 pub fn init_winit(
@@ -151,16 +152,30 @@ pub fn init_winit(
                         })
                         .collect();
 
+                    // Cursor built last (it needs `renderer` too) so it stays
+                    // in the same "collect before the combined render call"
+                    // discipline as the ghost/layer lists above -- the
+                    // borrow is released before `damage_tracker.render_output`.
+                    let cursor_elements = pointer_render_elements(
+                        renderer,
+                        &state.cursor_status,
+                        state.pointer_location,
+                        scale,
+                    );
+
                     // Collected before this point so the mutable `renderer`
                     // borrow used to build each element list is released in
-                    // time for `damage_tracker.render_output` below.
-                    let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-                    elements.extend(overlay);
-                    elements.extend(top);
-                    elements.extend(ghost_elements);
-                    elements.extend(space_elements);
-                    elements.extend(bottom);
-                    elements.extend(background);
+                    // time for `damage_tracker.render_output` below. Cursor is
+                    // prepended -- front of the Vec is topmost, and it must
+                    // draw above everything else, including overlay layers.
+                    let mut elements: Vec<RubixRenderElement<GlesRenderer>> = Vec::new();
+                    elements.extend(cursor_elements);
+                    elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(top.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(ghost_elements.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(background.into_iter().map(RubixRenderElement::Surface));
 
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, [0.1, 0.1, 0.1, 1.0])
