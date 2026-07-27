@@ -61,10 +61,11 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
 use smithay::backend::SwapBuffersError;
-use smithay::desktop::space::{space_render_elements, SpaceRenderElements};
+use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::OutputPresentationFeedback;
-use smithay::desktop::Window;
+use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Subpixel};
+use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{connector, crtc, ModeTypeFlags};
@@ -688,9 +689,43 @@ fn render_surface(
     renderer: &mut RubixRenderer<'_>,
     state: &mut RubixState,
 ) -> Result<bool, SwapBuffersError> {
-    let mut elements: Vec<SpaceRenderElements<_, _>> =
-        space_render_elements(renderer, [&state.space], &surface.output, 1.0)
-            .map_err(|_| SwapBuffersError::TemporaryFailure(Box::new(RenderNoMode)))?;
+    // Z-order, top-to-bottom: overlay -> top -> ghosts -> tiled windows (space)
+    // -> bottom -> background. `space_render_elements` was dropped in favor of
+    // building this by hand: as of smithay 0.7 (wayland_frontend feature) it
+    // already folds an output's LayerMap into its result (desktop/space/mod.rs
+    // ~L599-656), which would double-render every layer surface if combined
+    // with our own pass below. `Space::render_elements_for_region` gives the
+    // space's contribution alone.
+    let scale = 1.0_f64;
+    let mut background: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
+    let mut bottom: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
+    let mut top: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
+    let mut overlay: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
+    {
+        let map = layer_map_for_output(&surface.output);
+        for layer in map.layers() {
+            let Some(geo) = map.layer_geometry(layer) else { continue };
+            let loc = geo.loc.to_physical_precise_round(scale);
+            let elems = layer.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'_>>>(
+                renderer,
+                loc,
+                Scale::from(scale),
+                1.0,
+            );
+            match layer.layer() {
+                Layer::Background => background.extend(elems),
+                Layer::Bottom => bottom.extend(elems),
+                Layer::Top => top.extend(elems),
+                Layer::Overlay => overlay.extend(elems),
+            }
+        }
+    }
+
+    let space_elements: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = state
+        .space
+        .output_geometry(&surface.output)
+        .map(|geo| state.space.render_elements_for_region(renderer, &geo, scale, 1.0))
+        .unwrap_or_default();
 
     // Ghost elements for any in-flight rotation wrap, built from
     // `active_ghosts` (populated by `step_animations` right before this call,
@@ -699,23 +734,31 @@ fn render_surface(
     // needs the separate `&mut renderer` already in scope. Output scale is 1.0
     // here, so a logical Pos maps numerically to physical directly -- if that
     // ever changes, this needs `.to_physical_precise_round(scale)` from a
-    // logical point instead. Inserted at the front so ghosts draw top-most.
+    // logical point instead. Rendered between top/overlay and the space so
+    // ghosts stay above tiled windows but below chrome-style layer surfaces.
     let ghost_windows: Vec<(Window, Pos)> = state
         .active_ghosts
         .iter()
         .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
         .collect();
+    let mut ghosts: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
     for (window, pos) in ghost_windows {
-        let ghosts = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'_>>>(
+        ghosts.extend(window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'_>>>(
             renderer,
             Point::<i32, Physical>::from((pos.x, pos.y)),
             Scale::from(1.0),
             1.0,
-        );
-        for g in ghosts {
-            elements.insert(0, SpaceRenderElements::Surface(g));
-        }
+        ));
     }
+
+    let mut elements: Vec<SpaceRenderElements<RubixRenderer<'_>, WaylandSurfaceRenderElement<RubixRenderer<'_>>>> =
+        Vec::new();
+    elements.extend(overlay.into_iter().map(SpaceRenderElements::Surface));
+    elements.extend(top.into_iter().map(SpaceRenderElements::Surface));
+    elements.extend(ghosts.into_iter().map(SpaceRenderElements::Surface));
+    elements.extend(space_elements.into_iter().map(SpaceRenderElements::Surface));
+    elements.extend(bottom.into_iter().map(SpaceRenderElements::Surface));
+    elements.extend(background.into_iter().map(SpaceRenderElements::Surface));
 
     let frame = surface
         .drm_output
@@ -790,14 +833,4 @@ fn schedule_render(udev: &Rc<RefCell<UdevData>>, node: DrmNode, crtc: crtc::Hand
         tracing::warn!("failed to schedule render for {crtc:?}: {e}");
     }
 }
-
-/// Marker error for the "output has no mode yet" temporary failure.
-#[derive(Debug)]
-struct RenderNoMode;
-impl std::fmt::Display for RenderNoMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "output has no mode")
-    }
-}
-impl std::error::Error for RenderNoMode {}
 

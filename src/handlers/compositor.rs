@@ -15,7 +15,7 @@ use smithay::{
     },
 };
 
-use super::xdg_shell;
+use super::{layer_shell, xdg_shell};
 
 impl CompositorHandler for RubixState {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -43,6 +43,7 @@ impl CompositorHandler for RubixState {
         };
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
+        layer_shell::handle_commit(&self.space, surface);
         resize_grab::handle_commit(&mut self.space, surface);
     }
 }

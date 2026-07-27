@@ -9,9 +9,11 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
+    desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
     utils::{Physical, Point, Rectangle, Scale, Transform},
+    wayland::shell::wlr_layer::Layer,
 };
 
 use crate::{CalloopData, RubixState};
@@ -80,12 +82,61 @@ pub fn init_winit(
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
 
+                    // Z-order, top-to-bottom: overlay -> top -> ghosts -> tiled
+                    // windows (space) -> bottom -> background. `render_output`'s
+                    // helper (smithay::desktop::space::render_output) only has a
+                    // slot for `custom_elements` rendered ABOVE the space -- no
+                    // slot below it -- so a background layer passed that way
+                    // would draw on top of every window (the classic inversion).
+                    // Building one combined element list ourselves and driving
+                    // `OutputDamageTracker` directly is the only way to get the
+                    // wallpaper beneath the tiled windows.
+                    let scale = 1.0_f64;
+                    let mut background: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+                    let mut bottom: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+                    let mut top: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+                    let mut overlay: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+                    {
+                        let map = layer_map_for_output(&output);
+                        for layer in map.layers() {
+                            let Some(geo) = map.layer_geometry(layer) else { continue };
+                            let loc = geo.loc.to_physical_precise_round(scale);
+                            let elems = layer
+                                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                                    renderer,
+                                    loc,
+                                    Scale::from(scale),
+                                    1.0,
+                                );
+                            match layer.layer() {
+                                Layer::Background => background.extend(elems),
+                                Layer::Bottom => bottom.extend(elems),
+                                Layer::Top => top.extend(elems),
+                                Layer::Overlay => overlay.extend(elems),
+                            }
+                        }
+                    }
+
+                    // `space_render_elements` is intentionally not used here: as
+                    // of smithay 0.7 (wayland_frontend feature) it already folds
+                    // the output's LayerMap into its result, which would
+                    // double-render every layer surface if combined with the
+                    // pass above. `render_elements_for_region` gives the space's
+                    // own contribution alone.
+                    let space_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+                        .space
+                        .output_geometry(&output)
+                        .map(|geo| state.space.render_elements_for_region(renderer, &geo, scale, 1.0))
+                        .unwrap_or_default();
+
                     // Ghost elements for any in-flight rotation wrap, built from
                     // `active_ghosts` (populated by `step_animations` above, same
                     // frame). Output scale is 1.0 here, so a logical Pos maps
                     // numerically to physical directly -- if that ever changes,
                     // this needs `.to_physical_precise_round(scale)` from a
-                    // logical point instead.
+                    // logical point instead. Rendered between top/overlay and
+                    // the space so ghosts stay above tiled windows but below
+                    // chrome-style layer surfaces.
                     let ghost_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
                         .active_ghosts
                         .iter()
@@ -100,23 +151,20 @@ pub fn init_winit(
                         })
                         .collect();
 
-                    smithay::desktop::space::render_output::<
-                        _,
-                        WaylandSurfaceRenderElement<GlesRenderer>,
-                        _,
-                        _,
-                    >(
-                        &output,
-                        renderer,
-                        &mut framebuffer,
-                        1.0,
-                        0,
-                        [&state.space],
-                        &ghost_elements,
-                        &mut damage_tracker,
-                        [0.1, 0.1, 0.1, 1.0],
-                    )
-                    .unwrap();
+                    // Collected before this point so the mutable `renderer`
+                    // borrow used to build each element list is released in
+                    // time for `damage_tracker.render_output` below.
+                    let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+                    elements.extend(overlay);
+                    elements.extend(top);
+                    elements.extend(ghost_elements);
+                    elements.extend(space_elements);
+                    elements.extend(bottom);
+                    elements.extend(background);
+
+                    damage_tracker
+                        .render_output(renderer, &mut framebuffer, 0, &elements, [0.1, 0.1, 0.1, 1.0])
+                        .unwrap();
                 }
                 backend.submit(Some(&[damage])).unwrap();
 
