@@ -15,6 +15,8 @@ use smithay::reexports::{
     calloop::EventLoop,
     wayland_server::{Display, DisplayHandle},
 };
+use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
+use std::process::Stdio;
 pub use state::RubixState;
 
 pub struct CalloopData {
@@ -91,6 +93,57 @@ fn init_config_watch(event_loop: &EventLoop<CalloopData>) {
     }
 }
 
+/// Spawn XWayland and wire up the `X11Wm` once it signals readiness.
+/// Best-effort: any failure to spawn just logs and leaves X11 app support
+/// off for this run -- XWayland is a convenience layer, never a hard
+/// dependency for the wayland-native compositor to start.
+fn init_xwayland(event_loop: &EventLoop<'static, CalloopData>, display_handle: &DisplayHandle) {
+    let (xwayland, xclient) = match XWayland::spawn(
+        display_handle,
+        None,
+        std::iter::empty::<(String, String)>(),
+        true,
+        Stdio::null(),
+        Stdio::null(),
+        |_| {},
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("failed to spawn XWayland ({e}); X11 app support disabled");
+            return;
+        }
+    };
+
+    let loop_handle = event_loop.handle();
+    let registered = event_loop.handle().insert_source(xwayland, move |event, _, data| match event {
+        XWaylandEvent::Ready { x11_socket, display_number } => {
+            match X11Wm::start_wm(loop_handle.clone(), x11_socket, xclient.clone()) {
+                Ok(wm) => {
+                    data.state.xwm = Some(wm);
+                    // Stored, not exported: `Ready` fires mid-event-loop with the
+                    // libinput/render threads alive, so a global set_var here would
+                    // be UB (edition 2024 marks it unsafe for exactly that reason).
+                    // Spawned clients get DISPLAY set explicitly from xdisplay at
+                    // spawn time (see NavAction::Spawn in input.rs).
+                    data.state.xdisplay = Some(display_number);
+                    tracing::info!("XWayland ready on :{display_number}");
+                }
+                Err(e) => {
+                    tracing::warn!("failed to start X11 WM on XWayland :{display_number} ({e})");
+                }
+            }
+        }
+        XWaylandEvent::Error => {
+            tracing::warn!("XWayland failed to start");
+        }
+    });
+
+    match registered {
+        Ok(_) => tracing::info!("XWayland spawn requested"),
+        Err(e) => tracing::warn!("failed to register XWayland source ({e}); X11 app support disabled"),
+    }
+}
+
 /// Open `$XDG_CACHE_HOME/rubix/rubix.log` (or `~/.cache/rubix/rubix.log`),
 /// creating the directory. Returns `None` if neither env var is set or the file
 /// can't be created -- logging then falls back to stderr only. On the TTY backend
@@ -146,6 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             crate::udev::init_udev(&mut event_loop, &mut data)?;
         }
     }
+
+    init_xwayland(&event_loop, &data.display_handle);
 
     init_config_watch(&event_loop);
 

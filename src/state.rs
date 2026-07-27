@@ -6,7 +6,7 @@ use std::{
 };
 
 use smithay::{
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Space, Window, WindowSurface, WindowSurfaceType},
     input::{
         pointer::CursorImageStatus,
         Seat, SeatState,
@@ -19,7 +19,7 @@ use smithay::{
             Display, DisplayHandle,
         },
     },
-    utils::{Logical, Point},
+    utils::{Logical, Point, Rectangle},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         output::OutputManagerState,
@@ -28,7 +28,9 @@ use smithay::{
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::X11Wm,
 };
 
 use crate::{
@@ -111,6 +113,11 @@ pub struct RubixState {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub layer_shell_state: WlrLayerShellState,
+    pub xwayland_shell_state: XWaylandShellState,
+    // None until XWaylandEvent::Ready fires and X11Wm::start_wm succeeds.
+    pub xwm: Option<X11Wm>,
+    // Display number (e.g. `1` for `:1`), stored for logging/env once XWayland is ready.
+    pub xdisplay: Option<u32>,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<RubixState>,
@@ -137,6 +144,7 @@ impl RubixState {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let mut seat_state = SeatState::new();
@@ -218,6 +226,9 @@ impl RubixState {
             compositor_state,
             xdg_shell_state,
             layer_shell_state,
+            xwayland_shell_state,
+            xwm: None,
+            xdisplay: None,
             shm_state,
             output_manager_state,
             seat_state,
@@ -572,11 +583,23 @@ impl RubixState {
                         continue;
                     };
 
-                    let Some(toplevel) = window.toplevel() else { continue; };
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some((rect.width as i32, rect.height as i32).into());
-                    });
-                    toplevel.send_pending_configure();
+                    match window.underlying_surface() {
+                        WindowSurface::Wayland(toplevel) => {
+                            toplevel.with_pending_state(|state| {
+                                state.size = Some((rect.width as i32, rect.height as i32).into());
+                            });
+                            toplevel.send_pending_configure();
+                        }
+                        WindowSurface::X11(x11) => {
+                            // X11 configure carries position AND size in one rect.
+                            // map_element below still sets the compositor-side
+                            // location; keep both.
+                            let _ = x11.configure(Some(Rectangle::new(
+                                (rect.x as i32, rect.y as i32).into(),
+                                (rect.width as i32, rect.height as i32).into(),
+                            )));
+                        }
+                    }
 
                     self.space.map_element(window, (rect.x as i32, rect.y as i32), false);
                 }
@@ -599,11 +622,25 @@ impl RubixState {
                     let Some(window) = self.windows.get(id).cloned() else {
                         continue;
                     };
-                    let Some(toplevel) = window.toplevel() else { continue; };
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some((rect.width as i32, rect.height as i32).into());
-                    });
-                    toplevel.send_pending_configure();
+                    match window.underlying_surface() {
+                        WindowSurface::Wayland(toplevel) => {
+                            toplevel.with_pending_state(|state| {
+                                state.size = Some((rect.width as i32, rect.height as i32).into());
+                            });
+                            toplevel.send_pending_configure();
+                        }
+                        WindowSurface::X11(x11) => {
+                            // Same rect-carries-position-and-size as the snap
+                            // path; map_element for the tween is driven by the
+                            // plan below (unchanged) -- X11 windows animate
+                            // identically since space placement is
+                            // surface-agnostic.
+                            let _ = x11.configure(Some(Rectangle::new(
+                                (rect.x as i32, rect.y as i32).into(),
+                                (rect.width as i32, rect.height as i32).into(),
+                            )));
+                        }
+                    }
                 }
 
                 // 4-6. Plan tweens, map enter/move at from-position, store.

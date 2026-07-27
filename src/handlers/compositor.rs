@@ -13,6 +13,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
     },
+    xwayland::XWaylandClientData,
 };
 
 use super::{layer_shell, xdg_shell};
@@ -23,6 +24,12 @@ impl CompositorHandler for RubixState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // XWayland's client is created by smithay's own machinery and carries
+        // `XWaylandClientData`, not our `ClientState`, so check it first. All
+        // other clients connect through the listening socket with `ClientState`.
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 

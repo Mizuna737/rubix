@@ -12,6 +12,7 @@ use smithay::{
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::SERIAL_COUNTER,
+    wayland::seat::WaylandFocus,
 };
 
 use serde::Deserialize;
@@ -276,7 +277,17 @@ impl RubixState {
             NavAction::MoveActiveColumnRight => self.monitor.move_active_column(1),
             NavAction::NewGroup => self.monitor.grow_active_column(),
             NavAction::Spawn(command) => {
-                std::process::Command::new("sh").arg("-c").arg(&command).spawn().ok();
+                // Set DISPLAY explicitly from the live XWayland display number so
+                // spawned X11 clients find the server regardless of when XWayland
+                // became ready or what stale value the inherited env holds. None
+                // until XWayland signals Ready -- native-Wayland clients don't
+                // need it anyway (they use WAYLAND_DISPLAY).
+                let mut cmd = std::process::Command::new("sh");
+                cmd.arg("-c").arg(&command);
+                if let Some(n) = self.xdisplay {
+                    cmd.env("DISPLAY", format!(":{n}"));
+                }
+                cmd.spawn().ok();
             },
             NavAction::Quit => {
                 tracing::info!("quit requested; stopping event loop");
@@ -313,8 +324,10 @@ impl RubixState {
         match target {
             Some(window) => {
                 self.space.raise_element(&window, true);
-                let Some(toplevel) = window.toplevel() else { return; };
-                let surface = toplevel.wl_surface().clone();
+                // `wl_surface()` (via `WaylandFocus`) works for both wayland
+                // and X11 windows, unlike `toplevel()` which is `None` for X11.
+                let Some(surface) = window.wl_surface() else { return; };
+                let surface = surface.into_owned();
                 self.space.elements().for_each(|w| {
                     w.set_activated(w == &window);
                     let Some(toplevel) = w.toplevel() else { return; };

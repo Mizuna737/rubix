@@ -23,6 +23,7 @@ smithay = { version = "0.7", default-features = false, features = [
     "use_system_lib",
     "wayland_frontend",
     "desktop",
+    "xwayland",
 ] }
 # default-features off drops the `display-info` (EDID name-parsing) feature: its
 # libdisplay-info-sys pins `< 0.3.0` but the system ships 0.3.0. We only need the

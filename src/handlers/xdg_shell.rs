@@ -260,7 +260,7 @@ impl RubixState {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
     }
-    fn focused_window_id(& self) -> Option<u32> {
+    pub(crate) fn focused_window_id(& self) -> Option<u32> {
         let keyboard = self.seat.get_keyboard().unwrap();
         let focus = keyboard.current_focus();
         let focused_id = focus.and_then(|surface| {
