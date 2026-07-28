@@ -5,13 +5,12 @@ Runs as a waybar `custom` module in continuous mode (`return-type: "json"`):
 stays alive, subscribes to Rubix's IPC socket, and prints one waybar JSON line
 per cube-state change. Waybar re-renders on each line.
 
-Rendering: "column pips + focus title".
-  - One pip per column, 1-based. Empty columns show just the number; occupied
-    non-active columns show `<n>:<count>`; the active column shows
-    `<n>:<app>` with the focused window's short app_id, wrapped in pango markup
-    so it stands out (waybar gives a custom module only one CSS class for the
-    whole strip, so per-pip emphasis has to live in the text as markup).
-  - The focused window's title trails the pips.
+Rendering: "column pips".
+  - One pip per column, 1-based. `<n>:<groups>` is the column number and its
+    group count; empty columns show just the number. The active column adds the
+    focused window's short app_id: `▶<n> (<app>):<groups>`, wrapped in pango
+    markup so it stands out (waybar gives a custom module only one CSS class for
+    the whole strip, so per-pip emphasis has to live in the text as markup).
 
 Resilience: if the socket is missing (rubix not up yet) or the connection drops
 (rubix restarted), emit a muted placeholder and keep retrying -- a waybar module
@@ -26,10 +25,8 @@ import socket
 import sys
 import time
 
-# Pango colors for the active pip / focused title. Tweak in one place; the CSS
-# handles the rest of the module chrome.
+# Pango color for the active pip. The CSS handles the rest of the module chrome.
 ACTIVE_COLOR = "#8ec07c"
-TITLE_COLOR = "#928374"
 
 
 def socketPath():
@@ -91,21 +88,30 @@ def renderPips(snapshot):
     active = snapshot.get("active_column", 0)
     pips = []
     for index, column in enumerate(snapshot.get("columns", [])):
-        windows = columnWindows(column)
-        label = str(index + 1)
+        count = len(column.get("groups", []))
+        tail = f":{count}" if count else ""
         if index == active:
-            focused = next((w for w in windows if w.get("focused")), None)
-            source = focused or (windows[0] if windows else None)
+            # Only name a window when the focus lives in this column's active
+            # group. If the active group is empty (or focus is elsewhere), fall
+            # back to the bare `c:g` pip.
+            groups = column.get("groups", [])
+            activeRow = column.get("active_row", 0)
+            group = groups[activeRow] if 0 <= activeRow < len(groups) else None
+            source = None
+            if group is not None:
+                source = next(
+                    (w for w in group.get("windows", []) if w.get("focused")), None
+                )
             if source is not None:
                 app = shortAppId(
                     source.get("app_id"), source.get("title"), source.get("id")
                 )
-                label = f"{index + 1}:{app}"
+                label = f"{index + 1} ({app}){tail}"
+            else:
+                label = f"{index + 1}{tail}"
             pip = f"<span foreground='{ACTIVE_COLOR}' weight='bold'>▶{escapePango(label)}</span>"
         else:
-            if windows:
-                label = f"{index + 1}:{len(windows)}"
-            pip = escapePango(label)
+            pip = escapePango(f"{index + 1}{tail}")
         pips.append(f"[ {pip} ]")
     return "".join(pips) if pips else "[ – ]"
 
@@ -136,12 +142,8 @@ def renderTooltip(snapshot):
 def renderLine(snapshot):
     """Transform one Rubix snapshot into a waybar JSON payload."""
     focused = focusedWindow(snapshot)
-    text = renderPips(snapshot)
-    if focused and focused.get("title"):
-        title = escapePango(focused["title"])
-        text = f"{text}  <span foreground='{TITLE_COLOR}'>{title}</span>"
     return {
-        "text": text,
+        "text": renderPips(snapshot),
         "tooltip": renderTooltip(snapshot),
         "class": "focused" if focused else "empty",
     }
