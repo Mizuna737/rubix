@@ -48,6 +48,7 @@ impl WlrLayerShellHandler for RubixState {
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         // Find the output whose layer map contains this surface, unmap it, and
         // re-arrange so the remaining layers reclaim the space.
+        let mut arranged = false;
         for output in self.space.outputs().cloned().collect::<Vec<_>>() {
             let mut map = layer_map_for_output(&output);
             let found = map
@@ -57,7 +58,21 @@ impl WlrLayerShellHandler for RubixState {
             if let Some(layer) = found {
                 map.unmap_layer(&layer);
                 map.arrange();
-                return;
+                arranged = true;
+            }
+            // Drop the layer-map borrow before output_bounds()/apply_layout,
+            // which re-borrow the same RefCell.
+            drop(map);
+            if arranged {
+                break;
+            }
+        }
+        // A bar went away; reflow tiled windows back into the reclaimed area.
+        if arranged {
+            let bounds = self.output_bounds();
+            if bounds != self.reserved_bounds {
+                self.reserved_bounds = bounds;
+                self.apply_layout();
             }
         }
     }
@@ -72,7 +87,9 @@ delegate_layer_shell!(RubixState);
 /// itself only auto-sends a configure on *changes after* the initial one (see
 /// its doc comment), so the very first configure has to be sent explicitly
 /// here once the size has been computed.
-pub fn handle_commit(space: &Space<Window>, surface: &WlSurface) {
+/// Returns `true` if `surface` is a layer surface that was (re)arranged -- the
+/// caller uses this to reflow tiled windows when a bar's exclusive zone changes.
+pub fn handle_commit(space: &Space<Window>, surface: &WlSurface) -> bool {
     for output in space.outputs() {
         let mut map = layer_map_for_output(output);
         let Some(layer) = map
@@ -94,6 +111,7 @@ pub fn handle_commit(space: &Space<Window>, surface: &WlSurface) {
         if !initial_configure_sent {
             layer.layer_surface().send_configure();
         }
-        return;
+        return true;
     }
+    false
 }

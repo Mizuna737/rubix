@@ -697,6 +697,17 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, c
             Some(output.clone())
         })
     });
+    // Layer-shell surfaces (waybar, etc.) need frame callbacks too, or they
+    // paint their first buffer and freeze -- they're rendered above but were
+    // never told to produce their next frame.
+    {
+        let map = layer_map_for_output(&output);
+        for layer in map.layers() {
+            layer.send_frame(&output, start.elapsed(), Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
+    }
 
     drop(guard);
 

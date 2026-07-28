@@ -50,7 +50,16 @@ impl CompositorHandler for RubixState {
         };
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
-        layer_shell::handle_commit(&self.space, surface);
+        if layer_shell::handle_commit(&self.space, surface) {
+            // A bar committed; if it changed the reserved area (exclusive zone),
+            // reflow tiled windows into the new bounds -- once per change, not
+            // every repaint frame.
+            let bounds = self.output_bounds();
+            if bounds != self.reserved_bounds {
+                self.reserved_bounds = bounds;
+                self.apply_layout();
+            }
+        }
         resize_grab::handle_commit(&mut self.space, surface);
     }
 }

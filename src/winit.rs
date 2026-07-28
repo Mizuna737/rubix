@@ -196,6 +196,19 @@ pub fn init_winit(
                         |_, _| Some(output.clone()),
                     )
                 });
+                // Layer-shell surfaces (waybar, etc.) need frame callbacks too,
+                // or they paint their first buffer and freeze.
+                {
+                    let map = layer_map_for_output(&output);
+                    for layer in map.layers() {
+                        layer.send_frame(
+                            &output,
+                            state.start_time.elapsed(),
+                            Some(Duration::ZERO),
+                            |_, _| Some(output.clone()),
+                        );
+                    }
+                }
 
                 state.space.refresh();
                 state.popups.cleanup();

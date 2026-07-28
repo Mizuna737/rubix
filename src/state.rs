@@ -110,6 +110,12 @@ pub struct RubixState {
     // subscriber push (see ipc.rs).
     pub ipc_dirty: bool,
 
+    // Last tiling area we laid out into. When a layer surface (bar) changes its
+    // exclusive zone, the reserved area shifts; comparing against this lets the
+    // layer-commit path reflow existing windows exactly once per change instead
+    // of every frame the bar repaints.
+    pub reserved_bounds: Option<Rect>,
+
     animations: HashMap<u32, Tween>,
     pub(crate) pending_transition: Option<Transition>,
     // The exiting-ghost render positions for the in-flight frame, rebuilt fresh
@@ -236,6 +242,7 @@ impl RubixState {
             windows: HashMap::new(),
             next_id: 1,
             ipc_dirty: false,
+            reserved_bounds: None,
             animations: HashMap::new(),
             pending_transition: None,
             active_ghosts: Vec::new(),
@@ -350,18 +357,25 @@ impl RubixState {
     /// configure) onto the live window. Idempotent -- call it after every model
     /// mutation; re-mapping a window at an unchanged rect is a no-op and
     /// `send_pending_configure` only emits when the pending size actually differs.
-    fn output_bounds(&self) -> Option<Rect> {
+    pub(crate) fn output_bounds(&self) -> Option<Rect> {
         let Some(output) = self.space.outputs().next().cloned() else {
             return None;
         };
         let Some(output_geo) = self.space.output_geometry(&output) else {
             return None;
         };
+        // Reserve space for exclusive layer surfaces (e.g. waybar). The layer map
+        // computes this during `arrange()` (run on every layer commit); its
+        // non-exclusive zone is the output-local rect left over after subtracting
+        // each anchored bar's exclusive_zone. Tiling into it keeps windows from
+        // overlapping the bar. `zone.loc` carries the top/left inset, so offset
+        // it by the output's global position.
+        let zone = smithay::desktop::layer_map_for_output(&output).non_exclusive_zone();
         let bounds = Rect {
-            x: output_geo.loc.x.max(0) as u32,
-            y: output_geo.loc.y.max(0) as u32,
-            width: output_geo.size.w.max(0) as u32,
-            height: output_geo.size.h.max(0) as u32,
+            x: (output_geo.loc.x + zone.loc.x).max(0) as u32,
+            y: (output_geo.loc.y + zone.loc.y).max(0) as u32,
+            width: zone.size.w.max(0) as u32,
+            height: zone.size.h.max(0) as u32,
         };
         Some(bounds)
     }
