@@ -6,6 +6,7 @@ mod config;
 mod cursor;
 mod grabs;
 mod input;
+mod ipc;
 mod model;
 mod state;
 mod udev;
@@ -204,6 +205,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_config_watch(&event_loop);
 
+    let ipc_clients = crate::ipc::init_ipc(&event_loop, data.state.xdisplay);
+
     let mut args = std::env::args().skip(1);
     let flag = args.next();
     let arg = args.next();
@@ -227,6 +230,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         data.state.space.refresh();
         data.state.popups.cleanup();
         let _ = data.display_handle.flush_clients();
+        if std::mem::take(&mut data.state.ipc_dirty) {
+            if let Some(clients) = &ipc_clients {
+                crate::ipc::broadcast_snapshot(&data.state, clients);
+            }
+        }
     })?;
 
     Ok(())

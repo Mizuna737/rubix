@@ -252,7 +252,7 @@ impl RubixState {
     /// interception path only -- the model is still a single Group, so this just
     /// confirms the chord reached us (and never reached the client). Steps 2-3
     /// promote the model to a Monitor and wire scroll/rotate/move here.
-    fn dispatch_nav(&mut self, action: NavAction) {
+    pub(crate) fn dispatch_nav(&mut self, action: NavAction) {
         // Motion actions reposition the active column/group, so keyboard focus
         // should follow to whatever now sits in the active slot. Spawn (its focus
         // is a separate on-map concern) and the MoveToNewColumn stub do not.
@@ -305,6 +305,7 @@ impl RubixState {
         if refocus {
             self.focus_active_window();
         }
+        self.ipc_dirty = true;
     }
 
     /// Move keyboard focus to the model's current active window, mirroring the

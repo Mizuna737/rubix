@@ -44,6 +44,7 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
             state.space.unmap_elem(&win);
         }
         state.apply_layout();
+        state.ipc_dirty = true;
     }
 }
 
@@ -74,6 +75,7 @@ impl XwmHandler for RubixState {
             .unwrap_or(SplitDirection::Horizontal);
         self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
         self.apply_layout();
+        self.ipc_dirty = true;
         tracing::info!(
             "new X11 toplevel -> window {id} ({} tracked, {} mapped in space)",
             self.windows.len(),
@@ -91,6 +93,7 @@ impl XwmHandler for RubixState {
         self.windows.insert(id, win.clone());
         // activate=true so it stacks above the tiled windows.
         self.space.map_element(win, (loc.x, loc.y), true);
+        self.ipc_dirty = true;
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {

@@ -170,6 +170,25 @@ impl TilingNode {
             }
         }
     }
+
+    /// All leaf window ids under this node, left-to-right tree order. Plain
+    /// data walk for the IPC snapshot (see model/grid.rs::Group::window_ids) --
+    /// no serde here.
+    pub fn collect_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        self.collect_ids_into(&mut ids);
+        ids
+    }
+
+    fn collect_ids_into(&self, out: &mut Vec<u32>) {
+        match self {
+            TilingNode::Leaf { window_id } => out.push(*window_id),
+            TilingNode::Split { left_child, right_child, .. } => {
+                left_child.collect_ids_into(out);
+                right_child.collect_ids_into(out);
+            }
+        }
+    }
 }
 
 impl CountWindows for TilingNode {

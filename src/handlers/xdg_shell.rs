@@ -56,6 +56,7 @@ impl XdgShellHandler for RubixState {
             .unwrap_or(SplitDirection::Horizontal);
         self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
         self.apply_layout();
+        self.ipc_dirty = true;
         tracing::info!(
             "new toplevel -> window {id} ({} tracked, {} mapped in space)",
             self.windows.len(),
@@ -77,6 +78,7 @@ impl XdgShellHandler for RubixState {
             self.monitor.remove_window(id);
             self.windows.remove(&id);
             self.apply_layout();
+            self.ipc_dirty = true;
         }
     }
 

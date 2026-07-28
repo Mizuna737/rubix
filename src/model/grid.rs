@@ -34,6 +34,14 @@ impl Group {
             }
         }
     }
+    /// Window ids in this group's tree, in tree order. Read-only view for the
+    /// IPC snapshot (see ipc.rs) -- serde stays out of this module entirely.
+    pub fn window_ids(&self) -> Vec<u32> {
+        match &self.layout {
+            Some(node) => node.collect_ids(),
+            None => Vec::new(),
+        }
+    }
     pub fn add_window(&mut self, direction: SplitDirection, window_id: u32, focused_id: u32) {
         match &mut self.layout {
             Some(root_node) => {
@@ -102,6 +110,14 @@ impl Column {
         let signed_active_row = self.active_row as isize;
         self.active_row = (signed_active_row + motion).rem_euclid(rows) as usize
     }
+
+    pub fn active_row(&self) -> usize {
+        self.active_row
+    }
+
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
 }
 
 impl CountWindows for Column {
@@ -140,6 +156,18 @@ impl Monitor {
 
     pub fn add_column(&mut self, column: Column) {
         self.columns.push(column)
+    }
+
+    pub fn active_column(&self) -> usize {
+        self.active_column
+    }
+
+    pub fn visible_columns(&self) -> usize {
+        self.visible_columns
+    }
+
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
     }
 
     pub fn grow_columns(&mut self) -> &mut Column {

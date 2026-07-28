@@ -104,6 +104,12 @@ pub struct RubixState {
     pub windows: HashMap<u32, Window>,
     pub next_id: u32,
 
+    // Set by any mutation that changes cube state (nav dispatch, window
+    // map/unmap). The run-loop callback in main.rs checks-and-clears this once
+    // per dispatch cycle to coalesce a burst of mutations into a single IPC
+    // subscriber push (see ipc.rs).
+    pub ipc_dirty: bool,
+
     animations: HashMap<u32, Tween>,
     pub(crate) pending_transition: Option<Transition>,
     // The exiting-ghost render positions for the in-flight frame, rebuilt fresh
@@ -229,6 +235,7 @@ impl RubixState {
             monitor,
             windows: HashMap::new(),
             next_id: 1,
+            ipc_dirty: false,
             animations: HashMap::new(),
             pending_transition: None,
             active_ghosts: Vec::new(),
