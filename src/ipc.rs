@@ -23,6 +23,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use smithay::reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction};
+use smithay::wayland::seat::WaylandFocus;
 
 use crate::{input::NavAction, state::RubixState, CalloopData};
 
@@ -102,8 +103,22 @@ struct WindowView {
 /// `state.windows` for app_id/title. MVP: app_id/title extraction only covers
 /// the cheap cases (wayland xdg toplevel surface data); anything else is left
 /// `None` rather than blocking the feature on perfect title extraction.
+/// The window id holding real seat keyboard focus, mapped from the focused
+/// wl_surface. Unlike `monitor.active_window()` (which always resolves to a
+/// group's first leaf), this reflects actual focus -- including mouse
+/// click-to-focus onto a non-first window in a group -- so the bar highlights
+/// the window the user is really typing into.
+fn keyboard_focused_id(state: &RubixState) -> Option<u32> {
+    let surface = state.seat.get_keyboard()?.current_focus()?;
+    state
+        .windows
+        .iter()
+        .find(|(_, window)| window.wl_surface().is_some_and(|s| s.as_ref() == &surface))
+        .map(|(id, _)| *id)
+}
+
 fn build_snapshot(state: &RubixState) -> StateSnapshot {
-    let focused = state.monitor.active_window();
+    let focused = keyboard_focused_id(state);
     let columns = state
         .monitor
         .columns()

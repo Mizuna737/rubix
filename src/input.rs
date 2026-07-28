@@ -184,6 +184,9 @@ impl RubixState {
                             let Some(toplevel) = window.toplevel() else { return; };
                             toplevel.send_pending_configure();
                         });
+                        // Keyboard focus moved; push a fresh snapshot so the bar
+                        // tracks click-to-focus, not just nav chords.
+                        self.ipc_dirty = true;
                     } else {
                         self.space.elements().for_each(|window| {
                             window.set_activated(false);
@@ -191,6 +194,7 @@ impl RubixState {
                             toplevel.send_pending_configure();
                         });
                         keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+                        self.ipc_dirty = true;
                     }
                 };
 
