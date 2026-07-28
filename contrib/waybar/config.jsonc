@@ -1,0 +1,72 @@
+// Full waybar config for the Rubix compositor -- parity with the AwesomeWM
+// wibar (bar.lua). Copy into ~/.config/waybar/ or run directly with -c/-s.
+//
+// All custom modules are persistent (continuous return-type json); they rely on
+// Rubix delivering frame callbacks to layer surfaces (the layer send_frame fix)
+// so their live updates actually repaint.
+{
+  "layer": "top",
+  "position": "top",
+  "height": 24,
+  "margin-left": 24,
+  "margin-right": 24,
+  "spacing": 4,
+
+  "modules-left": ["custom/waStatus"],
+  "modules-center": ["custom/rubix"],
+  "modules-right": ["cpu", "memory", "network", "custom/volume", "tray", "custom/clock"],
+
+  // --- Left: the cube pips (Rubix's taglist analog) ---
+  "custom/rubix": {
+    "exec": "python3 ~/Projects/rubix/contrib/waybar/rubixBar.py",
+    "return-type": "json",
+    "escape": false,
+    "restart-interval": 2
+  },
+
+  // --- Left: workAssistant status (REC / Transcribing / Notes) ---
+  "custom/waStatus": {
+    "exec": "python3 ~/Projects/rubix/contrib/waybar/waStatus.py",
+    "return-type": "json",
+    "escape": false,
+    "restart-interval": 2
+  },
+
+  // --- Right: system stats via built-ins ---
+  "cpu": {
+    "interval": 2,
+    "format": "⚙ {usage}%"
+  },
+  "memory": {
+    "interval": 2,
+    "format": "▦ {used:0.1f}G"
+  },
+  "network": {
+    "interval": 2,
+    "format-ethernet": "{bandwidthDownBytes} ↓ {bandwidthUpBytes} ↑",
+    "format-wifi": "{bandwidthDownBytes} ↓ {bandwidthUpBytes} ↑",
+    "format-disconnected": "no net",
+    "tooltip-format": "{ifname}: {ipaddr}"
+  },
+
+  // --- Right: volume with grow/shrink animation ---
+  "custom/volume": {
+    "exec": "python3 ~/Projects/rubix/contrib/waybar/volume.py",
+    "return-type": "json",
+    "escape": false,
+    "restart-interval": 2
+  },
+
+  "tray": {
+    "icon-size": 16,
+    "spacing": 6
+  },
+
+  // --- Right: date + time with ordinal suffix ---
+  "custom/clock": {
+    "exec": "python3 ~/Projects/rubix/contrib/waybar/clockOrdinal.py",
+    "return-type": "json",
+    "escape": false,
+    "restart-interval": 2
+  }
+}
