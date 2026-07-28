@@ -116,13 +116,16 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[
 ];
 
 /// Backend-wide state, shared across calloop sources via `Rc<RefCell<_>>`.
-struct UdevData {
+/// `pub(crate)` (and the `gpus`/`primary_gpu` fields below) so `RubixState`'s
+/// `DmabufHandler` impl (handlers/dmabuf.rs) can reach the renderer through
+/// `RubixState::udev_handle`; the rest stays private to this module.
+pub(crate) struct UdevData {
     /// Seat session -- owns the VT, brokers DRM/input device fds.
     session: LibSeatSession,
     /// The primary render GPU. For a single-GPU box this is the only node.
-    primary_gpu: DrmNode,
+    pub(crate) primary_gpu: DrmNode,
     /// Multi-GPU renderer registry (one node registered per DRM device).
-    gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    pub(crate) gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     /// One entry per DRM device (GPU), keyed by its primary node.
     backends: HashMap<DrmNode, BackendData>,
     /// Loop handle for inserting per-device VBlank sources and frame timers from
@@ -204,6 +207,10 @@ pub fn init_udev(
         loop_handle: event_loop.handle(),
         active: true,
     }));
+
+    // Give `RubixState` a handle back into the renderer, so `DmabufHandler::dmabuf_imported`
+    // (which fires on `RubixState`, not `UdevData`) can validate imported buffers.
+    data.state.udev_handle = Some(udev.clone());
 
     // ---- udev device monitor ----
     let udev_backend = UdevBackend::new(&seat_name)?;
@@ -372,6 +379,22 @@ fn device_added(
         .egl_context()
         .dmabuf_render_formats()
         .clone();
+
+    // Advertise zwp_linux_dmabuf_v1 once, seeded with the primary GPU's render
+    // formats, so GPU-accelerated Wayland clients can hand us dmabuf buffers
+    // instead of falling back to SHM. Only the primary node's formats are
+    // published; secondary GPUs (if any) aren't wired into the dmabuf path yet.
+    if data.state.dmabuf_global.is_none() && render_node == udev_data.primary_gpu {
+        let global = data
+            .state
+            .dmabuf_state
+            .create_global::<RubixState>(&data.display_handle, render_formats.clone());
+        data.state.dmabuf_global = Some(global);
+        tracing::info!(
+            "advertised zwp_linux_dmabuf_v1 ({} formats)",
+            render_formats.iter().count()
+        );
+    }
 
     let allocator = GbmAllocator::new(
         gbm.clone(),

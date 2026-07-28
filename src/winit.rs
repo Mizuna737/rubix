@@ -28,6 +28,11 @@ pub fn init_winit(
 
     let (mut backend, winit) = winit::init()?;
 
+    // TODO(winit dmabuf): winit never creates the zwp_linux_dmabuf_v1 global
+    // (unlike udev's device_added). Nested-dev clients fall back to SHM,
+    // which is fine for the winit dev backend; the udev backend is the
+    // daily-driver path and does advertise the dmabuf global.
+
     let mode = Mode {
         size: backend.window_size(),
         refresh: 60_000,

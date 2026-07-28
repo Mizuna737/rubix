@@ -13,6 +13,7 @@ use smithay::{
     },
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
@@ -22,6 +23,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::wlr_layer::WlrLayerShellState,
@@ -123,6 +125,14 @@ pub struct RubixState {
     pub seat_state: SeatState<RubixState>,
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
+    pub dmabuf_state: DmabufState,
+    // Created lazily once the udev backend knows the primary GPU's render
+    // formats (in `device_added`); stays None on winit.
+    pub dmabuf_global: Option<DmabufGlobal>,
+    // Handle back into the udev backend's renderer, so `DmabufHandler::dmabuf_imported`
+    // (which fires on `RubixState`) can reach `GpuManager::single_renderer` to
+    // validate an imported dmabuf. None on winit.
+    pub(crate) udev_handle: Option<std::rc::Rc<std::cell::RefCell<crate::udev::UdevData>>>,
 
     pub seat: Seat<Self>,
 
@@ -234,6 +244,9 @@ impl RubixState {
             seat_state,
             data_device_state,
             popups,
+            dmabuf_state: DmabufState::new(),
+            dmabuf_global: None,
+            udev_handle: None,
             seat,
 
             pointer_location,
@@ -587,6 +600,10 @@ impl RubixState {
                         WindowSurface::Wayland(toplevel) => {
                             toplevel.with_pending_state(|state| {
                                 state.size = Some((rect.width as i32, rect.height as i32).into());
+                                state.states.set(xdg_toplevel::State::TiledLeft);
+                                state.states.set(xdg_toplevel::State::TiledRight);
+                                state.states.set(xdg_toplevel::State::TiledTop);
+                                state.states.set(xdg_toplevel::State::TiledBottom);
                             });
                             toplevel.send_pending_configure();
                         }
@@ -626,6 +643,10 @@ impl RubixState {
                         WindowSurface::Wayland(toplevel) => {
                             toplevel.with_pending_state(|state| {
                                 state.size = Some((rect.width as i32, rect.height as i32).into());
+                                state.states.set(xdg_toplevel::State::TiledLeft);
+                                state.states.set(xdg_toplevel::State::TiledRight);
+                                state.states.set(xdg_toplevel::State::TiledTop);
+                                state.states.set(xdg_toplevel::State::TiledBottom);
                             });
                             toplevel.send_pending_configure();
                         }
