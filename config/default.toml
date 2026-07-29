@@ -48,6 +48,10 @@ duration_ms = 250
 # Flip the focused window's parent split between horizontal and vertical.
 "Alt+r" = "FlipSplitDirection"
 "Alt+Shift+space" = { Spawn = "alacritty" }
+# Launcher. rofi picks its wayland (layer-shell) backend automatically under
+# Rubix; the compositor grants it keyboard focus via layer-shell keyboard
+# interactivity (see focus_interactive_layer).
+"Super+space" = { Spawn = "rofi -show drun" }
 # Exit the compositor. On the TTY backend this is the only in-session quit (winit
 # also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
 # Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the

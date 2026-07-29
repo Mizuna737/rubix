@@ -4,6 +4,7 @@ use smithay::{
     output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     reexports::wayland_server::protocol::wl_output::WlOutput,
+    utils::SERIAL_COUNTER,
     wayland::compositor::with_states,
     wayland::shell::wlr_layer::{
         Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler, WlrLayerShellState,
@@ -46,6 +47,16 @@ impl WlrLayerShellHandler for RubixState {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        // If the dismissed layer (e.g. rofi) currently holds keyboard focus,
+        // hand focus back to the model's active window rather than leaving it
+        // stranded on a dead surface. Captured before the unmap below.
+        let had_focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|k| k.current_focus())
+            .as_ref()
+            == Some(surface.wl_surface());
+
         // Find the output whose layer map contains this surface, unmap it, and
         // re-arrange so the remaining layers reclaim the space.
         let mut arranged = false;
@@ -75,6 +86,43 @@ impl WlrLayerShellHandler for RubixState {
                 self.apply_layout();
             }
         }
+        if had_focus {
+            self.focus_active_window();
+        }
+    }
+}
+
+impl RubixState {
+    /// If the just-committed layer surface requested keyboard interactivity
+    /// (Exclusive/OnDemand -- e.g. a wayland-native rofi), route keyboard focus
+    /// to it so it actually receives keystrokes. Without this a launcher maps
+    /// and renders but eats nothing. Idempotent: a no-op once the surface
+    /// already holds focus, so the per-commit call cost stays flat, and nav
+    /// chords keep working because the input filter intercepts them regardless
+    /// of who holds focus.
+    ///
+    /// Known gap (fine to refine later): this focuses *any* interactive layer,
+    /// so a second interactive layer mapping over the first would steal focus;
+    /// today rofi is the only such client.
+    pub(crate) fn focus_interactive_layer(&mut self, surface: &WlSurface) {
+        let wants = self.space.outputs().any(|output| {
+            layer_map_for_output(output)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .map(|l| l.can_receive_keyboard_focus())
+                .unwrap_or(false)
+        });
+        if !wants {
+            return;
+        }
+        let keyboard = self
+            .seat
+            .get_keyboard()
+            .expect("keyboard added to seat at startup");
+        if keyboard.current_focus().as_ref() == Some(surface) {
+            return;
+        }
+        let serial = SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, Some(surface.clone()), serial);
     }
 }
 

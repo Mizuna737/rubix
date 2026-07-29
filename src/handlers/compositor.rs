@@ -59,6 +59,9 @@ impl CompositorHandler for RubixState {
                 self.reserved_bounds = bounds;
                 self.apply_layout();
             }
+            // A layer surface committed; if it asked for keyboard interactivity
+            // (a launcher like rofi), route focus to it now that it's mapped.
+            self.focus_interactive_layer(surface);
         }
         resize_grab::handle_commit(&mut self.space, surface);
     }
