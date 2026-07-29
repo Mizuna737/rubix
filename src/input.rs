@@ -186,7 +186,12 @@ impl RubixState {
                         // Keyboard focus moved; push a fresh snapshot so the bar
                         // tracks click-to-focus, not just nav chords.
                         self.ipc_dirty = true;
-                    } else {
+                    } else if self.surface_under(pointer.current_location()).is_none() {
+                        // No toplevel *and* no layer surface under the pointer: a
+                        // genuine empty-desktop click, so drop keyboard focus. A
+                        // click that landed on a (non-keyboard) layer surface --
+                        // e.g. a mako notification or the bar -- must NOT steal
+                        // focus from the active window, so it's excluded here.
                         self.space.elements().for_each(|window| {
                             window.set_activated(false);
                             let Some(toplevel) = window.toplevel() else { return; };

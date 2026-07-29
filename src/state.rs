@@ -6,7 +6,7 @@ use std::{
 };
 
 use smithay::{
-    desktop::{PopupManager, Space, Window, WindowSurface, WindowSurfaceType},
+    desktop::{layer_map_for_output, LayerSurface, PopupManager, Space, Window, WindowSurface, WindowSurfaceType},
     input::{
         pointer::CursorImageStatus,
         Seat, SeatState,
@@ -26,7 +26,7 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::wlr_layer::WlrLayerShellState,
+        shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
@@ -310,12 +310,58 @@ impl RubixState {
         socket_name
     }
 
+    /// Resolve the surface (and its global position) under the pointer, honouring
+    /// the layer-shell stacking order: overlay/top layer surfaces sit *above* the
+    /// tiled windows, bottom/background *below* -- the same z-order the render
+    /// paths build. Without the layer hit-test the space's toplevels were the only
+    /// thing the pointer could ever land on, so layer clients (mako notifications,
+    /// the bar) never received pointer enter/button events and couldn't be clicked.
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space.element_under(pos).and_then(|(window, location)| {
-            window
+        let output = self.space.outputs().next()?;
+        let output_loc = self.space.output_geometry(output).map(|g| g.loc).unwrap_or_default();
+        let layers = layer_map_for_output(output);
+        // layer_geometry / layer_under work in output-local coords; shift the global
+        // pointer position into that space, and shift results back out.
+        let local = pos - output_loc.to_f64();
+
+        let hit_layer = |layer: &LayerSurface| -> Option<(WlSurface, Point<f64, Logical>)> {
+            let base = layers.layer_geometry(layer)?.loc.to_f64() + output_loc.to_f64();
+            layer
+                .surface_under(pos - base, WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, p.to_f64() + base))
+        };
+
+        // Above the tiled windows.
+        if let Some(layer) = layers
+            .layer_under(WlrLayer::Overlay, local)
+            .or_else(|| layers.layer_under(WlrLayer::Top, local))
+        {
+            if let Some(hit) = hit_layer(layer) {
+                return Some(hit);
+            }
+        }
+
+        // The tiled windows themselves.
+        if let Some((window, location)) = self.space.element_under(pos) {
+            if let Some(hit) = window
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
-        })
+            {
+                return Some(hit);
+            }
+        }
+
+        // Below the tiled windows.
+        if let Some(layer) = layers
+            .layer_under(WlrLayer::Bottom, local)
+            .or_else(|| layers.layer_under(WlrLayer::Background, local))
+        {
+            if let Some(hit) = hit_layer(layer) {
+                return Some(hit);
+            }
+        }
+
+        None
     }
 
     /// Hot-reload keybinds from the user config file. Only the keybind set is
