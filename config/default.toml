@@ -6,6 +6,15 @@
 # Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.
 visible_columns = 3
 
+# Gap, in pixels, between each column and the monitor edge / its neighbours.
+# Monitor edges and inter-column seams both measure exactly outer_gap (the seam is
+# split half-and-half between adjacent columns). Omitting the key defaults to 20.
+outer_gap = 20
+
+# Gap, in pixels, between tiled windows *within* a group's split tree. Exactly one
+# inner_gap sits in each split seam. Omitting the key defaults to 10.
+inner_gap = 10
+
 [animation]
 # Duration of scroll/rotate slide tweens, in milliseconds. Omitting this
 # section entirely is fine -- it defaults to 250.

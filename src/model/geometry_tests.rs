@@ -34,14 +34,14 @@
 
     #[test]
     fn single_leaf_fills_the_whole_bounds() {
-        let layout = compute_layout(&leaf(1), rect(0, 0, 800, 600));
+        let layout = compute_layout(&leaf(1), rect(0, 0, 800, 600), 0);
         assert_eq!(layout, vec![(1, rect(0, 0, 800, 600))]);
     }
 
     #[test]
     fn horizontal_split_places_children_side_by_side_and_tiles_exactly() {
         let tree = hsplit(0.5, leaf(1), leaf(2));
-        let layout = compute_layout(&tree, rect(0, 0, 800, 600));
+        let layout = compute_layout(&tree, rect(0, 0, 800, 600), 0);
         assert_eq!(find(&layout, 1), rect(0, 0, 400, 600));
         assert_eq!(find(&layout, 2), rect(400, 0, 400, 600));
         // right child begins exactly where left ends -- no gap, no overlap
@@ -53,7 +53,7 @@
     #[test]
     fn vertical_split_stacks_children_and_tiles_exactly() {
         let tree = vsplit(0.5, leaf(1), leaf(2));
-        let layout = compute_layout(&tree, rect(0, 0, 800, 600));
+        let layout = compute_layout(&tree, rect(0, 0, 800, 600), 0);
         assert_eq!(find(&layout, 1), rect(0, 0, 800, 300));
         assert_eq!(find(&layout, 2), rect(0, 300, 800, 300));
         let (top, bottom) = (find(&layout, 1), find(&layout, 2));
@@ -65,7 +65,7 @@
     fn uneven_ratio_leaves_no_gap_via_remainder() {
         // 0.333 * 100 = 33 (truncated); right must get the remaining 67, not 66.
         let tree = hsplit(0.333, leaf(1), leaf(2));
-        let layout = compute_layout(&tree, rect(0, 0, 100, 50));
+        let layout = compute_layout(&tree, rect(0, 0, 100, 50), 0);
         let (l, r) = (find(&layout, 1), find(&layout, 2));
         assert_eq!(l.width, 33);
         assert_eq!(r.width, 67);
@@ -82,7 +82,7 @@
         //   |  A  |  C  |
         //   +-----+-----+
         let tree = hsplit(0.5, leaf(1), vsplit(0.5, leaf(2), leaf(3)));
-        let layout = compute_layout(&tree, rect(0, 0, 800, 600));
+        let layout = compute_layout(&tree, rect(0, 0, 800, 600), 0);
 
         let a = find(&layout, 1);
         let b = find(&layout, 2);
@@ -107,12 +107,89 @@
         // Vertical analog of the horizontal remainder test: 0.333 * 50 = 16
         // (truncated), so the bottom child must take the remaining 34, not 33.
         let tree = vsplit(0.333, leaf(1), leaf(2));
-        let layout = compute_layout(&tree, rect(0, 0, 100, 50));
+        let layout = compute_layout(&tree, rect(0, 0, 100, 50), 0);
         let (top, bottom) = (find(&layout, 1), find(&layout, 2));
         assert_eq!(top.height, 16);
         assert_eq!(bottom.height, 34);
         assert_eq!(bottom.y, 16); // bottom begins exactly where top ends
         assert_eq!(top.height + bottom.height, 50); // exact, no seam
+    }
+
+    // ---- inner_gap ----
+    // Every split node inserts exactly one inner_gap in its seam; the ratio applies
+    // to the *usable* span (bounds minus the gap), and the cross axis is untouched.
+
+    #[test]
+    fn horizontal_split_inserts_exactly_one_inner_gap() {
+        // usable = 800 - 20 = 780; 0.5 * 780 = 390 each, 20px seam between them.
+        let tree = hsplit(0.5, leaf(1), leaf(2));
+        let layout = compute_layout(&tree, rect(0, 0, 800, 600), 20);
+        let (l, r) = (find(&layout, 1), find(&layout, 2));
+        assert_eq!(l, rect(0, 0, 390, 600));
+        assert_eq!(r, rect(410, 0, 390, 600));
+        // one inner_gap in the seam, and content + gap still spans the bounds exactly
+        assert_eq!(r.x - (l.x + l.width), 20);
+        assert_eq!(l.width + 20 + r.width, 800);
+        // cross axis (height) passes through untouched -- the gap is axis-local
+        assert_eq!(l.height, 600);
+        assert_eq!(r.height, 600);
+    }
+
+    #[test]
+    fn vertical_split_inserts_exactly_one_inner_gap() {
+        // usable = 600 - 20 = 580; 0.5 * 580 = 290 each, 20px seam between them.
+        let tree = vsplit(0.5, leaf(1), leaf(2));
+        let layout = compute_layout(&tree, rect(0, 0, 800, 600), 20);
+        let (top, bottom) = (find(&layout, 1), find(&layout, 2));
+        assert_eq!(top, rect(0, 0, 800, 290));
+        assert_eq!(bottom, rect(0, 310, 800, 290));
+        assert_eq!(bottom.y - (top.y + top.height), 20);
+        assert_eq!(top.height + 20 + bottom.height, 600);
+        // cross axis (width) untouched
+        assert_eq!(top.width, 800);
+        assert_eq!(bottom.width, 800);
+    }
+
+    #[test]
+    fn nested_split_gaps_are_one_per_seam_and_do_not_accumulate() {
+        // A | (B / C): a root H-split whose right child is a V-split. Each seam --
+        // the A|column divider and the B/C divider -- must carry exactly one gap,
+        // and neither should bleed onto the other's axis.
+        let tree = hsplit(0.5, leaf(1), vsplit(0.5, leaf(2), leaf(3)));
+        let layout = compute_layout(&tree, rect(0, 0, 800, 600), 20);
+        let (a, b, c) = (find(&layout, 1), find(&layout, 2), find(&layout, 3));
+
+        // root H-split: usable 780, A gets 390, right column starts at 410 (one gap)
+        assert_eq!(a, rect(0, 0, 390, 600));
+        assert_eq!(b, rect(410, 0, 390, 290));
+        assert_eq!(c, rect(410, 310, 390, 290));
+
+        // horizontal seam A|column = one inner_gap; B and C share the column's left edge
+        assert_eq!(b.x - (a.x + a.width), 20);
+        assert_eq!(c.x, b.x);
+        // vertical seam B/C = one inner_gap, independent of the horizontal one
+        assert_eq!(c.y - (b.y + b.height), 20);
+        // B and C keep the full right-column width -- the V-split's gap didn't touch x
+        assert_eq!(b.width, 390);
+        assert_eq!(c.width, 390);
+    }
+
+    #[test]
+    fn inner_gap_larger_than_bounds_saturates_to_zero_size_without_panic() {
+        // Pathological: gap exceeds the axis. usable saturates to 0, so both
+        // children collapse to zero width -- degenerate but panic-free (the u32
+        // subtractions never underflow).
+        let tree = hsplit(0.5, leaf(1), leaf(2));
+        let layout = compute_layout(&tree, rect(0, 0, 30, 50), 100);
+        assert_eq!(find(&layout, 1).width, 0);
+        assert_eq!(find(&layout, 2).width, 0);
+    }
+
+    #[test]
+    fn single_leaf_ignores_inner_gap() {
+        // A leaf has no seam, so a nonzero gap must not inset it at all.
+        let layout = compute_layout(&leaf(1), rect(0, 0, 800, 600), 20);
+        assert_eq!(layout, vec![(1, rect(0, 0, 800, 600))]);
     }
 
     // ---- longer_axis (auto-split heuristic) ----

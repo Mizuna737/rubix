@@ -354,3 +354,86 @@
         assert_eq!(dest.count_windows(), 2);
         assert!(matches!(group_axis(dest), Some(SplitDirection::Vertical)));
     }
+
+    // ---- gaps: outer (column<->edge/neighbour) and their composition with inner ----
+    // Half-seam contract: monitor edges and inter-column seams both measure exactly
+    // outer_gap (each column claims half of every shared seam). These tests pin the
+    // seam arithmetic, the single-column edge case, the odd-value no-lost-pixel
+    // guarantee, and that outer + inner gaps compose without interfering.
+    use super::super::geometry::Rect;
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
+        Rect { x, y, width, height }
+    }
+    fn find(layout: &[(u32, Rect)], id: u32) -> Rect {
+        layout.iter().find(|(i, _)| *i == id).expect("window id present in layout").1
+    }
+
+    #[test]
+    fn outer_gap_makes_every_seam_and_edge_uniform_across_three_columns() {
+        // 900px / 3 = 300px bands; outer_gap 30 => half-seam 15 either side of each
+        // internal divider, full 30 at the monitor edges. All spacing reads as 30.
+        let mon = monitor_from(&[&[1], &[2], &[3]], &[0, 0, 0]);
+        let layout = mon.compute_layout(rect(0, 0, 900, 600), 30, 0);
+        let (c0, c1, c2) = (find(&layout, 1), find(&layout, 2), find(&layout, 3));
+
+        assert_eq!(c0, rect(30, 30, 255, 540));
+        assert_eq!(c1, rect(315, 30, 270, 540));
+        assert_eq!(c2, rect(615, 30, 255, 540));
+
+        // left edge, right edge, and both internal seams all equal outer_gap
+        assert_eq!(c0.x, 30);
+        assert_eq!(900 - (c2.x + c2.width), 30);
+        assert_eq!(c1.x - (c0.x + c0.width), 30);
+        assert_eq!(c2.x - (c1.x + c1.width), 30);
+        // vertical edges too
+        assert_eq!(c0.y, 30);
+        assert_eq!(600 - (c0.y + c0.height), 30);
+    }
+
+    #[test]
+    fn single_column_inherits_outer_gap_on_all_four_edges() {
+        // The lone-column case Max flagged: one leaf, no seams, so it's simply
+        // inset by outer_gap on every side -- no smart-gaps special-case needed.
+        let mon = monitor_from(&[&[1]], &[0]);
+        let layout = mon.compute_layout(rect(0, 0, 800, 600), 20, 0);
+        assert_eq!(find(&layout, 1), rect(20, 20, 760, 560));
+    }
+
+    #[test]
+    fn odd_outer_gap_keeps_the_seam_exact_with_no_lost_pixel() {
+        // outer_gap 15 is odd: half_low=7, half_high=8. The seam must still sum to
+        // exactly 15 (7 from one column + 8 from its neighbour), not 14 -- this is
+        // the whole reason for the low/high split rather than a bare /2.
+        let mon = monitor_from(&[&[1], &[2]], &[0, 0]);
+        let layout = mon.compute_layout(rect(0, 0, 600, 400), 15, 0);
+        let (c0, c1) = (find(&layout, 1), find(&layout, 2));
+        assert_eq!(c1.x - (c0.x + c0.width), 15); // seam exact despite odd gap
+        assert_eq!(c0.x, 15);                     // left edge
+        assert_eq!(600 - (c1.x + c1.width), 15);  // right edge
+    }
+
+    #[test]
+    fn outer_and_inner_gaps_compose_in_a_split_column() {
+        // Left column holds an h-split(1|2); right column a lone leaf 3. The inner
+        // gap lives inside column 0's split; the outer gap sits between the columns.
+        // Neither should perturb the other's arithmetic.
+        let mut mon = Monitor::new(0, 2);
+        let mut c0 = Column::new(0);
+        c0.add_group(split_group(1, 2));
+        mon.add_column(c0);
+        let mut c1 = Column::new(0);
+        c1.add_group(leaf_group(3));
+        mon.add_column(c1);
+
+        let layout = mon.compute_layout(rect(0, 0, 800, 600), 20, 10);
+        let (w1, w2, w3) = (find(&layout, 1), find(&layout, 2), find(&layout, 3));
+
+        // column 0 bounds (20,20,370,560); split usable 360 -> 180 each, 10px seam
+        assert_eq!(w1, rect(20, 20, 180, 560));
+        assert_eq!(w2, rect(210, 20, 180, 560));
+        // column 1 lone leaf, inset by outer_gap
+        assert_eq!(w3, rect(410, 20, 370, 560));
+        // inner seam inside column 0 = inner_gap; outer seam between columns = outer_gap
+        assert_eq!(w2.x - (w1.x + w1.width), 10);
+        assert_eq!(w3.x - (w2.x + w2.width), 20);
+    }

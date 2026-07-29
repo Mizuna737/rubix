@@ -306,8 +306,7 @@ impl Monitor {
         self.active_group_mut().add_window(direction,id,focused_id);
     }
 
-    pub fn compute_layout(&self, bounds: Rect) -> Vec<(u32, Rect)> {
-        let column_width = (bounds.width / self.visible_columns as u32) as usize;
+    pub fn compute_layout(&self, bounds: Rect, outer_gap: u32, inner_gap: u32) -> Vec<(u32, Rect)> {
         let columns = self.columns.iter().enumerate().take(self.visible_columns);
         let mut monitor_vec = Vec::new();
         for (i, c) in columns {
@@ -317,13 +316,25 @@ impl Monitor {
                     match &group.layout {
                         None => (),
                         Some(layout) => {
+                            // For gaps support we need to distinguish between edge columns and
+                            // central columns. We also need to account for the edge case of only
+                            // one visible column. Columns on edges offset bounds.x by outer_gap and
+                            // subtract outer_gap from their width (for each edge). This is a
+                            // surprisingly involved puzzle.
+                            let half_gap_low = outer_gap / 2;
+                            let half_gap_high = outer_gap - half_gap_low;
+                            let usize_width = bounds.width as usize;
+                            let x_left = bounds.x + (i * usize_width / self.visible_columns) as u32;
+                            let x_right = bounds.x + ((i+1) * usize_width / self.visible_columns) as u32;
+                            let left_inset = if i == 0 { outer_gap } else { half_gap_high };
+                            let right_inset = if i == self.visible_columns - 1 { outer_gap } else { half_gap_low };
                             let column_bounds = Rect {
-                                x: bounds.x + (i * column_width) as u32,
-                                y: bounds.y,
-                                width: column_width as u32,
-                                height: bounds.height,
+                                x: x_left + left_inset,
+                                y: bounds.y + outer_gap,
+                                width: (x_right - x_left).saturating_sub(left_inset + right_inset),
+                                height: bounds.height.saturating_sub(2 * outer_gap),
                             };
-                            let column_vec = compute_layout(layout, column_bounds);
+                            let column_vec = compute_layout(layout, column_bounds, inner_gap);
                             monitor_vec.extend(column_vec);
                         }
                     }

@@ -12,24 +12,30 @@ impl Rect {
         if self.width >= self.height { SplitDirection::Horizontal } else { SplitDirection::Vertical }
     }
 }
-pub fn compute_layout(node: &TilingNode, bounds: Rect) -> Vec<(u32, Rect)> {
+pub fn compute_layout(node: &TilingNode, bounds: Rect, inner_gap: u32) -> Vec<(u32, Rect)> {
     match node {
         TilingNode::Leaf { window_id } => {
             vec![(*window_id,bounds)]
         }
         TilingNode::Split { split_direction, split_ratio, left_child, right_child } => {
+            let usable_bounds = Rect {
+                x: bounds.x,
+                y: bounds.y,
+                width: bounds.width.saturating_sub(inner_gap),
+                height: bounds.height.saturating_sub(inner_gap),
+            };
             let (left_bounds, right_bounds) = match split_direction {
                 SplitDirection::Horizontal => {
                     let left = Rect {
                         x: bounds.x,
                         y: bounds.y,
-                        width: (bounds.width as f32 * *split_ratio) as u32,
+                        width: (usable_bounds.width as f32 * *split_ratio) as u32,
                         height: bounds.height,
                     };
                     let right = Rect {
-                        x: bounds.x + left.width,
+                        x: bounds.x + left.width + inner_gap,
                         y: bounds.y,
-                        width: bounds.width - left.width,
+                        width: usable_bounds.width - left.width,
                         height: bounds.height,
                     };
                     (left,right)
@@ -39,19 +45,19 @@ pub fn compute_layout(node: &TilingNode, bounds: Rect) -> Vec<(u32, Rect)> {
                         x: bounds.x,
                         y: bounds.y,
                         width: bounds.width,
-                        height: (bounds.height as f32 * *split_ratio) as u32,
+                        height: (usable_bounds.height as f32 * *split_ratio) as u32,
                     };
                     let right = Rect {
                         x: bounds.x,
-                        y: bounds.y + left.height,
+                        y: bounds.y + left.height + inner_gap,
                         width: bounds.width,
-                        height: bounds.height - left.height,
+                        height: usable_bounds.height - left.height,
                     };
                     (left,right)
                 }
             };
-            let mut windows = compute_layout(left_child,left_bounds);
-            windows.extend(compute_layout(right_child,right_bounds));
+            let mut windows = compute_layout(left_child,left_bounds,inner_gap);
+            windows.extend(compute_layout(right_child,right_bounds,inner_gap));
             windows
         }
     }

@@ -19,6 +19,8 @@ const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 /// the raw string form only exists during deserialization.
 pub struct Config {
     pub visible_columns: usize,
+    pub outer_gap: u32,
+    pub inner_gap: u32,
     pub keybinds: Vec<Keybind>,
     pub animation_duration: Duration,
 }
@@ -61,6 +63,12 @@ struct RawConfig {
 #[derive(Deserialize)]
 struct RawLayout {
     visible_columns: usize,
+    // Gaps are optional: a config predating them (or a minimal one) still parses,
+    // falling back to the same values the layout was hardcoded to before config wiring.
+    #[serde(default = "default_outer_gap")]
+    outer_gap: u32,
+    #[serde(default = "default_inner_gap")]
+    inner_gap: u32,
 }
 
 // Optional section: a config omitting `[animation]` entirely still parses,
@@ -79,6 +87,14 @@ impl Default for RawAnimation {
 
 fn default_duration_ms() -> u64 {
     250
+}
+
+fn default_outer_gap() -> u32 {
+    20
+}
+
+fn default_inner_gap() -> u32 {
+    10
 }
 
 impl Config {
@@ -108,6 +124,8 @@ impl Config {
 
         Config {
             visible_columns: raw.layout.visible_columns,
+            outer_gap: raw.layout.outer_gap,
+            inner_gap: raw.layout.inner_gap,
             keybinds,
             animation_duration: Duration::from_millis(raw.animation.duration_ms),
         }

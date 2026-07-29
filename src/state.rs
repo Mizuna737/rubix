@@ -340,6 +340,10 @@ impl RubixState {
         let count = new.keybinds.len();
         self.config.keybinds = new.keybinds;
         self.config.animation_duration = new.animation_duration;
+        // Gaps are per-frame layout inputs, not structural like visible_columns --
+        // safe to swap live; the next apply_layout re-tiles with the new values.
+        self.config.outer_gap = new.outer_gap;
+        self.config.inner_gap = new.inner_gap;
         tracing::info!("reloaded config: {count} keybinds active");
     }
 
@@ -383,7 +387,7 @@ impl RubixState {
     pub fn window_rect(&self, id: u32) -> Option<Rect> {
         let bounds = self.output_bounds()?;
         self.monitor
-            .compute_layout(bounds)
+            .compute_layout(bounds, self.config.outer_gap, self.config.inner_gap)
             .into_iter()
             .find(|(wid, _)| *wid == id)
             .map(|(_, rect)| rect)
@@ -591,7 +595,7 @@ impl RubixState {
 
     pub fn apply_layout(&mut self) {
         let Some(bounds) = self.output_bounds() else { return };
-        let targets = self.monitor.compute_layout(bounds);
+        let targets = self.monitor.compute_layout(bounds, self.config.outer_gap, self.config.inner_gap);
 
         match self.pending_transition.take() {
             None => {
