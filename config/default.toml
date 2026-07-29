@@ -52,6 +52,15 @@ duration_ms = 250
 # Rubix; the compositor grants it keyboard focus via layer-shell keyboard
 # interactivity (see focus_interactive_layer).
 "Super+space" = { Spawn = "rofi -show drun" }
+# Audio. Bare XF86 media keysyms (resolved case-sensitively by xkb) reach the
+# compositor via libinput on the TTY; each Spawns a pactl command against the
+# default sink/source. The waybar volume module reacts on its own via `pactl
+# subscribe`, so no compositor-side sink handler is needed. pactl matches the
+# bar's tooling (@DEFAULT_SINK@).
+"XF86AudioRaiseVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ +5%" }
+"XF86AudioLowerVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ -5%" }
+"XF86AudioMute" = { Spawn = "pactl set-sink-mute @DEFAULT_SINK@ toggle" }
+"XF86AudioMicMute" = { Spawn = "pactl set-source-mute @DEFAULT_SOURCE@ toggle" }
 # Exit the compositor. On the TTY backend this is the only in-session quit (winit
 # also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
 # Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the
