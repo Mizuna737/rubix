@@ -1,6 +1,15 @@
 # Rubix default configuration.
 # Copy to $XDG_CONFIG_HOME/rubix/config.toml (or ~/.config/rubix/config.toml) to override.
 
+# Commands run once, via `sh -c`, after the compositor is up (Wayland socket
+# published + XWayland ready). The Rubix equivalent of AwesomeWM's autorun.
+# Here: import the compositor env into the systemd --user environment and start
+# the Rubix session target, which pulls in the notification daemon (mako),
+# clipboard (copyq), polkit agent, wallpaper (swaybg), and teams-for-notif.
+startup = [
+    "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start rubix-session.target",
+]
+
 [layout]
 # Number of columns instantiated on the monitor at startup.
 # Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.

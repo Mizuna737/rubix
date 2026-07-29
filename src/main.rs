@@ -129,6 +129,19 @@ fn init_xwayland(event_loop: &EventLoop<'static, CalloopData>, display_handle: &
                     // spawn time (see NavAction::Spawn in input.rs).
                     data.state.xdisplay = Some(display_number);
                     tracing::info!("XWayland ready on :{display_number}");
+
+                    // Fire configured startup commands once, now that the
+                    // compositor is fully up: the Wayland socket is published
+                    // (children inherit WAYLAND_DISPLAY) and XWayland is ready
+                    // (DISPLAY set explicitly, as in NavAction::Spawn). `Ready`
+                    // is a one-shot event, so this runs exactly once.
+                    for command in &data.state.config.startup {
+                        let mut cmd = std::process::Command::new("sh");
+                        cmd.arg("-c").arg(command);
+                        cmd.env("DISPLAY", format!(":{display_number}"));
+                        cmd.spawn().ok();
+                        tracing::info!("ran startup command: {command}");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("failed to start X11 WM on XWayland :{display_number} ({e})");

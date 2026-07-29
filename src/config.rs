@@ -23,6 +23,10 @@ pub struct Config {
     pub inner_gap: u32,
     pub keybinds: Vec<Keybind>,
     pub animation_duration: Duration,
+    /// Commands run once (via `sh -c`) after the compositor is up -- the Rubix
+    /// equivalent of AwesomeWM's autorun. Fired from the XWayland-ready hook so
+    /// children inherit WAYLAND_DISPLAY and get DISPLAY set (see main.rs).
+    pub startup: Vec<String>,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -58,6 +62,9 @@ struct RawConfig {
     #[serde(default)]
     animation: RawAnimation,
     keybinds: HashMap<String, NavAction>,
+    // Optional: a config omitting `startup` parses fine (empty list = run nothing).
+    #[serde(default)]
+    startup: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +135,7 @@ impl Config {
             inner_gap: raw.layout.inner_gap,
             keybinds,
             animation_duration: Duration::from_millis(raw.animation.duration_ms),
+            startup: raw.startup,
         }
     }
 
