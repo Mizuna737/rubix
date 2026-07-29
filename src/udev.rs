@@ -330,9 +330,13 @@ pub fn init_udev(
     }
 
     // Publish our socket so spawned clients connect to us, not a host compositor.
+    // XDG_SESSION_TYPE=wayland steers Chromium/Electron `auto` backend detection
+    // onto Wayland -- it keys off the session type, not WAYLAND_DISPLAY, and would
+    // otherwise inherit `tty` from the TTY launch and land on XWayland.
     // SAFETY: set once at startup before any client threads exist (see winit).
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &data.state.socket_name);
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
     }
 
     tracing::info!("udev backend up ({} device(s))", udev.borrow().backends.len());

@@ -55,11 +55,14 @@ pub fn init_winit(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
+    // XDG_SESSION_TYPE=wayland steers Chromium/Electron `auto` backend detection
+    // onto Wayland -- it keys off the session type, not WAYLAND_DISPLAY.
     // SAFETY: edition 2024 marks set_var unsafe because concurrent env reads
     // from other threads would be UB. We set this once at startup, before any
     // client threads exist, so there is no concurrent access.
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
     }
 
     event_loop.handle().insert_source(winit, move |event, _, data| {
