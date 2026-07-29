@@ -66,6 +66,7 @@ use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::shell::wlr_layer::Layer;
+use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{connector, crtc, ModeTypeFlags};
@@ -389,14 +390,25 @@ fn device_added(
     // instead of falling back to SHM. Only the primary node's formats are
     // published; secondary GPUs (if any) aren't wired into the dmabuf path yet.
     if data.state.dmabuf_global.is_none() && render_node == udev_data.primary_gpu {
+        // Advertise dmabuf v4 with *default feedback* naming the primary render
+        // node as the main device. XWayland (and other feedback-aware clients)
+        // read this to discover the GPU and enable glamor/DRI3 -- without it,
+        // XWayland reports "dri3 extension not supported" and GPU-accelerated X
+        // clients (Chromium/Electron, games) can't create a presentation surface,
+        // so they never paint. v3-and-lower clients still receive the format list
+        // from the main tranche, so native dmabuf clients are unaffected.
+        let feedback = DmabufFeedbackBuilder::new(render_node.dev_id(), render_formats.clone())
+            .build()
+            .expect("failed to build dmabuf default feedback");
         let global = data
             .state
             .dmabuf_state
-            .create_global::<RubixState>(&data.display_handle, render_formats.clone());
+            .create_global_with_default_feedback::<RubixState>(&data.display_handle, &feedback);
         data.state.dmabuf_global = Some(global);
         tracing::info!(
-            "advertised zwp_linux_dmabuf_v1 ({} formats)",
-            render_formats.iter().count()
+            "advertised zwp_linux_dmabuf_v1 with default feedback ({} formats, main device {})",
+            render_formats.iter().count(),
+            render_node.dev_id(),
         );
     }
 
