@@ -312,35 +312,41 @@ impl RubixState {
         self.ipc_dirty = true;
     }
 
-    /// Move keyboard focus to the model's current active window, mirroring the
-    /// pointer-click focus path (raise + activate-toggle + set_focus). Derived
-    /// fresh from the model each call -- `active_window` walks active_column ->
-    /// active_row -> first leaf, so it always tracks the latest nav. A `None`
-    /// target (empty active band) clears focus; nav chords still work because
-    /// the input filter intercepts them regardless of who holds focus.
-    fn focus_active_window(&mut self) {
+    /// Focus a specific window by id: raise it, mark it the sole activated
+    /// toplevel, and set seat keyboard focus to its surface. No-op if the id
+    /// isn't tracked or has no surface yet. This is the generic primitive --
+    /// `focus_active_window` wraps it with the model-derived active id, on-map
+    /// handlers pass the freshly-created id, and directional-move chords will
+    /// pass the destination id.
+    pub(crate) fn focus_by_id(&mut self, id: u32) {
+        let Some(window) = self.windows.get(&id).cloned() else { return; };
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
-        let target = self
-            .monitor
-            .active_window()
-            .and_then(|id| self.windows.get(&id).cloned());
+        self.space.raise_element(&window, true);
+        // `wl_surface()` (via `WaylandFocus`) works for both wayland and X11
+        // windows, unlike `toplevel()` which is `None` for X11.
+        let Some(surface) = window.wl_surface() else { return; };
+        let surface = surface.into_owned();
+        self.space.elements().for_each(|w| {
+            w.set_activated(w == &window);
+            let Some(toplevel) = w.toplevel() else { return; };
+            toplevel.send_pending_configure();
+        });
+        keyboard.set_focus(self, Some(surface), serial);
+    }
 
-        match target {
-            Some(window) => {
-                self.space.raise_element(&window, true);
-                // `wl_surface()` (via `WaylandFocus`) works for both wayland
-                // and X11 windows, unlike `toplevel()` which is `None` for X11.
-                let Some(surface) = window.wl_surface() else { return; };
-                let surface = surface.into_owned();
-                self.space.elements().for_each(|w| {
-                    w.set_activated(w == &window);
-                    let Some(toplevel) = w.toplevel() else { return; };
-                    toplevel.send_pending_configure();
-                });
-                keyboard.set_focus(self, Some(surface), serial);
-            }
+    /// Move keyboard focus to the model's current active window, mirroring the
+    /// pointer-click focus path. Derived fresh from the model each call --
+    /// `active_window` walks active_column -> active_row -> first leaf, so it
+    /// always tracks the latest nav. A `None` target (empty active band) clears
+    /// focus; nav chords still work because the input filter intercepts them
+    /// regardless of who holds focus.
+    pub(crate) fn focus_active_window(&mut self) {
+        match self.monitor.active_window() {
+            Some(id) => self.focus_by_id(id),
             None => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
                 self.space.elements().for_each(|w| {
                     w.set_activated(false);
                     let Some(toplevel) = w.toplevel() else { return; };

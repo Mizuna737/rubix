@@ -75,6 +75,9 @@ impl XwmHandler for RubixState {
             .unwrap_or(SplitDirection::Horizontal);
         self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
         self.apply_layout();
+        // Focus follows spawn (mirrors xdg_shell::new_toplevel): name the new id
+        // directly, since the focus-agnostic model won't surface it via re-derive.
+        self.focus_by_id(id);
         self.ipc_dirty = true;
         tracing::info!(
             "new X11 toplevel -> window {id} ({} tracked, {} mapped in space)",

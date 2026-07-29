@@ -56,6 +56,10 @@ impl XdgShellHandler for RubixState {
             .unwrap_or(SplitDirection::Horizontal);
         self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
         self.apply_layout();
+        // Focus follows spawn: name the new id directly. The model is
+        // focus-agnostic, so focus_active_window would re-derive the group's top
+        // leaf and never land on the window we just created.
+        self.focus_by_id(id);
         self.ipc_dirty = true;
         tracing::info!(
             "new toplevel -> window {id} ({} tracked, {} mapped in space)",
