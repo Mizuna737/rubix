@@ -4,6 +4,7 @@ mod handlers;
 
 mod config;
 mod cursor;
+mod focus;
 mod grabs;
 mod input;
 mod ipc;

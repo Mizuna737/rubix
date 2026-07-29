@@ -4,6 +4,7 @@ mod layer_shell;
 mod xdg_shell;
 pub mod xwayland;
 
+use crate::focus::KeyboardFocusTarget;
 use crate::RubixState;
 
 //
@@ -21,7 +22,7 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::{delegate_data_device, delegate_output, delegate_seat};
 
 impl SeatHandler for RubixState {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -33,9 +34,11 @@ impl SeatHandler for RubixState {
         self.cursor_status = image;
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
         let dh = &self.display_handle;
-        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        let client = focused
+            .and_then(|t| t.surface())
+            .and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client);
     }
 }

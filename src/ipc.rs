@@ -109,7 +109,7 @@ struct WindowView {
 /// click-to-focus onto a non-first window in a group -- so the bar highlights
 /// the window the user is really typing into.
 fn keyboard_focused_id(state: &RubixState) -> Option<u32> {
-    let surface = state.seat.get_keyboard()?.current_focus()?;
+    let surface = state.seat.get_keyboard()?.current_focus()?.surface()?;
     state
         .windows
         .iter()

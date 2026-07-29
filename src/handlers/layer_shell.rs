@@ -11,6 +11,7 @@ use smithay::{
     },
 };
 
+use crate::focus::KeyboardFocusTarget;
 use crate::RubixState;
 
 impl WlrLayerShellHandler for RubixState {
@@ -54,6 +55,7 @@ impl WlrLayerShellHandler for RubixState {
             .seat
             .get_keyboard()
             .and_then(|k| k.current_focus())
+            .and_then(|t| t.surface())
             .as_ref()
             == Some(surface.wl_surface());
 
@@ -118,11 +120,11 @@ impl RubixState {
             .seat
             .get_keyboard()
             .expect("keyboard added to seat at startup");
-        if keyboard.current_focus().as_ref() == Some(surface) {
+        if keyboard.current_focus().and_then(|t| t.surface()).as_ref() == Some(surface) {
             return;
         }
         let serial = SERIAL_COUNTER.next_serial();
-        keyboard.set_focus(self, Some(surface.clone()), serial);
+        keyboard.set_focus(self, Some(KeyboardFocusTarget::Wayland(surface.clone())), serial);
     }
 }
 

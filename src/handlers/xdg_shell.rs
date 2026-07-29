@@ -15,6 +15,7 @@ use smithay::{
     utils::{Rectangle, Serial},
     wayland::{
         compositor::with_states,
+        seat::WaylandFocus,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
             XdgToplevelSurfaceData,
@@ -268,11 +269,13 @@ impl RubixState {
     }
     pub(crate) fn focused_window_id(& self) -> Option<u32> {
         let keyboard = self.seat.get_keyboard().unwrap();
-        let focus = keyboard.current_focus();
+        // Match by wl_surface (not toplevel()) so X11 focus resolves too --
+        // toplevel() is None for X11 windows.
+        let focus = keyboard.current_focus().and_then(|t| t.surface());
         let focused_id = focus.and_then(|surface| {
             self.windows
                 .iter()
-                .find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == &surface))
+                .find(|(_, w)| w.wl_surface().is_some_and(|s| s.as_ref() == &surface))
                 .map(|(id, _)| *id)
         });
         focused_id

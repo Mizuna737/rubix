@@ -10,13 +10,12 @@ use smithay::{
         },
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::SERIAL_COUNTER,
-    wayland::seat::WaylandFocus,
 };
 
 use serde::Deserialize;
 
+use crate::focus::KeyboardFocusTarget;
 use crate::state::{RubixState, Transition};
 use crate::model::grid::Direction;
 
@@ -174,16 +173,16 @@ impl RubixState {
                         .map(|(w, l)| (w.clone(), l))
                     {
                         self.space.raise_element(&window, true);
-                        let Some(toplevel) = window.toplevel() else { return; };
-                        keyboard.set_focus(
-                            self,
-                            Some(toplevel.wl_surface().clone()),
-                            serial,
-                        );
-                        self.space.elements().for_each(|window| {
-                            let Some(toplevel) = window.toplevel() else { return; };
+                        // from_window keeps X11 clicks working -- window.toplevel()
+                        // is None for X11, so the old early-return dropped focus
+                        // entirely on click.
+                        let target = KeyboardFocusTarget::from_window(&window);
+                        self.space.elements().for_each(|w| {
+                            w.set_activated(w == &window);
+                            let Some(toplevel) = w.toplevel() else { return; };
                             toplevel.send_pending_configure();
                         });
+                        keyboard.set_focus(self, target, serial);
                         // Keyboard focus moved; push a fresh snapshot so the bar
                         // tracks click-to-focus, not just nav chords.
                         self.ipc_dirty = true;
@@ -193,7 +192,7 @@ impl RubixState {
                             let Some(toplevel) = window.toplevel() else { return; };
                             toplevel.send_pending_configure();
                         });
-                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+                        keyboard.set_focus(self, Option::<KeyboardFocusTarget>::None, serial);
                         self.ipc_dirty = true;
                     }
                 };
@@ -320,19 +319,18 @@ impl RubixState {
     /// pass the destination id.
     pub(crate) fn focus_by_id(&mut self, id: u32) {
         let Some(window) = self.windows.get(&id).cloned() else { return; };
+        // X11 windows focus as their X11Surface so input focus is actually
+        // driven (XSetInputFocus/WM_TAKE_FOCUS); wayland windows as wl_surface.
+        let Some(target) = KeyboardFocusTarget::from_window(&window) else { return; };
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
         self.space.raise_element(&window, true);
-        // `wl_surface()` (via `WaylandFocus`) works for both wayland and X11
-        // windows, unlike `toplevel()` which is `None` for X11.
-        let Some(surface) = window.wl_surface() else { return; };
-        let surface = surface.into_owned();
         self.space.elements().for_each(|w| {
             w.set_activated(w == &window);
             let Some(toplevel) = w.toplevel() else { return; };
             toplevel.send_pending_configure();
         });
-        keyboard.set_focus(self, Some(surface), serial);
+        keyboard.set_focus(self, Some(target), serial);
     }
 
     /// Move keyboard focus to the model's current active window, mirroring the
@@ -352,7 +350,7 @@ impl RubixState {
                     let Some(toplevel) = w.toplevel() else { return; };
                     toplevel.send_pending_configure();
                 });
-                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+                keyboard.set_focus(self, Option::<KeyboardFocusTarget>::None, serial);
             }
         }
     }
