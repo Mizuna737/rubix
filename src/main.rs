@@ -221,17 +221,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ipc_clients = crate::ipc::init_ipc(&event_loop, data.state.xdisplay);
 
+    // Optional startup command for nested dev (`rubix -c <cmd>`). No default
+    // spawn: launchers (rofi via Super+space) and the config `startup` hook
+    // cover normal session bring-up, so an empty desktop is the right default.
     let mut args = std::env::args().skip(1);
     let flag = args.next();
     let arg = args.next();
 
-    match (flag.as_deref(), arg) {
-        (Some("-c") | Some("--command"), Some(command)) => {
-            std::process::Command::new(command).spawn().ok();
-        }
-        _ => {
-            std::process::Command::new("alacritty").spawn().ok();
-        }
+    if let (Some("-c") | Some("--command"), Some(command)) = (flag.as_deref(), arg) {
+        std::process::Command::new(command).spawn().ok();
     }
 
     // After every dispatch cycle: refresh the space (enter/leave bookkeeping),
