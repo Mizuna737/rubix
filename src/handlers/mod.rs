@@ -18,8 +18,9 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
     set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
+use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
 use smithay::wayland::selection::SelectionHandler;
-use smithay::{delegate_data_device, delegate_output, delegate_seat};
+use smithay::{delegate_data_control, delegate_data_device, delegate_output, delegate_seat};
 
 impl SeatHandler for RubixState {
     type KeyboardFocus = KeyboardFocusTarget;
@@ -63,6 +64,14 @@ impl ClientDndGrabHandler for RubixState {}
 impl ServerDndGrabHandler for RubixState {}
 
 delegate_data_device!(RubixState);
+
+impl DataControlHandler for RubixState {
+    fn data_control_state(&self) -> &DataControlState {
+        &self.data_control_state
+    }
+}
+
+delegate_data_control!(RubixState);
 
 //
 // Wl Output & Xdg Output

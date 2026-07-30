@@ -25,7 +25,7 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
+        selection::{data_device::DataDeviceState, wlr_data_control::DataControlState},
         shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
         shell::xdg::XdgShellState,
         shm::ShmState,
@@ -136,6 +136,7 @@ pub struct RubixState {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<RubixState>,
     pub data_device_state: DataDeviceState,
+    pub data_control_state: DataControlState,
     pub popups: PopupManager,
     pub dmabuf_state: DmabufState,
     // Created lazily once the udev backend knows the primary GPU's render
@@ -176,6 +177,9 @@ impl RubixState {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        // wlr-data-control: lets headless clients (wl-paste, clipse, etc.) read/write
+        // the clipboard without creating a real toplevel. No primary-selection support.
+        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let popups = PopupManager::default();
 
         // A seat is a group of keyboards, pointer and touch devices.
@@ -262,6 +266,7 @@ impl RubixState {
             output_manager_state,
             seat_state,
             data_device_state,
+            data_control_state,
             popups,
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
