@@ -3,7 +3,7 @@
 A from-scratch Wayland compositor in Rust, built on [Smithay](https://github.com/Smithay/smithay),
 with a **Rubik's-cube spatial model**: each monitor is a 2D grid of window groups. The viewport
 slides across columns on the X axis (shared), while each column scrolls independently through its
-group stack on the Y axis — plus three zoom levels (Grid → Square → Window).
+group stack on the Y axis — plus three zoom levels (Monitor → Group → Window).
 
 Status: **early development** — bootstrapping. See [`docs/design.md`](docs/design.md) for the full design schema.
 
@@ -35,9 +35,7 @@ docs/design.md       design schema (source of truth)
 
 ## Conventions
 
-Idiomatic Rust naming: `snake_case` items, `CamelCase` types, `SCREAMING_SNAKE_CASE` consts —
-a deliberate departure from the camelCase-everywhere used elsewhere in the author's projects,
-adopted here to build fluency in idiomatic Rust.
+Idiomatic Rust naming.
 
 ## License
 
