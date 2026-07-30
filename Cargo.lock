@@ -1882,8 +1882,10 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "async-io",
+ "async-process",
  "bitflags 2.13.1",
  "calloop-notify",
+ "futures-lite",
  "pipewire",
  "serde",
  "serde_json",

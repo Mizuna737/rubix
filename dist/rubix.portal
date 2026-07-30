@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.rubix
+Interfaces=org.freedesktop.impl.portal.ScreenCast
+UseIn=rubix;wlroots

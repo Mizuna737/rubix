@@ -39,21 +39,9 @@ use zbus::zvariant::{
 use zbus::Connection;
 
 use crate::portal::capture::{self, CaptureTarget};
+use crate::portal::chooser;
 use crate::portal::pipewire_stream::{self, StreamStarted};
 use crate::{state::RubixState, CalloopData};
-
-/// `AvailableSourceTypes`/`SelectSources` `types` bitmask, per
-/// `org.freedesktop.portal.ScreenCast`: `MONITOR = 1`, `WINDOW = 2`.
-const SOURCE_TYPE_WINDOW: u32 = 0b10;
-
-/// Which kind of target `Start` should resolve a session to, decided on the
-/// zbus thread (it already has `SessionState::source_types` from
-/// `SelectSources`) and resolved to a concrete [`CaptureTarget`] on the loop
-/// thread (which alone can see `state.windows`/`state.space`).
-pub(crate) enum TargetHint {
-    Window(u32),
-    Monitor,
-}
 
 /// Capture cadence: how often the loop-thread timer re-renders every active
 /// session's target and refreshes its `FrameSlot`. ~30fps, matching
@@ -97,7 +85,7 @@ pub enum PortalRequest {
     /// connected and has a node id.
     StartStream {
         session_handle: OwnedObjectPath,
-        target_hint: TargetHint,
+        target: CaptureTarget,
         reply: async_channel::Sender<Result<StreamStarted, String>>,
     },
 }
@@ -270,29 +258,67 @@ impl ScreenCastIface {
             }
         };
 
-        // TODO(M5): replaced by chooser. Until a real chooser UI exists, a
-        // window target can only be reached by setting `RUBIX_PORTAL_TEST_WINDOW`
-        // to a live window id (see `screencast::build_source_list`/`ListSources`
-        // logs for ids) *and* having selected WINDOW in `SelectSources`; every
-        // other case streams the first monitor. This is scaffolding for M3/M4
-        // validation only -- do not delete, M5 swaps it for real source
-        // selection.
-        let target_hint = match std::env::var("RUBIX_PORTAL_TEST_WINDOW").ok().and_then(|s| s.parse::<u32>().ok())
-        {
-            Some(id) if source_types & SOURCE_TYPE_WINDOW != 0 => TargetHint::Window(id),
-            _ => TargetHint::Monitor,
+        // Debug-only bypass of the chooser, e.g. for scripted testing where a
+        // rofi prompt can't be driven interactively. Format: "window:<id>" or
+        // "monitor:<name>". Unset by default -- the chooser below is the real
+        // path a live client goes through.
+        let forced_target = std::env::var("RUBIX_PORTAL_FORCE_TARGET").ok().and_then(|raw| {
+            let (kind, value) = raw.split_once(':')?;
+            match kind {
+                "window" => value.parse::<u32>().ok().map(CaptureTarget::Window),
+                "monitor" => Some(CaptureTarget::Monitor(value.to_string())),
+                _ => None,
+            }
+        });
+
+        let target = match forced_target {
+            Some(target) => {
+                tracing::warn!(
+                    "[portal] Start: RUBIX_PORTAL_FORCE_TARGET set, bypassing chooser -> {target:?}"
+                );
+                target
+            }
+            None => {
+                let (reply_tx, reply_rx) = async_channel::bounded(1);
+                let sent =
+                    self.bridge_tx.lock().unwrap().send(PortalRequest::ListSources { reply: reply_tx });
+                if let Err(e) = sent {
+                    tracing::warn!("[portal] Start: loop bridge send failed while listing sources ({e})");
+                    return Ok((2, HashMap::new()));
+                }
+                let sources = match reply_rx.recv().await {
+                    Ok(sources) => sources,
+                    Err(e) => {
+                        tracing::warn!("[portal] Start: loop bridge reply channel closed ({e})");
+                        return Ok((2, HashMap::new()));
+                    }
+                };
+
+                match chooser::choose_target(&sources, source_types).await {
+                    Some(target) => target,
+                    None => {
+                        tracing::info!(
+                            "[portal] Start: chooser cancelled or unavailable for session {session_handle}"
+                        );
+                        // 1 == user cancelled, per the impl-portal Request/Session
+                        // response-code convention.
+                        return Ok((1, HashMap::new()));
+                    }
+                }
+            }
         };
+
         // WINDOW (2) / MONITOR (1), per org.freedesktop.portal.ScreenCast's
         // SourceType -- reported in the `streams` dict below.
-        let source_type_value: u32 = match target_hint {
-            TargetHint::Window(_) => 2,
-            TargetHint::Monitor => 1,
+        let source_type_value: u32 = match target {
+            CaptureTarget::Window(_) => 2,
+            CaptureTarget::Monitor(_) => 1,
         };
 
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         let sent = self.bridge_tx.lock().unwrap().send(PortalRequest::StartStream {
             session_handle: session_handle.clone(),
-            target_hint,
+            target,
             reply: reply_tx,
         });
         if let Err(e) = sent {
@@ -491,7 +517,7 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
                 }
                 calloop::channel::Event::Msg(PortalRequest::StartStream {
                     session_handle,
-                    target_hint,
+                    target,
                     reply,
                 }) => {
                     if !sessions_for_loop.lock().unwrap().contains_key(&session_handle) {
@@ -502,22 +528,20 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
                         return;
                     }
 
-                    let target = match target_hint {
-                        TargetHint::Window(id) => {
-                            if !data.state.windows.contains_key(&id) {
-                                let _ = reply.try_send(Err(format!("window {id} not found")));
-                                return;
-                            }
-                            CaptureTarget::Window(id)
+                    // Re-validate the chooser's pick against current
+                    // compositor state -- it may have vanished (window
+                    // closed, output unplugged) between the chooser running
+                    // on the zbus thread and this message landing here.
+                    let target_exists = match &target {
+                        CaptureTarget::Window(id) => data.state.windows.contains_key(id),
+                        CaptureTarget::Monitor(name) => {
+                            data.state.space.outputs().any(|o| &o.name() == name)
                         }
-                        TargetHint::Monitor => match data.state.space.outputs().next() {
-                            Some(output) => CaptureTarget::Monitor(output.name()),
-                            None => {
-                                let _ = reply.try_send(Err("no outputs available".to_string()));
-                                return;
-                            }
-                        },
                     };
+                    if !target_exists {
+                        let _ = reply.try_send(Err(format!("{target:?} no longer available")));
+                        return;
+                    }
 
                     let Some((width, height)) = capture::target_size(&data.state, &target) else {
                         let _ = reply.try_send(Err(format!("could not resolve size for {target:?}")));

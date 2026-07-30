@@ -19,6 +19,7 @@
 //! replacing this plumbing.
 
 mod capture;
+mod chooser;
 mod pipewire_stream;
 pub mod screencast;
 
