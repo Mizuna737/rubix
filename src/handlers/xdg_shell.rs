@@ -41,35 +41,42 @@ impl XdgShellHandler for RubixState {
 
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Register the window, then insert it into the model. It is not mapped
-        // here -- apply_layout maps it once the model knows where it goes.
+        // Client pid (best-effort): names which process owns a toplevel, so a
+        // rapid create/destroy loop points straight at the offending app. Read
+        // before `surface` is moved into the Window below.
+        let client_pid = surface
+            .wl_surface()
+            .client()
+            .and_then(|c| c.get_credentials(&self.display_handle).ok())
+            .map(|cred| cred.pid);
+        // Register the window and send the initial configure, but stage it as
+        // unmapped -- it does not enter the model/space/focus/IPC until it
+        // commits a first buffer (see handle_commit below). A client that
+        // creates a toplevel and never maps it (e.g. a headless clipboard
+        // reader grabbing the selection) then leaves no trace.
         let window = Window::new_wayland_window(surface);
+        window.toplevel().unwrap().send_configure();
         let id = self.next_window_id();
-        self.windows.insert(id, window);
-
-        // Split the currently-focused window (via seat keyboard focus, reverse
-        // -looked-up to its id); an unfocused/empty case falls through to 0,
-        // which add_window treats as "no target" (seeds the root if empty).
-        let focused_id = self.focused_window_id();
-        let direction = focused_id
-            .and_then(|fid| self.window_rect(fid))
-            .map(Rect::longer_axis)
-            .unwrap_or(SplitDirection::Horizontal);
-        self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
-        self.apply_layout();
-        // Focus follows spawn: name the new id directly. The model is
-        // focus-agnostic, so focus_active_window would re-derive the group's top
-        // leaf and never land on the window we just created.
-        self.focus_by_id(id);
-        self.ipc_dirty = true;
+        self.unmapped.insert(id, window);
         tracing::info!(
-            "new toplevel -> window {id} ({} tracked, {} mapped in space)",
-            self.windows.len(),
-            self.space.elements().count(),
+            "new toplevel -> window {id} pid={client_pid:?} (unmapped, {} pending)",
+            self.unmapped.len(),
         );
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // A toplevel that never mapped just drops out of `unmapped` -- it was
+        // never in the model, so there's nothing to remove/re-tile.
+        let unmapped_id = self
+            .unmapped
+            .iter()
+            .find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == surface.wl_surface()))
+            .map(|(id, _)| *id);
+        if let Some(id) = unmapped_id {
+            self.unmapped.remove(&id);
+            return;
+        }
+
         // Reverse-lookup the destroyed surface's id, then evict it from both the
         // model and the registry and re-tile. Skips cleanly if the window was
         // never tracked (nothing to remove).
@@ -84,6 +91,11 @@ impl XdgShellHandler for RubixState {
             self.windows.remove(&id);
             self.apply_layout();
             self.ipc_dirty = true;
+            tracing::info!(
+                "toplevel destroyed -> window {id} ({} tracked, {} mapped in space)",
+                self.windows.len(),
+                self.space.elements().count(),
+            );
         }
     }
 

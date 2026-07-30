@@ -104,6 +104,13 @@ pub struct RubixState {
     pub windows: HashMap<u32, Window>,
     pub next_id: u32,
 
+    // Wayland toplevels that have been created (initial configure sent) but
+    // never committed a buffer yet -- e.g. a headless clipboard reader that
+    // creates a toplevel just to read the selection and exits before mapping.
+    // Kept OUT of `windows` so the model/focus/IPC never see them; promoted to
+    // `windows` on first buffer commit (see xdg_shell::handle_commit).
+    pub(crate) unmapped: HashMap<u32, Window>,
+
     // Set by any mutation that changes cube state (nav dispatch, window
     // map/unmap). The run-loop callback in main.rs checks-and-clears this once
     // per dispatch cycle to coalesce a burst of mutations into a single IPC
@@ -250,6 +257,7 @@ impl RubixState {
             monitor,
             windows: HashMap::new(),
             next_id: 1,
+            unmapped: HashMap::new(),
             ipc_dirty: false,
             reserved_bounds: None,
             animations: HashMap::new(),

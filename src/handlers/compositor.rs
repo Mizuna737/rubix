@@ -1,6 +1,11 @@
-use crate::{grabs::resize_grab, state::ClientState, RubixState};
+use crate::{
+    grabs::resize_grab,
+    model::{geometry::Rect, tiling::SplitDirection},
+    state::ClientState,
+    RubixState,
+};
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     delegate_compositor, delegate_shm,
     reexports::wayland_server::{
         protocol::{wl_buffer, wl_surface::WlSurface},
@@ -40,6 +45,45 @@ impl CompositorHandler for RubixState {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
+
+            // First buffer commit for a staged (unmapped) toplevel: this is the
+            // point a client actually "maps" -- promote it into the model now,
+            // running exactly what `new_toplevel` used to do eagerly at creation
+            // time. A client that creates a toplevel and never attaches a buffer
+            // (e.g. a headless clipboard reader grabbing the selection) never
+            // reaches this path and leaves no trace.
+            let unmapped_id = self
+                .unmapped
+                .iter()
+                .find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
+                .map(|(id, _)| *id);
+            if let Some(id) = unmapped_id {
+                let has_buffer =
+                    with_renderer_surface_state(&root, |s| s.buffer().is_some()).unwrap_or(false);
+                if has_buffer {
+                    let window = self.unmapped.remove(&id).unwrap();
+                    self.windows.insert(id, window);
+
+                    let focused_id = self.focused_window_id();
+                    let direction = focused_id
+                        .and_then(|fid| self.window_rect(fid))
+                        .map(Rect::longer_axis)
+                        .unwrap_or(SplitDirection::Horizontal);
+                    self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                    self.apply_layout();
+                    // Focus follows spawn: name the new id directly. The model is
+                    // focus-agnostic, so focus_active_window would re-derive the
+                    // group's top leaf and never land on the window we just mapped.
+                    self.focus_by_id(id);
+                    self.ipc_dirty = true;
+                    tracing::info!(
+                        "toplevel mapped -> window {id} ({} tracked, {} mapped in space)",
+                        self.windows.len(),
+                        self.space.elements().count(),
+                    );
+                }
+            }
+
             if let Some(window) = self
                 .space
                 .elements()
