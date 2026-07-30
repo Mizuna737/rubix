@@ -18,6 +18,7 @@
 //! milestones (chooser UI, PipeWire producer) grow `PortalRequest` rather than
 //! replacing this plumbing.
 
+mod pipewire_stream;
 pub mod screencast;
 
 pub use screencast::init_portal;

@@ -31,9 +31,13 @@ use smithay::reexports::calloop::{self, EventLoop};
 use zbus::fdo;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{Array, ObjectPath, OwnedObjectPath, OwnedValue, Signature, Value};
+use zbus::zvariant::{
+    Array, Dict, ObjectPath, OwnedObjectPath, OwnedValue, Signature, Structure, StructureBuilder,
+    Value,
+};
 use zbus::Connection;
 
+use crate::portal::pipewire_stream::{self, StreamStarted};
 use crate::{state::RubixState, CalloopData};
 
 /// A window or monitor the compositor can offer as a capture source. Plain
@@ -58,6 +62,16 @@ pub enum SourceKind {
 /// zbus-side `async fn` can simply `.await` it.
 pub enum PortalRequest {
     ListSources { reply: async_channel::Sender<Vec<SourceInfo>> },
+    /// `Start` asking the loop thread to spin up the M2 PipeWire test-pattern
+    /// producer for a session. The loop thread only spawns the (self
+    /// contained) pipewire thread and stashes its stop handle in the session
+    /// registry -- it never touches PipeWire itself. `reply` is resolved
+    /// later, directly by the pipewire thread, once the stream has actually
+    /// connected and has a node id.
+    StartStream {
+        session_handle: OwnedObjectPath,
+        reply: async_channel::Sender<Result<StreamStarted, String>>,
+    },
 }
 
 /// Bind `init_portal`'s calloop channel receiver into the event loop. The
@@ -96,6 +110,11 @@ fn build_source_list(state: &RubixState) -> Vec<SourceInfo> {
 struct SessionState {
     source_types: u32,
     multiple: bool,
+    /// Set once `Start` has spun up the M2 test-pattern PipeWire thread for
+    /// this session. Sending `()` on it tells that thread to quit its main
+    /// loop and tear itself down; `Session.Close`/`Request.Close` use this to
+    /// avoid leaking a PipeWire stream/thread per session.
+    stream_stop: Option<pipewire::channel::Sender<()>>,
 }
 
 type SessionRegistry = Arc<Mutex<HashMap<OwnedObjectPath, SessionState>>>;
@@ -209,13 +228,64 @@ impl ScreenCastIface {
         tracing::info!(
             "[portal] Start handle={handle} session_handle={session_handle} app_id={app_id:?} parent_window={parent_window:?} options={options:?}"
         );
-        tracing::warn!("[portal] Start: no PipeWire node yet (M1 stub)");
+
+        if !self.sessions.lock().unwrap().contains_key(&session_handle) {
+            tracing::warn!("[portal] Start: unknown session {session_handle}");
+            return Ok((2, HashMap::new()));
+        }
+
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        let sent = self.bridge_tx.lock().unwrap().send(PortalRequest::StartStream {
+            session_handle: session_handle.clone(),
+            reply: reply_tx,
+        });
+        if let Err(e) = sent {
+            tracing::warn!("[portal] Start: loop bridge send failed ({e})");
+            return Ok((2, HashMap::new()));
+        }
+
+        let started = match reply_rx.recv().await {
+            Ok(Ok(started)) => started,
+            Ok(Err(e)) => {
+                tracing::warn!("[portal] Start: pipewire producer failed: {e}");
+                return Ok((2, HashMap::new()));
+            }
+            Err(e) => {
+                tracing::warn!("[portal] Start: loop bridge reply channel closed ({e})");
+                return Ok((2, HashMap::new()));
+            }
+        };
+
+        tracing::info!(
+            "[portal] Start: pipewire node {} ready ({}x{})",
+            started.node_id,
+            started.width,
+            started.height
+        );
+
+        let mut stream_props: HashMap<String, Value> = HashMap::new();
+        stream_props.insert(
+            "size".to_string(),
+            Value::Structure(Structure::from((started.width as i32, started.height as i32))),
+        );
+        // MONITOR = 1 (org.freedesktop.portal.ScreenCast SourceType); this
+        // producer is a synthetic test pattern, not a real capture yet, so we
+        // just advertise it as a monitor-class source.
+        stream_props.insert("source_type".to_string(), Value::U32(1));
+
+        let stream_dict = Dict::from(stream_props);
+        let stream_struct = StructureBuilder::new()
+            .append_field(Value::U32(started.node_id))
+            .append_field(Value::Dict(stream_dict))
+            .build()
+            .expect("(u, a{sv}) fields always build a valid structure");
+        let stream_entry = Value::Structure(stream_struct);
 
         let streams_sig = Signature::try_from("(ua{sv})").expect("valid signature literal");
-        let streams = Array::new(&streams_sig);
-        let streams_value: OwnedValue = Value::from(streams)
-            .try_to_owned()
-            .expect("empty array always converts to an owned value");
+        let mut streams = Array::new(&streams_sig);
+        streams.append(stream_entry).expect("stream entry matches the (ua{sv}) signature");
+        let streams_value: OwnedValue =
+            Value::Array(streams).try_to_owned().expect("array of one valid entry always converts");
 
         let mut results = HashMap::new();
         results.insert("streams".to_string(), streams_value);
@@ -259,7 +329,17 @@ impl SessionObj {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
         tracing::info!("[portal] Session.Close {}", self.handle);
-        self.sessions.lock().unwrap().remove(&self.handle);
+        let removed = self.sessions.lock().unwrap().remove(&self.handle);
+        if let Some(state) = removed {
+            if let Some(stop_tx) = state.stream_stop {
+                if let Err(e) = stop_tx.send(()) {
+                    tracing::debug!(
+                        "[portal] Session.Close {}: pipewire stream already gone ({e:?})",
+                        self.handle
+                    );
+                }
+            }
+        }
         let _ = Self::closed(&emitter).await;
         if let Err(e) = conn.object_server().remove::<Self, _>(&self.handle).await {
             tracing::debug!("[portal] Session object at {} already gone: {e}", self.handle);
@@ -288,8 +368,11 @@ impl RequestObj {
 const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.rubix";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 
-async fn run_dbus_service(bridge_tx: calloop::channel::Sender<PortalRequest>) -> zbus::Result<()> {
-    let iface = ScreenCastIface { bridge_tx: Mutex::new(bridge_tx), sessions: Arc::new(Mutex::new(HashMap::new())) };
+async fn run_dbus_service(
+    bridge_tx: calloop::channel::Sender<PortalRequest>,
+    sessions: SessionRegistry,
+) -> zbus::Result<()> {
+    let iface = ScreenCastIface { bridge_tx: Mutex::new(bridge_tx), sessions };
 
     let path = ObjectPath::try_from(OBJECT_PATH).expect("valid object path literal");
     let _conn = zbus::connection::Builder::session()?
@@ -324,17 +407,50 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
 
     let (bridge_tx, bridge_channel) = calloop::channel::channel::<PortalRequest>();
 
-    let registered = event_loop.handle().insert_source(bridge_channel, |event, _, data: &mut CalloopData| {
-        match event {
-            calloop::channel::Event::Msg(PortalRequest::ListSources { reply }) => {
-                let sources = build_source_list(&data.state);
-                if reply.try_send(sources).is_err() {
-                    tracing::debug!("[portal] ListSources reply dropped (zbus side gone)");
+    // Shared with the zbus thread's `ScreenCastIface` below: the loop thread
+    // needs it to stash each session's PipeWire stop handle after spawning
+    // the M2 producer; `Session.Close`/`Request.Close` (zbus thread) need it
+    // to retrieve that handle and tear the stream down.
+    let sessions: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let sessions_for_loop = sessions.clone();
+
+    let registered =
+        event_loop.handle().insert_source(bridge_channel, move |event, _, data: &mut CalloopData| {
+            match event {
+                calloop::channel::Event::Msg(PortalRequest::ListSources { reply }) => {
+                    let sources = build_source_list(&data.state);
+                    if reply.try_send(sources).is_err() {
+                        tracing::debug!("[portal] ListSources reply dropped (zbus side gone)");
+                    }
                 }
+                calloop::channel::Event::Msg(PortalRequest::StartStream {
+                    session_handle,
+                    reply,
+                }) => {
+                    if !sessions_for_loop.lock().unwrap().contains_key(&session_handle) {
+                        tracing::warn!(
+                            "[portal] StartStream: unknown session {session_handle}, refusing"
+                        );
+                        let _ = reply.try_send(Err("unknown session".to_string()));
+                        return;
+                    }
+                    // pw node.name dislikes '/'; the session handle is an
+                    // object path, so give it a flat, still-unique name.
+                    let node_name =
+                        format!("rubix-screencast-{}", session_handle.as_str().replace('/', "_"));
+                    let stop_tx = pipewire_stream::spawn_test_pattern_stream(node_name, reply);
+                    if let Some(state) = sessions_for_loop.lock().unwrap().get_mut(&session_handle) {
+                        state.stream_stop = Some(stop_tx);
+                    } else {
+                        // Session vanished (raced with Close) between the
+                        // check above and here; stop the thread we just
+                        // spawned instead of leaking it.
+                        let _ = stop_tx.send(());
+                    }
+                }
+                calloop::channel::Event::Closed => {}
             }
-            calloop::channel::Event::Closed => {}
-        }
-    });
+        });
 
     if let Err(e) = registered {
         tracing::warn!("[portal] failed to register loop bridge source ({e}); portal disabled");
@@ -343,7 +459,7 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
 
     let spawned = std::thread::Builder::new().name("rubix-portal-dbus".to_string()).spawn(move || {
         async_io::block_on(async move {
-            if let Err(e) = run_dbus_service(bridge_tx).await {
+            if let Err(e) = run_dbus_service(bridge_tx, sessions).await {
                 tracing::warn!("[portal] ScreenCast D-Bus service exited with an error: {e}");
             }
         });
