@@ -1,4 +1,4 @@
-//! M2: a self-contained PipeWire video producer for the ScreenCast portal.
+//! PipeWire video producer for the ScreenCast portal.
 //!
 //! Architecture note: PipeWire's own loop runs on a **dedicated `std::thread`**
 //! per stream (`pw::main_loop::MainLoopRc::run()`), not integrated into the
@@ -14,33 +14,31 @@
 //!   `xdg-desktop-portal-cosmic`, whose `screencast_thread.rs` this module's
 //!   shape is deliberately modeled on -- also avoids by using a dedicated
 //!   thread with `MainLoopRc::run()`.
-//! - For M2's test pattern there is no renderer frame to hand across threads
-//!   yet, so a dedicated thread is fully self-contained: `pw::init()`,
-//!   connect, negotiate format, fill buffers, done. No cross-thread frame
-//!   marshalling is needed at all this milestone.
 //!
-//! Implication for M3: once real compositor frames need to reach this stream,
-//! they must cross from the calloop/render thread to this pw thread. That
-//! will need either (a) a channel carrying dmabuf fds / shm handles into the
-//! `process` callback's dequeued buffer, or (b) revisiting the calloop
-//! integration once the frame-marshalling shape is known. Documented here so
-//! M3 doesn't have to rediscover this.
+//! M3/M4: real compositor frames now cross from the calloop/render thread to
+//! this pw thread via [`crate::portal::capture::FrameSlot`] -- a
+//! `Arc<Mutex<Option<Arc<FrameBuffer>>>>` the capture cadence (a calloop timer
+//! in `screencast.rs`) writes into and this module's `process` callback reads
+//! out of. The lock is only ever held for an `Arc` clone/compare, never a byte
+//! copy; the actual per-cycle memcpy into the dequeued PipeWire buffer happens
+//! here, on the pw thread.
 //!
-//! Per-session lifecycle: `spawn_test_pattern_stream` returns a
-//! `pipewire::channel::Sender<()>` immediately; the caller stores it in the
-//! session registry. Sending `()` on it (from `Session.Close`/`Request.Close`)
-//! wakes the pw thread's attached receiver, which calls `MainLoop::quit()`,
-//! unwinding `run()` and dropping the stream/core/context/loop before the
-//! thread exits -- no leaks across sessions.
+//! Per-session lifecycle: `spawn_stream` returns a `pipewire::channel::Sender<()>`
+//! immediately; the caller stores it in the session registry. Sending `()` on
+//! it (from `Session.Close`/`Request.Close`) wakes the pw thread's attached
+//! receiver, which calls `MainLoop::quit()`, unwinding `run()` and dropping the
+//! stream/core/context/loop before the thread exits -- no leaks across
+//! sessions.
 
 use std::io;
+use std::sync::Arc;
 
 use pipewire as pw;
 use pw::spa::pod::{self, Pod};
 use pw::spa::utils::{Direction, Fraction, Id, Rectangle};
 
-pub const WIDTH: u32 = 1280;
-pub const HEIGHT: u32 = 720;
+use crate::portal::capture::{FrameBuffer, FrameSlot};
+
 pub const FRAMERATE: u32 = 30;
 
 /// Plain `Send` result of a successful `Start`: everything the zbus thread
@@ -70,10 +68,13 @@ impl OwnedPod {
     }
 }
 
-/// Build the single fixed `SPA_PARAM_EnumFormat` pod this test-pattern stream
-/// offers: video/raw, BGRx, 1280x720 @ 30fps. No dmabuf, no choices -- one
-/// concrete format, since we control both ends.
-fn format_param() -> OwnedPod {
+/// Build the single fixed `SPA_PARAM_EnumFormat` pod this stream offers:
+/// video/raw, BGRx, at the target's resolved size, @ `FRAMERATE`fps. No
+/// dmabuf, no choices -- one concrete format, since we control both ends.
+/// `BGRx` is a deliberate match for `capture.rs`'s `Xrgb8888` readback (see
+/// that module's doc comment): identical byte order, so `process` below can
+/// memcpy captured frames straight into the negotiated buffer.
+fn format_param(width: u32, height: u32) -> OwnedPod {
     OwnedPod::serialize(&pod::Value::Object(pod::Object {
         type_: pw::spa::sys::SPA_TYPE_OBJECT_Format,
         id: pw::spa::sys::SPA_PARAM_EnumFormat,
@@ -96,7 +97,7 @@ fn format_param() -> OwnedPod {
             pod::Property {
                 key: pw::spa::sys::SPA_FORMAT_VIDEO_size,
                 flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Rectangle(Rectangle { width: WIDTH, height: HEIGHT }),
+                value: pod::Value::Rectangle(Rectangle { width, height }),
             },
             pod::Property {
                 key: pw::spa::sys::SPA_FORMAT_VIDEO_framerate,
@@ -109,21 +110,22 @@ fn format_param() -> OwnedPod {
 
 /// Per-stream data living entirely on the pw thread. Not `Send` -- never
 /// crosses back to the calloop/zbus threads.
-struct TestPatternState {
-    frame: u64,
+struct StreamState {
+    width: u32,
+    height: u32,
     node_id_reply: Option<async_channel::Sender<Result<StreamStarted, String>>>,
-    /// `process` fires once per graph cycle, which runs at whatever quantum
-    /// the shared PipeWire clock is using (often faster than our target
-    /// framerate) -- not something this stream controls. We still service
-    /// every cycle (skipping would stall the graph), but only repaint the
-    /// moving bar at `FRAMERATE`; between repaints we resubmit the last
-    /// frame's content unchanged, so playback rate matches `FRAMERATE`
-    /// exactly rather than the (typically higher) driver cycle rate.
-    last_paint: std::time::Instant,
+    /// Where the capture cadence (loop thread) deposits the newest frame.
+    frame_slot: FrameSlot,
+    /// The last frame actually painted into a pw buffer. Kept so a `process`
+    /// cycle that races ahead of the ~33ms capture cadence (pw's graph often
+    /// runs faster than our capture rate) re-submits real content instead of
+    /// blanking -- exactly the M2 "resubmit last frame's content unchanged"
+    /// behaviour, now with real frames instead of a painted test pattern.
+    last_frame: Option<Arc<FrameBuffer>>,
 }
 
 fn state_changed(
-    state: &mut TestPatternState,
+    state: &mut StreamState,
     stream: &pw::stream::Stream,
     old: pw::stream::StreamState,
     new: pw::stream::StreamState,
@@ -133,7 +135,7 @@ fn state_changed(
         pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming => {
             if let Some(reply) = state.node_id_reply.take() {
                 let started =
-                    StreamStarted { node_id: stream.node_id(), width: WIDTH, height: HEIGHT };
+                    StreamStarted { node_id: stream.node_id(), width: state.width, height: state.height };
                 if reply.try_send(Ok(started)).is_err() {
                     tracing::debug!("[portal] StartStream reply dropped (zbus side gone)");
                 }
@@ -148,61 +150,64 @@ fn state_changed(
     }
 }
 
-/// Paint a moving vertical bar over a solid background directly into the
-/// mapped buffer memory (`BGRx`, 4 bytes/px). Proves real frames flow without
-/// needing a renderer yet.
-fn paint_test_pattern(slice: &mut [u8], width: u32, height: u32, frame: u64) {
-    let stride = width as usize * 4;
-    let bar_width = (width / 16).max(1) as usize;
-    let bar_x = (frame as usize * 6) % width as usize;
-
-    for row in 0..height as usize {
-        let row_start = row * stride;
-        let Some(row_slice) = slice.get_mut(row_start..row_start + stride) else { break };
-        for col in 0..width as usize {
-            let px = &mut row_slice[col * 4..col * 4 + 4];
-            let in_bar = col.abs_diff(bar_x) < bar_width / 2;
-            if in_bar {
-                // BGRx: bright bar.
-                px.copy_from_slice(&[0x20, 0xE0, 0xE0, 0x00]);
-            } else {
-                // Dark teal background.
-                px.copy_from_slice(&[0x30, 0x20, 0x10, 0x00]);
-            }
-        }
-    }
-}
-
-fn process(state: &mut TestPatternState, stream: &pw::stream::Stream) {
+/// Pull the newest captured frame (if any) into the dequeued PipeWire buffer.
+/// Falls back to the last frame actually painted (process can run faster than
+/// the capture cadence), and to black (never uninitialized memory) before the
+/// very first capture has landed.
+fn process(state: &mut StreamState, stream: &pw::stream::Stream) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
     let datas = buffer.datas_mut();
     let Some(data) = datas.first_mut() else { return };
 
-    let frame_interval = std::time::Duration::from_secs_f64(1.0 / FRAMERATE as f64);
-    let now = std::time::Instant::now();
-    if now.duration_since(state.last_paint) >= frame_interval {
-        let frame = state.frame;
-        state.frame = state.frame.wrapping_add(1);
-        state.last_paint = now;
-        if let Some(slice) = data.data() {
-            paint_test_pattern(slice, WIDTH, HEIGHT, frame);
+    if let Some(frame) = state.frame_slot.lock().unwrap().clone() {
+        state.last_frame = Some(frame);
+    }
+
+    let stride = state.width * 4;
+    let expected_len = (stride * state.height) as usize;
+
+    if let Some(slice) = data.data() {
+        match &state.last_frame {
+            Some(frame) if frame.width == state.width && frame.height == state.height => {
+                // Row-wise, honouring the captured stride (`capture.rs` packs
+                // tightly today, but this stays correct if that ever changes)
+                // against our own negotiated (also tight) stride.
+                let dst_stride = stride as usize;
+                let src_stride = frame.stride as usize;
+                let row_bytes = dst_stride.min(src_stride);
+                let rows = state.height as usize;
+                for y in 0..rows {
+                    let s = y * src_stride;
+                    let d = y * dst_stride;
+                    if s + row_bytes > frame.data.len() || d + row_bytes > slice.len() {
+                        break;
+                    }
+                    slice[d..d + row_bytes].copy_from_slice(&frame.data[s..s + row_bytes]);
+                }
+            }
+            _ => {
+                // No frame captured yet, or its size no longer matches this
+                // stream's negotiated format (e.g. target resized -- dynamic
+                // renegotiation is out of scope here) -- black beats garbage.
+                let n = expected_len.min(slice.len());
+                slice[..n].fill(0);
+            }
         }
     }
-    // Either freshly painted above, or (buffer memory is stream-owned and
-    // reused round-robin) still holding a recent frame from a previous
-    // cycle -- either way the chunk metadata must be resubmitted every time.
 
-    let stride = WIDTH * 4;
     let chunk = data.chunk_mut();
     *chunk.offset_mut() = 0;
     *chunk.stride_mut() = stride as i32;
-    *chunk.size_mut() = stride * HEIGHT;
+    *chunk.size_mut() = stride * state.height;
 }
 
 fn run_pw_thread(
     node_name: String,
+    width: u32,
+    height: u32,
+    frame_slot: FrameSlot,
     stop_rx: pw::channel::Receiver<()>,
     reply: async_channel::Sender<Result<StreamStarted, String>>,
 ) -> Result<(), pw::Error> {
@@ -221,14 +226,16 @@ fn run_pw_thread(
             *pw::keys::MEDIA_CATEGORY => "Screen",
             *pw::keys::MEDIA_ROLE => "Screen",
             *pw::keys::NODE_NAME => node_name.clone(),
-            *pw::keys::NODE_DESCRIPTION => "Rubix ScreenCast test pattern",
+            *pw::keys::NODE_DESCRIPTION => "Rubix ScreenCast",
         },
     )?;
 
-    let data = TestPatternState {
-        frame: 0,
+    let data = StreamState {
+        width,
+        height,
         node_id_reply: Some(reply.clone()),
-        last_paint: std::time::Instant::now(),
+        frame_slot,
+        last_frame: None,
     };
 
     let _listener = stream
@@ -237,7 +244,7 @@ fn run_pw_thread(
         .process(|stream, data| process(data, stream))
         .register()?;
 
-    let format = format_param();
+    let format = format_param(width, height);
     let mut params = [format.as_pod()];
 
     let flags = pw::stream::StreamFlags::AUTOCONNECT
@@ -257,16 +264,21 @@ fn run_pw_thread(
     });
 
     main_loop.run();
-    tracing::info!("[portal] pipewire test-pattern thread for {node_name} exiting");
+    tracing::info!("[portal] pipewire thread for {node_name} exiting");
     Ok(())
 }
 
-/// Spawn the dedicated PipeWire thread for one ScreenCast session's test
-/// pattern. Returns immediately with a stop handle the caller must retain and
-/// send `()` on when the session/request closes; the node id (or an error)
-/// arrives later on `reply`, once the stream has actually connected.
-pub fn spawn_test_pattern_stream(
+/// Spawn the dedicated PipeWire thread for one ScreenCast session. Returns
+/// immediately with a stop handle the caller must retain and send `()` on
+/// when the session/request closes; the node id (or an error) arrives later
+/// on `reply`, once the stream has actually connected. `frame_slot` is shared
+/// with the loop-thread capture cadence (`screencast.rs`); this thread only
+/// ever reads it.
+pub fn spawn_stream(
     node_name: String,
+    width: u32,
+    height: u32,
+    frame_slot: FrameSlot,
     reply: async_channel::Sender<Result<StreamStarted, String>>,
 ) -> pw::channel::Sender<()> {
     let (stop_tx, stop_rx) = pw::channel::channel::<()>();
@@ -276,7 +288,7 @@ pub fn spawn_test_pattern_stream(
     let spawned = std::thread::Builder::new()
         .name("rubix-portal-pw".to_string())
         .spawn(move || {
-            if let Err(e) = run_pw_thread(node_name, stop_rx, reply.clone()) {
+            if let Err(e) = run_pw_thread(node_name, width, height, frame_slot, stop_rx, reply.clone()) {
                 tracing::warn!("[portal] pipewire thread exited with an error: {e}");
                 let _ = reply.try_send(Err(e.to_string()));
             }

@@ -26,8 +26,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use smithay::reexports::calloop::{self, EventLoop};
+use smithay::reexports::calloop::{self, timer::TimeoutAction, timer::Timer, EventLoop};
 use zbus::fdo;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -37,8 +38,34 @@ use zbus::zvariant::{
 };
 use zbus::Connection;
 
+use crate::portal::capture::{self, CaptureTarget};
 use crate::portal::pipewire_stream::{self, StreamStarted};
 use crate::{state::RubixState, CalloopData};
+
+/// `AvailableSourceTypes`/`SelectSources` `types` bitmask, per
+/// `org.freedesktop.portal.ScreenCast`: `MONITOR = 1`, `WINDOW = 2`.
+const SOURCE_TYPE_WINDOW: u32 = 0b10;
+
+/// Which kind of target `Start` should resolve a session to, decided on the
+/// zbus thread (it already has `SessionState::source_types` from
+/// `SelectSources`) and resolved to a concrete [`CaptureTarget`] on the loop
+/// thread (which alone can see `state.windows`/`state.space`).
+pub(crate) enum TargetHint {
+    Window(u32),
+    Monitor,
+}
+
+/// Capture cadence: how often the loop-thread timer re-renders every active
+/// session's target and refreshes its `FrameSlot`. ~30fps, matching
+/// `pipewire_stream::FRAMERATE`.
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
+
+/// `session_handle -> (what it streams, where the newest frame lands)`.
+/// Written by the loop thread (`StartStream` handling inserts, the capture
+/// timer updates frames in place); removed by either thread on teardown
+/// (`Session.Close` on the zbus thread, or `StartStream` itself if the
+/// session raced closed underneath it).
+type ActiveCaptures = Arc<Mutex<HashMap<OwnedObjectPath, (CaptureTarget, capture::FrameSlot)>>>;
 
 /// A window or monitor the compositor can offer as a capture source. Plain
 /// `Send` data -- this is what crosses the calloop/zbus thread boundary, never
@@ -70,6 +97,7 @@ pub enum PortalRequest {
     /// connected and has a node id.
     StartStream {
         session_handle: OwnedObjectPath,
+        target_hint: TargetHint,
         reply: async_channel::Sender<Result<StreamStarted, String>>,
     },
 }
@@ -128,6 +156,7 @@ struct ScreenCastIface {
     /// `Send + Sync + 'static` since methods can run concurrently.
     bridge_tx: Mutex<calloop::channel::Sender<PortalRequest>>,
     sessions: SessionRegistry,
+    active_captures: ActiveCaptures,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -163,7 +192,11 @@ impl ScreenCastIface {
 
         self.sessions.lock().unwrap().insert(session_handle.clone(), SessionState::default());
 
-        let session_obj = SessionObj { handle: session_handle.clone(), sessions: self.sessions.clone() };
+        let session_obj = SessionObj {
+            handle: session_handle.clone(),
+            sessions: self.sessions.clone(),
+            active_captures: self.active_captures.clone(),
+        };
         if let Err(e) = conn.object_server().at(&session_handle, session_obj).await {
             tracing::warn!("[portal] failed to export Session object at {session_handle}: {e}");
         }
@@ -229,14 +262,37 @@ impl ScreenCastIface {
             "[portal] Start handle={handle} session_handle={session_handle} app_id={app_id:?} parent_window={parent_window:?} options={options:?}"
         );
 
-        if !self.sessions.lock().unwrap().contains_key(&session_handle) {
-            tracing::warn!("[portal] Start: unknown session {session_handle}");
-            return Ok((2, HashMap::new()));
-        }
+        let source_types = match self.sessions.lock().unwrap().get(&session_handle) {
+            Some(state) => state.source_types,
+            None => {
+                tracing::warn!("[portal] Start: unknown session {session_handle}");
+                return Ok((2, HashMap::new()));
+            }
+        };
+
+        // TODO(M5): replaced by chooser. Until a real chooser UI exists, a
+        // window target can only be reached by setting `RUBIX_PORTAL_TEST_WINDOW`
+        // to a live window id (see `screencast::build_source_list`/`ListSources`
+        // logs for ids) *and* having selected WINDOW in `SelectSources`; every
+        // other case streams the first monitor. This is scaffolding for M3/M4
+        // validation only -- do not delete, M5 swaps it for real source
+        // selection.
+        let target_hint = match std::env::var("RUBIX_PORTAL_TEST_WINDOW").ok().and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(id) if source_types & SOURCE_TYPE_WINDOW != 0 => TargetHint::Window(id),
+            _ => TargetHint::Monitor,
+        };
+        // WINDOW (2) / MONITOR (1), per org.freedesktop.portal.ScreenCast's
+        // SourceType -- reported in the `streams` dict below.
+        let source_type_value: u32 = match target_hint {
+            TargetHint::Window(_) => 2,
+            TargetHint::Monitor => 1,
+        };
 
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         let sent = self.bridge_tx.lock().unwrap().send(PortalRequest::StartStream {
             session_handle: session_handle.clone(),
+            target_hint,
             reply: reply_tx,
         });
         if let Err(e) = sent {
@@ -268,10 +324,7 @@ impl ScreenCastIface {
             "size".to_string(),
             Value::Structure(Structure::from((started.width as i32, started.height as i32))),
         );
-        // MONITOR = 1 (org.freedesktop.portal.ScreenCast SourceType); this
-        // producer is a synthetic test pattern, not a real capture yet, so we
-        // just advertise it as a monitor-class source.
-        stream_props.insert("source_type".to_string(), Value::U32(1));
+        stream_props.insert("source_type".to_string(), Value::U32(source_type_value));
 
         let stream_dict = Dict::from(stream_props);
         let stream_struct = StructureBuilder::new()
@@ -314,6 +367,7 @@ impl ScreenCastIface {
 struct SessionObj {
     handle: OwnedObjectPath,
     sessions: SessionRegistry,
+    active_captures: ActiveCaptures,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.Session")]
@@ -329,6 +383,11 @@ impl SessionObj {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
         tracing::info!("[portal] Session.Close {}", self.handle);
+        // Stop the capture cadence for this session first: once the pw thread
+        // is asked to quit below, nothing reads `FrameSlot` again anyway, but
+        // this also drops it out of the timer's iteration on the very next
+        // tick rather than racing a capture against a dying stream.
+        self.active_captures.lock().unwrap().remove(&self.handle);
         let removed = self.sessions.lock().unwrap().remove(&self.handle);
         if let Some(state) = removed {
             if let Some(stop_tx) = state.stream_stop {
@@ -371,8 +430,9 @@ const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 async fn run_dbus_service(
     bridge_tx: calloop::channel::Sender<PortalRequest>,
     sessions: SessionRegistry,
+    active_captures: ActiveCaptures,
 ) -> zbus::Result<()> {
-    let iface = ScreenCastIface { bridge_tx: Mutex::new(bridge_tx), sessions };
+    let iface = ScreenCastIface { bridge_tx: Mutex::new(bridge_tx), sessions, active_captures };
 
     let path = ObjectPath::try_from(OBJECT_PATH).expect("valid object path literal");
     let _conn = zbus::connection::Builder::session()?
@@ -414,6 +474,12 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
     let sessions: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
     let sessions_for_loop = sessions.clone();
 
+    // Shared with the zbus thread's `SessionObj::close` and the capture timer
+    // below: which session streams what, and where its newest frame lands.
+    let active_captures: ActiveCaptures = Arc::new(Mutex::new(HashMap::new()));
+    let active_captures_for_loop = active_captures.clone();
+    let active_captures_for_timer = active_captures.clone();
+
     let registered =
         event_loop.handle().insert_source(bridge_channel, move |event, _, data: &mut CalloopData| {
             match event {
@@ -425,6 +491,7 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
                 }
                 calloop::channel::Event::Msg(PortalRequest::StartStream {
                     session_handle,
+                    target_hint,
                     reply,
                 }) => {
                     if !sessions_for_loop.lock().unwrap().contains_key(&session_handle) {
@@ -434,13 +501,42 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
                         let _ = reply.try_send(Err("unknown session".to_string()));
                         return;
                     }
+
+                    let target = match target_hint {
+                        TargetHint::Window(id) => {
+                            if !data.state.windows.contains_key(&id) {
+                                let _ = reply.try_send(Err(format!("window {id} not found")));
+                                return;
+                            }
+                            CaptureTarget::Window(id)
+                        }
+                        TargetHint::Monitor => match data.state.space.outputs().next() {
+                            Some(output) => CaptureTarget::Monitor(output.name()),
+                            None => {
+                                let _ = reply.try_send(Err("no outputs available".to_string()));
+                                return;
+                            }
+                        },
+                    };
+
+                    let Some((width, height)) = capture::target_size(&data.state, &target) else {
+                        let _ = reply.try_send(Err(format!("could not resolve size for {target:?}")));
+                        return;
+                    };
+
                     // pw node.name dislikes '/'; the session handle is an
                     // object path, so give it a flat, still-unique name.
                     let node_name =
                         format!("rubix-screencast-{}", session_handle.as_str().replace('/', "_"));
-                    let stop_tx = pipewire_stream::spawn_test_pattern_stream(node_name, reply);
+                    let slot: capture::FrameSlot = Arc::new(Mutex::new(None));
+                    let stop_tx =
+                        pipewire_stream::spawn_stream(node_name, width, height, slot.clone(), reply);
                     if let Some(state) = sessions_for_loop.lock().unwrap().get_mut(&session_handle) {
                         state.stream_stop = Some(stop_tx);
+                        active_captures_for_loop
+                            .lock()
+                            .unwrap()
+                            .insert(session_handle, (target, slot));
                     } else {
                         // Session vanished (raced with Close) between the
                         // check above and here; stop the thread we just
@@ -457,9 +553,23 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
         return;
     }
 
+    // Capture cadence: re-render every active session's target at ~30fps and
+    // refresh its `FrameSlot`. A no-op (empty map, no renderer touched) while
+    // no session is streaming, so this runs unconditionally rather than being
+    // spawned/torn down per-session. Only produces real frames on the udev
+    // backend (`state.udev_handle` is `None` under nested winit); see
+    // `run_capture_tick`.
+    let capture_timer = Timer::from_duration(CAPTURE_INTERVAL);
+    if let Err(e) = event_loop.handle().insert_source(capture_timer, move |_, _, data: &mut CalloopData| {
+        run_capture_tick(&active_captures_for_timer, data);
+        TimeoutAction::ToDuration(CAPTURE_INTERVAL)
+    }) {
+        tracing::warn!("[portal] failed to register capture timer ({e}); ScreenCast frames disabled");
+    }
+
     let spawned = std::thread::Builder::new().name("rubix-portal-dbus".to_string()).spawn(move || {
         async_io::block_on(async move {
-            if let Err(e) = run_dbus_service(bridge_tx, sessions).await {
+            if let Err(e) = run_dbus_service(bridge_tx, sessions, active_captures).await {
                 tracing::warn!("[portal] ScreenCast D-Bus service exited with an error: {e}");
             }
         });
@@ -468,5 +578,43 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
     match spawned {
         Ok(_) => tracing::info!("[portal] ScreenCast D-Bus thread spawned"),
         Err(e) => tracing::warn!("[portal] failed to spawn ScreenCast D-Bus thread ({e}); portal disabled"),
+    }
+}
+
+/// One capture-timer tick: re-render every active session's target and
+/// refresh its `FrameSlot`. Renderer acquisition mirrors `udev.rs`'s own
+/// render path (`render()`'s `single_renderer` call): only the udev backend
+/// populates `state.udev_handle`, so this is a silent no-op under nested
+/// winit -- there is no equivalent renderer handle to reach for there (see
+/// the M3/M4 milestone report for why real-content validation is deferred to
+/// the user's next udev/TTY session rather than exercised here).
+fn run_capture_tick(active_captures: &ActiveCaptures, data: &mut CalloopData) {
+    let Some(udev) = data.state.udev_handle.clone() else { return };
+
+    let targets: Vec<(OwnedObjectPath, CaptureTarget, capture::FrameSlot)> = {
+        let guard = active_captures.lock().unwrap();
+        if guard.is_empty() {
+            return;
+        }
+        guard.iter().map(|(handle, (target, slot))| (handle.clone(), target.clone(), slot.clone())).collect()
+    };
+
+    let mut guard = udev.borrow_mut();
+    let primary = guard.primary_gpu;
+    let mut renderer = match guard.gpus.single_renderer(&primary) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[portal] capture tick: failed to acquire renderer: {e}");
+            return;
+        }
+    };
+
+    for (session_handle, target, slot) in targets {
+        match capture::capture_frame(&data.state, &mut renderer, &target) {
+            Ok(frame) => *slot.lock().unwrap() = Some(Arc::new(frame)),
+            Err(e) => {
+                tracing::debug!("[portal] capture tick: {session_handle} ({target:?}) failed: {e}")
+            }
+        }
     }
 }
