@@ -191,6 +191,16 @@ pub fn init_winit(
                 }
                 backend.submit(Some(&[damage])).unwrap();
 
+                // Service any screencopy captures now that this frame is
+                // presented. Re-bind to reach the renderer (the earlier bind's
+                // borrow ended with the render block); fulfill re-renders the
+                // output into its own offscreen buffer, so the winit surface we
+                // just submitted is untouched.
+                if !state.pending_screencopy.is_empty() {
+                    let (renderer, _fb) = backend.bind().unwrap();
+                    crate::screencopy::fulfill_pending(state, renderer, &output);
+                }
+
                 state.space.elements().for_each(|window| {
                     window.send_frame(
                         &output,

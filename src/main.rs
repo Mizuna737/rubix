@@ -9,6 +9,7 @@ mod grabs;
 mod input;
 mod ipc;
 mod model;
+mod screencopy;
 mod state;
 mod udev;
 mod winit;
@@ -218,6 +219,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_xwayland(&event_loop, &data.display_handle);
 
     init_config_watch(&event_loop);
+
+    crate::screencopy::init(&data.display_handle);
 
     let ipc_clients = crate::ipc::init_ipc(&event_loop, data.state.xdisplay);
 

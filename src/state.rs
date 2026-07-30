@@ -155,6 +155,11 @@ pub struct RubixState {
     // The client-requested cursor image (named/surface/hidden), set by the
     // `SeatHandler::cursor_image` callback in handlers/mod.rs.
     pub cursor_status: CursorImageStatus,
+
+    // wlr-screencopy captures awaiting the next presented frame. Pushed by the
+    // frame `copy` handler (screencopy.rs), drained by each backend's render
+    // path via `screencopy::fulfill_pending` right after it presents.
+    pub(crate) pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
 }
 
 impl RubixState {
@@ -265,6 +270,17 @@ impl RubixState {
 
             pointer_location,
             cursor_status: CursorImageStatus::default_named(),
+            pending_screencopy: Vec::new(),
+        }
+    }
+
+    /// Force a repaint so a queued screencopy capture is serviced. The udev
+    /// backend renders on demand (VBlank/timer) and would otherwise stay idle
+    /// until something else dirties the screen, leaving the client (e.g. grim)
+    /// blocked forever; winit repaints continuously and needs no nudge.
+    pub(crate) fn nudge_render(&self) {
+        if let Some(udev) = &self.udev_handle {
+            crate::udev::nudge_all_renders(udev);
         }
     }
 

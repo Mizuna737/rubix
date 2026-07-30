@@ -687,6 +687,13 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, c
 
     let result = render_surface(surface, &mut renderer, &mut data.state);
 
+    // Service any screencopy captures against the frame we just rendered, using
+    // this surface's live renderer (re-renders into its own offscreen buffer).
+    if !data.state.pending_screencopy.is_empty() {
+        let sc_output = surface.output.clone();
+        crate::screencopy::fulfill_pending(&mut data.state, &mut renderer, &sc_output);
+    }
+
     let reschedule = match result {
         Ok(true) => {
             // Damage submitted; the flip's VBlank will schedule the next frame.
@@ -871,6 +878,24 @@ fn frame_finish(
     // Repaint a touch before the next scanout so the buffer is ready in time.
     let delay = frame_duration.mul_f64(0.6);
     schedule_render(udev, node, crtc, delay);
+}
+
+/// Force an immediate repaint of every live CRTC. Used by screencopy: a capture
+/// must produce the *next* frame even when the screen is idle, or the client
+/// blocks forever. Collect the (node, crtc) targets under a short borrow, then
+/// schedule outside it -- `schedule_render` re-borrows `udev` for the loop handle.
+pub(crate) fn nudge_all_renders(udev: &Rc<RefCell<UdevData>>) {
+    let targets: Vec<(DrmNode, crtc::Handle)> = {
+        let guard = udev.borrow();
+        guard
+            .backends
+            .iter()
+            .flat_map(|(node, backend)| backend.surfaces.keys().map(move |crtc| (*node, *crtc)))
+            .collect()
+    };
+    for (node, crtc) in targets {
+        schedule_render(udev, node, crtc, Duration::ZERO);
+    }
 }
 
 /// Arm a one-shot timer that renders `(node, crtc)` after `delay`. All render
