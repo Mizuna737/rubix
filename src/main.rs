@@ -9,6 +9,7 @@ mod grabs;
 mod input;
 mod ipc;
 mod model;
+mod portal;
 mod screencopy;
 mod state;
 mod udev;
@@ -223,6 +224,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     crate::screencopy::init(&data.display_handle);
 
     let ipc_clients = crate::ipc::init_ipc(&event_loop, data.state.xdisplay);
+
+    crate::portal::init_portal(&event_loop);
 
     // Optional startup command for nested dev (`rubix -c <cmd>`). No default
     // spawn: launchers (rofi via Super+space) and the config `startup` hook
