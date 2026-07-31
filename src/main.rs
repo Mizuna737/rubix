@@ -7,6 +7,7 @@ mod cursor;
 mod focus;
 mod grabs;
 mod hdr;
+mod hdr_shaders;
 mod input;
 mod ipc;
 mod model;

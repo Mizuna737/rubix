@@ -19,9 +19,10 @@ use smithay::{
             element::{
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
+                texture::TextureRenderElement,
                 Kind,
             },
-            ImportAll, ImportMem, Renderer, Texture,
+            ImportAll, ImportMem, Renderer, RendererSuper, Texture,
         },
     },
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
@@ -53,10 +54,22 @@ use smithay::{
 // `RubixRenderer<'_>` and winit's `GlesRenderer` both just substitute for `R`
 // at their respective call sites without the enum itself needing to know
 // about the lifetime.
+//
+// `Texture = TextureRenderElement<R::TextureId>` (HDR Phase 2): the encode
+// pass in `udev::render_surface`'s HDR branch wraps the linear 16F offscreen
+// as a single fullscreen element. `TextureRenderElement<T>: RenderElement<R>`
+// requires `R: Renderer<TextureId = T>` (backend/renderer/element/texture.rs
+// ~685), which `T = R::TextureId` satisfies trivially -- no extra bound
+// needed beyond what `render_elements!` already assumes for `R`. Used at
+// `R = GlesRenderer` specifically (the encode pass calls `drm_output
+// .render_frame` with `renderer.as_mut(): &mut GlesRenderer`, not the outer
+// `MultiRenderer` -- see udev.rs's HDR branch comment for why), so in
+// practice this variant only ever holds `TextureRenderElement<GlesTexture>`.
 render_elements! {
     pub RubixRenderElement<R> where R: ImportAll + ImportMem;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
+    Texture = TextureRenderElement<<R as RendererSuper>::TextureId>,
 }
 
 struct LoadedCursor {
