@@ -149,7 +149,10 @@ struct ScreenCastIface {
 
 #[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
 impl ScreenCastIface {
-    #[zbus(property)]
+    // Portal interfaces expose the version property lowercase ("version"); zbus
+    // would otherwise derive PascalCase "Version", which the frontend can't find
+    // -> it falls back to client-facing ScreenCast version 0 (unusable).
+    #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         2
     }
@@ -398,7 +401,7 @@ struct SessionObj {
 
 #[interface(name = "org.freedesktop.impl.portal.Session")]
 impl SessionObj {
-    #[zbus(property)]
+    #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         2
     }
