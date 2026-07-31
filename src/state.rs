@@ -438,7 +438,17 @@ impl RubixState {
             });
         self.workspace.ensure_monitor(id, self.config.visible_columns);
         output.user_data().insert_if_missing(|| MonitorId(id));
-        if self.workspace.active_monitor().is_none() {
+        // The configured primary output claims active focus even if another head
+        // bound first (connectors can enumerate in any order); otherwise the first
+        // output to bind seeds it.
+        let is_primary = self
+            .config
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.primary)
+            .unwrap_or(false);
+        if is_primary || self.workspace.active_monitor().is_none() {
             self.workspace.set_active_monitor(id);
         }
     }

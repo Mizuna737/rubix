@@ -931,8 +931,18 @@ fn render_surface(
     // Cursor built last (it also needs `renderer`), same "collect before the
     // combined render call" discipline as the ghost/layer lists above so the
     // mutable borrow is released before `drm_output.render_frame` below.
-    let cursor_elements =
-        pointer_render_elements(renderer, &state.cursor_status, state.pointer_location, scale);
+    // Only the output the pointer is actually over draws it, and the location is
+    // translated into that output's local space (subtract its geometry origin) --
+    // otherwise every output redraws the cursor at the raw global coordinate,
+    // producing a phantom cursor per extra monitor.
+    let output_geo = state.space.output_geometry(&surface.output);
+    let cursor_elements = match output_geo {
+        Some(geo) if geo.to_f64().contains(state.pointer_location) => {
+            let local = state.pointer_location - geo.loc.to_f64();
+            pointer_render_elements(renderer, &state.cursor_status, local, scale)
+        }
+        _ => Vec::new(),
+    };
 
     // Cursor prepended -- front of the Vec is topmost, and it must draw above
     // everything else, including overlay layers.
