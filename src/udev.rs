@@ -591,7 +591,8 @@ fn connector_connected(
     );
     let global = output.create_global::<RubixState>(&data.display_handle);
     output.set_preferred(wl_mode);
-    output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some(position.into()));
+    let transform = output_config.map(|o| o.transform).unwrap_or(Transform::Normal);
+    output.change_current_state(Some(wl_mode), Some(transform), None, Some(position.into()));
     data.state.space.map_output(&output, position);
     data.state.bind_output_monitor(&output);
 

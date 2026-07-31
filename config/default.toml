@@ -38,6 +38,7 @@ inner_gap = 10
 # name = "HDMI-A-1"
 # position = [1920, 0]
 # mode = "1280x400"
+# transform = "270"  # normal|90|180|270|flipped|flipped-90|...|left|right; rotates the output
 
 [animation]
 # Duration of scroll/rotate slide tweens, in milliseconds. Omitting this

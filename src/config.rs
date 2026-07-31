@@ -7,6 +7,7 @@ use smithay::input::keyboard::{
     xkb::{keysym_from_name, KEYSYM_NO_FLAGS},
     ModifiersState,
 };
+use smithay::utils::Transform;
 
 use crate::input::NavAction;
 
@@ -42,6 +43,9 @@ pub struct OutputConfig {
     /// Preferred (width, height); `None` means use the output's own preferred mode.
     pub mode: Option<(i32, i32)>,
     pub primary: bool,
+    /// Output transform (rotation/flip). Defaults to `Transform::Normal` when
+    /// the config omits `transform` or the string is unrecognized.
+    pub transform: Transform,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -97,6 +101,8 @@ struct RawOutput {
     mode: Option<String>,
     #[serde(default)]
     primary: bool,
+    #[serde(default)]
+    transform: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +175,7 @@ impl Config {
                 position: (o.position[0], o.position[1]),
                 mode: o.mode.as_deref().and_then(parse_mode),
                 primary: o.primary,
+                transform: o.transform.as_deref().and_then(parse_transform).unwrap_or(Transform::Normal),
             })
             .collect();
 
@@ -258,6 +265,32 @@ fn parse_mode(mode: &str) -> Option<(i32, i32)> {
         (Ok(w), Ok(h)) => Some((w, h)),
         _ => {
             tracing::warn!("malformed output mode '{mode}'; falling back to preferred mode");
+            None
+        }
+    }
+}
+
+/// Parse a `transform` string (e.g. `"270"`, `"flipped-90"`, `"right"`) into a
+/// [`Transform`]. Unrecognized strings warn and return `None`, falling back to
+/// `Transform::Normal` at the call site rather than failing config resolution.
+fn parse_transform(transform: &str) -> Option<Transform> {
+    match transform {
+        "normal" | "0" => Some(Transform::Normal),
+        "90" => Some(Transform::_90),
+        "180" => Some(Transform::_180),
+        "270" => Some(Transform::_270),
+        "flipped" => Some(Transform::Flipped),
+        "flipped-90" => Some(Transform::Flipped90),
+        "flipped-180" => Some(Transform::Flipped180),
+        "flipped-270" => Some(Transform::Flipped270),
+        // NOTE: xrandr-style aliases for how Max thinks about rotation direction.
+        // This CW/CCW mapping is a best guess and has NOT been hardware-verified;
+        // if `left`/`right` come out rotated the wrong way on real hardware, swap
+        // these two arms (_90 <-> _270).
+        "left" => Some(Transform::_90),
+        "right" => Some(Transform::_270),
+        _ => {
+            tracing::warn!("unrecognized output transform '{transform}'; falling back to normal");
             None
         }
     }
