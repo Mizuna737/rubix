@@ -24,6 +24,21 @@ outer_gap = 20
 # inner_gap sits in each split seam. Omitting the key defaults to 10.
 inner_gap = 10
 
+# Per-connector output placement. Omitting this section (or omitting an entry
+# for a given connector) is fine -- unconfigured outputs are auto-laid-out
+# left-to-right so they never collide at the same origin. Uncomment and adjust
+# to pin a specific connector's position (and optionally its mode).
+# [[output]]
+# name = "DP-3"            # connector name, as reported by the DRM backend
+# position = [0, 0]        # top-left corner in global compositor space
+# mode = "1920x1080"       # optional; omit to use the output's preferred mode
+# primary = true           # optional, defaults to false
+#
+# [[output]]
+# name = "HDMI-A-1"
+# position = [1920, 0]
+# mode = "1280x400"
+
 [animation]
 # Duration of scroll/rotate slide tweens, in milliseconds. Omitting this
 # section entirely is fine -- it defaults to 250.

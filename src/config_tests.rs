@@ -49,6 +49,77 @@
         assert!(parse_chord("Alt+Nonsense", NavAction::MoveToNewColumn).is_none());
     }
 
+    // ---- output config ----
+
+    #[test]
+    fn two_output_entries_resolve_with_position_and_mode() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+
+            [[output]]
+            name = "DP-3"
+            position = [0, 0]
+            mode = "1920x1080"
+            primary = true
+
+            [[output]]
+            name = "HDMI-A-1"
+            position = [1920, 0]
+            mode = "1280x400"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config with [[output]] parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.outputs.len(), 2);
+
+        let dp3 = cfg.outputs.iter().find(|o| o.name == "DP-3").unwrap();
+        assert_eq!(dp3.position, (0, 0));
+        assert_eq!(dp3.mode, Some((1920, 1080)));
+        assert!(dp3.primary);
+
+        let hdmi = cfg.outputs.iter().find(|o| o.name == "HDMI-A-1").unwrap();
+        assert_eq!(hdmi.position, (1920, 0));
+        assert_eq!(hdmi.mode, Some((1280, 400)));
+        assert!(!hdmi.primary);
+    }
+
+    #[test]
+    fn config_omitting_output_section_resolves_to_empty_vec() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [[output]] still parses");
+        let cfg = Config::resolve(raw);
+        assert!(cfg.outputs.is_empty());
+    }
+
+    #[test]
+    fn malformed_output_mode_is_dropped_without_failing_parse() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+
+            [[output]]
+            name = "DP-3"
+            position = [0, 0]
+            mode = "not-a-mode"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config still parses despite bad mode string");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.outputs.len(), 1);
+        assert_eq!(cfg.outputs[0].mode, None);
+    }
+
     // ---- hot-reload event filtering ----
 
     use calloop_notify::notify::{

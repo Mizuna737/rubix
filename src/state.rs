@@ -419,6 +419,7 @@ impl RubixState {
         // safe to swap live; the next apply_layout re-tiles with the new values.
         self.config.outer_gap = new.outer_gap;
         self.config.inner_gap = new.inner_gap;
+        self.config.outputs = new.outputs;
         tracing::info!("reloaded config: {count} keybinds active");
     }
 

@@ -27,6 +27,21 @@ pub struct Config {
     /// equivalent of AwesomeWM's autorun. Fired from the XWayland-ready hook so
     /// children inherit WAYLAND_DISPLAY and get DISPLAY set (see main.rs).
     pub startup: Vec<String>,
+    /// Per-connector output placement, resolved from `[[output]]` entries.
+    /// Empty when the user config omits the section (or has no entries) --
+    /// the udev backend falls back to auto left-to-right layout in that case.
+    pub outputs: Vec<OutputConfig>,
+}
+
+/// Resolved placement for one physical output, matched by connector name
+/// (e.g. "DP-3", "HDMI-A-1") at connect time in udev.rs.
+pub struct OutputConfig {
+    pub name: String,
+    /// Top-left corner in global compositor space.
+    pub position: (i32, i32),
+    /// Preferred (width, height); `None` means use the output's own preferred mode.
+    pub mode: Option<(i32, i32)>,
+    pub primary: bool,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -65,6 +80,23 @@ struct RawConfig {
     // Optional: a config omitting `startup` parses fine (empty list = run nothing).
     #[serde(default)]
     startup: Vec<String>,
+    // Optional: a config omitting `[[output]]` entirely parses fine (empty list =
+    // auto left-to-right layout for every connector; see udev.rs). Field name is
+    // singular to match the `[[output]]` TOML array-of-tables header exactly (no
+    // serde rename); the resolved `Config::outputs` is plural since it's built
+    // manually in resolve(), not deserialized directly.
+    #[serde(default)]
+    output: Vec<RawOutput>,
+}
+
+#[derive(Deserialize)]
+struct RawOutput {
+    name: String,
+    position: [i32; 2],
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    primary: bool,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +161,17 @@ impl Config {
             .filter_map(|(chord, action)| parse_chord(&chord, action))
             .collect();
 
+        let outputs = raw
+            .output
+            .into_iter()
+            .map(|o| OutputConfig {
+                name: o.name,
+                position: (o.position[0], o.position[1]),
+                mode: o.mode.as_deref().and_then(parse_mode),
+                primary: o.primary,
+            })
+            .collect();
+
         Config {
             visible_columns: raw.layout.visible_columns,
             outer_gap: raw.layout.outer_gap,
@@ -136,6 +179,7 @@ impl Config {
             keybinds,
             animation_duration: Duration::from_millis(raw.animation.duration_ms),
             startup: raw.startup,
+            outputs,
         }
     }
 
@@ -199,6 +243,24 @@ pub fn should_reload(event: &calloop_notify::notify::Event, file_name: &std::ffi
         _ => false,
     };
     touches && is_write
+}
+
+/// Parse a mode string like `"1280x400"` into `(width, height)`. Returns `None`
+/// (with a warning) on anything that doesn't split cleanly into two ints on
+/// 'x' -- an unparseable mode falls back to the output's preferred mode rather
+/// than failing config resolution.
+fn parse_mode(mode: &str) -> Option<(i32, i32)> {
+    let Some((w, h)) = mode.split_once('x') else {
+        tracing::warn!("malformed output mode '{mode}'; falling back to preferred mode");
+        return None;
+    };
+    match (w.trim().parse::<i32>(), h.trim().parse::<i32>()) {
+        (Ok(w), Ok(h)) => Some((w, h)),
+        _ => {
+            tracing::warn!("malformed output mode '{mode}'; falling back to preferred mode");
+            None
+        }
+    }
 }
 
 /// Parse a chord like `"Alt+Return"` into a resolved [`Keybind`]. Modifier tokens

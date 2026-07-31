@@ -537,13 +537,47 @@ fn connector_connected(
     );
     tracing::info!("connector {output_name} connected on {node}");
 
-    // Preferred mode, else the first advertised.
-    let drm_mode = *connector
-        .modes()
+    // Preferred mode, else the first advertised. If config pins a mode for this
+    // connector, prefer the DRM mode matching those dimensions when one exists;
+    // otherwise fall through to the same preferred/first selection.
+    let output_config = data
+        .state
+        .config
+        .outputs
         .iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .unwrap_or_else(|| &connector.modes()[0]);
+        .find(|o| o.name == output_name);
+    let drm_mode = *output_config
+        .and_then(|o| o.mode)
+        .and_then(|(w, h)| {
+            connector
+                .modes()
+                .iter()
+                .find(|m| m.size() == (w as u16, h as u16))
+        })
+        .unwrap_or_else(|| {
+            connector
+                .modes()
+                .iter()
+                .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+                .unwrap_or_else(|| &connector.modes()[0])
+        });
     let wl_mode = WlMode::from(drm_mode);
+
+    // Position: explicit config entry wins; otherwise auto-layout left-to-right
+    // by summing the widths of outputs already mapped into the space, so an
+    // unconfigured connector never collides at the same origin as another.
+    let position = match output_config {
+        Some(o) => o.position,
+        None => {
+            let x: i32 = data
+                .state
+                .space
+                .outputs()
+                .map(|o| data.state.space.output_geometry(o).map_or(0, |geo| geo.size.w))
+                .sum();
+            (x, 0)
+        }
+    };
 
     let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
     let output = Output::new(
@@ -557,8 +591,8 @@ fn connector_connected(
     );
     let global = output.create_global::<RubixState>(&data.display_handle);
     output.set_preferred(wl_mode);
-    output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some((0, 0).into()));
-    data.state.space.map_output(&output, (0, 0));
+    output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some(position.into()));
+    data.state.space.map_output(&output, position);
 
     // NVIDIA breaks with overlay planes assigned -- clear them before init.
     let mut planes = backend
