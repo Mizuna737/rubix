@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use pipewire as pw;
 use pw::spa::pod::{self, Pod};
-use pw::spa::utils::{Direction, Fraction, Id, Rectangle};
+use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Id, Rectangle};
 
 use crate::portal::capture::{FrameBuffer, FrameSlot};
 
@@ -106,6 +106,102 @@ fn format_param(width: u32, height: u32) -> OwnedPod {
             },
         ],
     }))
+}
+
+/// Build the `SPA_PARAM_Buffers` pod advertising this stream's buffer
+/// requirements, plus a `SPA_PARAM_Meta` pod for the standard `Header`
+/// metadata. Emitted from the `param_changed` callback once the format has
+/// negotiated (see `param_changed` below) -- without this, strict consumers
+/// (gstreamer's `pipewiresrc`, Teams' `mod.client-node` path) fail buffer
+/// allocation with `-22 (EINVAL)` even though lenient consumers tolerate its
+/// absence. `data_type` is a bitmask (`1 << SPA_DATA_*`) of the buffer memory
+/// kinds we're willing to hand out; MemFd must be included for strict
+/// consumers even though `process` below currently writes through MemPtr.
+fn buffers_params(width: u32, height: u32) -> (OwnedPod, OwnedPod) {
+    let stride = width * 4;
+    let size = stride * height;
+    let data_type = (1u32 << pw::spa::sys::SPA_DATA_MemPtr) | (1u32 << pw::spa::sys::SPA_DATA_MemFd);
+
+    let buffers = OwnedPod::serialize(&pod::Value::Object(pod::Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamBuffers,
+        id: pw::spa::sys::SPA_PARAM_Buffers,
+        properties: vec![
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range { default: 4, min: 2, max: 8 },
+                ))),
+            },
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_blocks,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(1),
+            },
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_size,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(size as i32),
+            },
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_stride,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(stride as i32),
+            },
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_align,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(16),
+            },
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Flags { default: data_type as i32, flags: vec![data_type as i32] },
+                ))),
+            },
+        ],
+    }));
+
+    let meta = OwnedPod::serialize(&pod::Value::Object(pod::Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamMeta,
+        id: pw::spa::sys::SPA_PARAM_Meta,
+        properties: vec![
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_META_type,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Id(Id(pw::spa::sys::SPA_META_Header)),
+            },
+            pod::Property {
+                key: pw::spa::sys::SPA_PARAM_META_size,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(std::mem::size_of::<pw::spa::sys::spa_meta_header>() as i32),
+            },
+        ],
+    }));
+
+    (buffers, meta)
+}
+
+/// `param_changed` stream callback: once the concrete `SPA_PARAM_Format`
+/// lands (the only format we ever offer, so negotiation is trivial -- see
+/// `format_param`'s doc comment), push the `Buffers`/`Meta` params so strict
+/// consumers can actually allocate buffers. Without this round-trip the link
+/// negotiates a format but dies at `port_use_buffers` with `-22`.
+fn param_changed(state: &mut StreamState, stream: &pw::stream::Stream, id: u32, param: Option<&Pod>) {
+    if id != pw::spa::sys::SPA_PARAM_Format || param.is_none() {
+        return;
+    }
+
+    tracing::debug!("[portal] format negotiated, advertising buffer params ({}x{})", state.width, state.height);
+
+    let (buffers, meta) = buffers_params(state.width, state.height);
+    let mut params = [buffers.as_pod(), meta.as_pod()];
+    if let Err(e) = stream.update_params(&mut params) {
+        tracing::warn!("[portal] failed to update stream buffer params: {e}");
+    }
 }
 
 /// Per-stream data living entirely on the pw thread. Not `Send` -- never
@@ -241,6 +337,7 @@ fn run_pw_thread(
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(|stream, data, old, new| state_changed(data, stream, old, new))
+        .param_changed(|stream, data, id, param| param_changed(data, stream, id, param))
         .process(|stream, data| process(data, stream))
         .register()?;
 
