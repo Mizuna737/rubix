@@ -10,6 +10,15 @@ startup = [
     "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start rubix-session.target",
 ]
 
+# SDR white luminance (nits) fed to the HDR encode shader for `hdr = true`
+# outputs -- the "brightness slider" for SDR content composited through the
+# HDR (BT.2020/PQ) pipeline. Live/hot-reloadable: editing and saving this
+# value takes effect immediately, no restart. Also adjustable at runtime via
+# Alt+XF86AudioRaiseVolume / Alt+XF86AudioLowerVolume (Super+ on a real TTY
+# session -- see keybinds below). Valid range [80, 300]; out-of-range values
+# are clamped. Omitting the key defaults to 203 (BT.2408 reference SDR white).
+sdr_white_nits = 203.0
+
 [layout]
 # Number of columns instantiated on the monitor at startup.
 # Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.
@@ -87,6 +96,11 @@ duration_ms = 250
 "XF86AudioLowerVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ -5%" }
 "XF86AudioMute" = { Spawn = "pactl set-sink-mute @DEFAULT_SINK@ toggle" }
 "XF86AudioMicMute" = { Spawn = "pactl set-source-mute @DEFAULT_SOURCE@ toggle" }
+# SDR-white-nits "brightness slider" for HDR outputs (see sdr_white_nits
+# above). Alt-based to match this file's nested-testing convention; switch to
+# Super for a real TTY session (matches "Super+space" launcher above).
+"Alt+XF86AudioRaiseVolume" = "IncreaseSdrWhite"
+"Alt+XF86AudioLowerVolume" = "DecreaseSdrWhite"
 # Exit the compositor. On the TTY backend this is the only in-session quit (winit
 # also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
 # Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the

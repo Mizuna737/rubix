@@ -14,11 +14,15 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::backend::renderer::Color32F;
 
-/// BT.2408 reference SDR white, in nits. Fed to `ENCODE_LINEAR_TO_PQ`'s
-/// `sdr_white_nits` uniform so the scene-referred [0,1] linear offscreen maps
-/// to an absolute PQ luminance. Phase 4 replaces this constant with a live
-/// per-output value from the SDR-brightness slider (80-300 nits) -- static
-/// 203 nits is correct for now (no slider exists yet).
+/// BT.2408 reference SDR white, in nits. Historically fed straight to
+/// `ENCODE_LINEAR_TO_PQ`'s `sdr_white_nits` uniform; as of Phase 4 the encode
+/// pass instead reads the live, runtime-adjustable `RubixState::sdr_white_nits`
+/// (see udev.rs::render_surface_hdr), which starts out seeded from this
+/// constant. This const now serves two remaining purposes: the serde default
+/// for `Config::sdr_white_nits` (`config::default_sdr_white_nits`) and the
+/// documented center of its valid range, [80, 300] nits -- the clamp bounds
+/// enforced everywhere the value can change (config resolve, hot-reload, and
+/// the IncreaseSdrWhite/DecreaseSdrWhite keybind actions).
 pub const SDR_WHITE_NITS: f32 = 203.0;
 
 /// Decode pass: samples the client-submitted sRGB texture, converts to

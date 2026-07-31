@@ -102,6 +102,14 @@ pub struct RubixState {
     // User configuration (keybinds + layout), resolved at startup.
     pub config: Config,
 
+    // Live SDR-white-nits value the HDR encode pass reads each frame
+    // (render_surface_hdr, threaded through render_surface). Seeded from
+    // `config.sdr_white_nits` in `new` and re-seeded in `reload_config`, but
+    // also adjustable independently at runtime via the IncreaseSdrWhite /
+    // DecreaseSdrWhite keybinds (input.rs dispatch_nav) without touching the
+    // config struct. Always in [80, 300].
+    pub sdr_white_nits: f32,
+
     // Rubix model + translation registry.
     // `workspace` is the pure tiling model, one Monitor per bound output;
     // `windows` maps its synthetic u32 ids to live Smithay handles; `next_id`
@@ -241,6 +249,8 @@ impl RubixState {
         // an Output into `space` (see udev.rs/winit.rs). Empty at construction.
         let workspace = Workspace::new();
 
+        let sdr_white_nits = config.sdr_white_nits.clamp(80.0, 300.0);
+
         Self {
             start_time,
             display_handle: dh,
@@ -251,6 +261,7 @@ impl RubixState {
             socket_name,
 
             config,
+            sdr_white_nits,
 
             workspace,
             windows: HashMap::new(),
@@ -480,7 +491,15 @@ impl RubixState {
         self.config.outer_gap = new.outer_gap;
         self.config.inner_gap = new.inner_gap;
         self.config.outputs = new.outputs;
+        self.config.sdr_white_nits = new.sdr_white_nits;
+        // Re-seed the live runtime value too (already clamped by resolve()),
+        // so a plain config-file edit takes effect immediately without
+        // needing a keybind nudge -- matches the gaps' live-swap behavior.
+        self.sdr_white_nits = self.config.sdr_white_nits;
         tracing::info!("reloaded config: {count} keybinds active");
+        // Force a repaint so an sdr_white_nits edit is visible immediately,
+        // same reasoning as the keybind path in dispatch_nav below.
+        self.nudge_render();
     }
 
     /// Mint the next synthetic window id. Monotonic, never reused within a run.

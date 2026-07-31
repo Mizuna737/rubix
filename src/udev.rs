@@ -81,7 +81,7 @@ use smithay::utils::{Buffer as BufferCoord, DeviceFd, Physical, Point, Scale, Si
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
-use crate::hdr_shaders::{compile_hdr_shaders, srgb_to_linear_solid, HdrShaders, SDR_WHITE_NITS};
+use crate::hdr_shaders::{compile_hdr_shaders, srgb_to_linear_solid, HdrShaders};
 use crate::state::Pos;
 use crate::RubixState;
 
@@ -1085,7 +1085,7 @@ fn render_surface(
     // session. The non-HDR path below is intentionally untouched byte-for-
     // byte by this branch: most outputs (e.g. HDMI-A-1) never enter it.
     if surface.hdr {
-        match render_surface_hdr(surface, renderer, &elements) {
+        match render_surface_hdr(surface, renderer, &elements, state.sdr_white_nits) {
             Ok(presented) => return Ok(presented),
             Err(err) => {
                 tracing::warn!(
@@ -1183,6 +1183,7 @@ fn render_surface_hdr<'a>(
     surface: &mut SurfaceData,
     renderer: &mut RubixRenderer<'a>,
     elements: &[RubixRenderElement<RubixRenderer<'a>>],
+    sdr_white_nits: f32,
 ) -> Result<bool, String> {
     // Compile once, cache forever (SurfaceData::hdr_shaders -- see its doc
     // comment for why the cache lives here and not on UdevData).
@@ -1295,7 +1296,11 @@ fn render_surface_hdr<'a>(
     );
     gles.set_default_tex_program_override(Some((
         shaders.encode.clone(),
-        vec![Uniform::new("sdr_white_nits", SDR_WHITE_NITS)],
+        // Live value threaded from RubixState::sdr_white_nits (via
+        // render_surface's caller), not the SDR_WHITE_NITS const -- that
+        // const now only serves as the serde default / clamp-bounds
+        // reference (see its doc comment in hdr_shaders.rs).
+        vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
     )));
     let encode_elements = [RubixRenderElement::Texture(texture_element)];
     // See the doc comment above for why `FrameFlags::empty()` (not
