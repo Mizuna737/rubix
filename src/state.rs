@@ -11,6 +11,7 @@ use smithay::{
         pointer::CursorImageStatus,
         Seat, SeatState,
     },
+    output::Output,
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -339,6 +340,21 @@ impl RubixState {
         socket_name
     }
 
+    /// The output whose geometry contains this global point, if any. `None`
+    /// when there are no outputs, or the point falls in a dead zone between
+    /// heads (a gap left by non-adjacent placement in config).
+    pub(crate) fn output_at(&self, point: Point<f64, Logical>) -> Option<Output> {
+        self.space
+            .outputs()
+            .find(|o| {
+                self.space
+                    .output_geometry(o)
+                    .map(|geo| geo.to_f64().contains(point))
+                    .unwrap_or(false)
+            })
+            .cloned()
+    }
+
     /// Resolve the surface (and its global position) under the pointer, honouring
     /// the layer-shell stacking order: overlay/top layer surfaces sit *above* the
     /// tiled windows, bottom/background *below* -- the same z-order the render
@@ -346,7 +362,12 @@ impl RubixState {
     /// thing the pointer could ever land on, so layer clients (mako notifications,
     /// the bar) never received pointer enter/button events and couldn't be clicked.
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let output = self.space.outputs().next()?;
+        // Prefer the output whose geometry actually contains the pointer; fall
+        // back to the first known output for a point in a dead zone between
+        // heads (gaps from non-adjacent placement), so behaviour never
+        // regresses versus the single-output case.
+        let output = self.output_at(pos).unwrap_or(self.space.outputs().next()?.clone());
+        let output = &output;
         let output_loc = self.space.output_geometry(output).map(|g| g.loc).unwrap_or_default();
         let layers = layer_map_for_output(output);
         // layer_geometry / layer_under work in output-local coords; shift the global

@@ -26,14 +26,26 @@ impl WlrLayerShellHandler for RubixState {
         _layer: Layer,
         namespace: String,
     ) {
-        // Resolve the target output: the client's requested output if given and
-        // still mappable, else the first (only, today) output known to the
-        // space. No output yet (e.g. a layer client racing compositor startup
-        // before winit/udev has mapped one) -- skip-map, never unwrap. The
-        // surface stays unmapped; there is no protocol requirement to map it.
+        // Resolve the target output: the client's requested output if given,
+        // else the configured primary output (matched by connector name),
+        // else the first output known to the space. No output yet (e.g. a
+        // layer client racing compositor startup before winit/udev has
+        // mapped one) -- skip-map, never unwrap. The surface stays unmapped;
+        // there is no protocol requirement to map it.
         let output = wl_output
             .as_ref()
             .and_then(Output::from_resource)
+            .or_else(|| {
+                let primary_name = self
+                    .config
+                    .outputs
+                    .iter()
+                    .find(|o| o.primary)
+                    .map(|o| o.name.as_str());
+                primary_name.and_then(|name| {
+                    self.space.outputs().find(|o| o.name() == name).cloned()
+                })
+            })
             .or_else(|| self.space.outputs().next().cloned());
 
         let Some(output) = output else {

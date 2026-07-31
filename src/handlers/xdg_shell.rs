@@ -265,9 +265,16 @@ impl RubixState {
             return;
         };
 
-        let output = self.space.outputs().next().unwrap();
-        let output_geo = self.space.output_geometry(output).unwrap();
-        let window_geo = self.space.element_geometry(window).unwrap();
+        // Constrain against the output the popup's parent toplevel actually
+        // sits on (multi-monitor), falling back to the first known output --
+        // gracefully, no unwrap -- if for some reason the parent's location
+        // can't be resolved (e.g. no outputs at all).
+        let Some(window_geo) = self.space.element_geometry(window) else { return; };
+        let output = self
+            .output_at(window_geo.loc.to_f64())
+            .or_else(|| self.space.outputs().next().cloned());
+        let Some(output) = output else { return; };
+        let Some(output_geo) = self.space.output_geometry(&output) else { return; };
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.

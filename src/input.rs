@@ -103,15 +103,29 @@ impl RubixState {
             }
             // Relative motion (udev/libinput mice): mirrors the absolute arm
             // below, but the new location is accumulated from a delta instead
-            // of read off the device directly. Single-monitor clamp for now --
-            // see src/cursor.rs module doc for the multi-monitor caveat.
+            // of read off the device directly. Multi-monitor: the proposed
+            // position is accepted as-is when it lands inside some output's
+            // geometry (crossing freely between adjacent heads); otherwise it
+            // is clamped per-axis to the geometry of whichever output the
+            // pointer is currently in, so the cursor stops at that head's
+            // edge where there's no neighbour.
             InputEvent::PointerMotion { event, .. } => {
-                let Some(output) = self.space.outputs().next().cloned() else { return; };
-                let Some(output_geo) = self.space.output_geometry(&output) else { return; };
+                let proposed = self.pointer_location + event.delta();
 
-                let mut loc = self.pointer_location + event.delta();
-                loc.x = loc.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
-                loc.y = loc.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
+                let loc = if self.output_at(proposed).is_some() {
+                    proposed
+                } else {
+                    let current_output = self
+                        .output_at(self.pointer_location)
+                        .or_else(|| self.space.outputs().next().cloned());
+                    let Some(current_output) = current_output else { return; };
+                    let Some(output_geo) = self.space.output_geometry(&current_output) else { return; };
+
+                    let mut clamped = proposed;
+                    clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
+                    clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
+                    clamped
+                };
                 self.pointer_location = loc;
 
                 let serial = SERIAL_COUNTER.next_serial();
@@ -129,9 +143,17 @@ impl RubixState {
                 pointer.frame(self);
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let Some(output) = self.space.outputs().next() else { return; };
+                // Absolute devices (touchscreens/tablets) report position
+                // relative to a single mapped output; multi-monitor absolute
+                // input is rare on this setup, so this stays minimal: prefer
+                // the output under the current pointer location, falling
+                // back to the first known output.
+                let output = self
+                    .output_at(self.pointer_location)
+                    .or_else(|| self.space.outputs().next().cloned());
+                let Some(output) = output else { return; };
 
-                let Some(output_geo) = self.space.output_geometry(output) else { return; };
+                let Some(output_geo) = self.space.output_geometry(&output) else { return; };
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
                 // Keep the single source of truth in sync with the relative
