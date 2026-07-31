@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use smithay::reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction};
 use smithay::wayland::seat::WaylandFocus;
 
-use crate::{input::NavAction, state::RubixState, CalloopData};
+use crate::{input::NavAction, state::RubixState};
 
 /// One subscriber's write-side handle, kept in the shared registry so the
 /// run-loop's coalesced broadcast (see `broadcast_snapshot`) can reach every
@@ -209,17 +209,17 @@ fn write_reply(stream: &mut UnixStream, reply: &Reply) -> std::io::Result<()> {
 /// Handle every complete line currently buffered for `client`. Returns
 /// `false` if the connection should be dropped (write failure -- read EOF is
 /// detected by the caller before this runs).
-fn handle_lines(client: &mut ClientIo, data: &mut CalloopData) -> bool {
+fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
     for line in drain_lines(&mut client.buf) {
         let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::GetState) => Reply::State(build_snapshot(&data.state)),
+            Ok(Request::GetState) => Reply::State(build_snapshot(data)),
             Ok(Request::Action { action }) => {
-                data.state.dispatch_nav(action);
+                data.dispatch_nav(action);
                 Reply::Ok
             }
             Ok(Request::Subscribe) => {
                 client.subscribed.set(true);
-                Reply::State(build_snapshot(&data.state))
+                Reply::State(build_snapshot(data))
             }
             Err(e) => Reply::Error { message: e.to_string() },
         };
@@ -277,7 +277,7 @@ fn read_available(client: &mut ClientIo) -> bool {
 /// necessarily signaled `Ready`), `xdisplay` is almost always `None`, and
 /// that's fine: the socket must exist independent of X11.
 pub fn init_ipc(
-    event_loop: &EventLoop<'static, CalloopData>,
+    event_loop: &EventLoop<'static, RubixState>,
     xdisplay: Option<u32>,
 ) -> Option<ClientRegistry> {
     let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
@@ -316,7 +316,7 @@ pub fn init_ipc(
 
     let registered = loop_handle.insert_source(
         Generic::new(listener, Interest::READ, Mode::Level),
-        move |_readiness, listener, _data: &mut CalloopData| {
+        move |_readiness, listener, _data: &mut RubixState| {
             // Safety: we never drop the listener out from under the source.
             let listener = unsafe { listener.get_mut() };
             loop {
@@ -350,7 +350,7 @@ pub fn init_ipc(
                         };
                         let insert = accept_handle.insert_source(
                             Generic::new(client_io, Interest::READ, Mode::Level),
-                            move |_readiness, io, data: &mut CalloopData| {
+                            move |_readiness, io, data: &mut RubixState| {
                                 // Safety: we never drop the client out from
                                 // under the source.
                                 let client = unsafe { io.get_mut() };

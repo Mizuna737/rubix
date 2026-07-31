@@ -41,7 +41,7 @@ use zbus::Connection;
 use crate::portal::capture::{self, CaptureTarget};
 use crate::portal::chooser;
 use crate::portal::pipewire_stream::{self, StreamStarted};
-use crate::{state::RubixState, CalloopData};
+use crate::state::RubixState;
 
 /// Capture cadence: how often the loop-thread timer re-renders every active
 /// session's target and refreshes its `FrameSlot`. ~30fps, matching
@@ -91,7 +91,7 @@ pub enum PortalRequest {
 }
 
 /// Bind `init_portal`'s calloop channel receiver into the event loop. The
-/// handler runs on the loop thread, reads `data.state`, and replies over the
+/// handler runs on the loop thread, reads `RubixState` directly, and replies over the
 /// enclosed `async_channel::Sender` -- the only place `RubixState` data is
 /// ever read for this feature.
 fn build_source_list(state: &RubixState) -> Vec<SourceInfo> {
@@ -488,7 +488,7 @@ async fn run_dbus_service(
 /// can be turned off without a rebuild if it misbehaves. Does NOT touch
 /// `~/.config/xdg-desktop-portal` -- `xdg-desktop-portal-wlr` remains the
 /// live ScreenCast backend regardless of whether this registers.
-pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
+pub fn init_portal(event_loop: &EventLoop<'static, RubixState>) {
     if std::env::var("RUBIX_PORTAL").as_deref() == Ok("0") {
         tracing::info!("[portal] RUBIX_PORTAL=0; ScreenCast portal backend disabled");
         return;
@@ -510,10 +510,10 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
     let active_captures_for_timer = active_captures.clone();
 
     let registered =
-        event_loop.handle().insert_source(bridge_channel, move |event, _, data: &mut CalloopData| {
+        event_loop.handle().insert_source(bridge_channel, move |event, _, data: &mut RubixState| {
             match event {
                 calloop::channel::Event::Msg(PortalRequest::ListSources { reply }) => {
-                    let sources = build_source_list(&data.state);
+                    let sources = build_source_list(data);
                     if reply.try_send(sources).is_err() {
                         tracing::debug!("[portal] ListSources reply dropped (zbus side gone)");
                     }
@@ -536,9 +536,9 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
                     // closed, output unplugged) between the chooser running
                     // on the zbus thread and this message landing here.
                     let target_exists = match &target {
-                        CaptureTarget::Window(id) => data.state.windows.contains_key(id),
+                        CaptureTarget::Window(id) => data.windows.contains_key(id),
                         CaptureTarget::Monitor(name) => {
-                            data.state.space.outputs().any(|o| &o.name() == name)
+                            data.space.outputs().any(|o| &o.name() == name)
                         }
                     };
                     if !target_exists {
@@ -546,7 +546,7 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
                         return;
                     }
 
-                    let Some((width, height)) = capture::target_size(&data.state, &target) else {
+                    let Some((width, height)) = capture::target_size(data, &target) else {
                         let _ = reply.try_send(Err(format!("could not resolve size for {target:?}")));
                         return;
                     };
@@ -587,7 +587,7 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
     // backend (`state.udev_handle` is `None` under nested winit); see
     // `run_capture_tick`.
     let capture_timer = Timer::from_duration(CAPTURE_INTERVAL);
-    if let Err(e) = event_loop.handle().insert_source(capture_timer, move |_, _, data: &mut CalloopData| {
+    if let Err(e) = event_loop.handle().insert_source(capture_timer, move |_, _, data: &mut RubixState| {
         run_capture_tick(&active_captures_for_timer, data);
         TimeoutAction::ToDuration(CAPTURE_INTERVAL)
     }) {
@@ -615,8 +615,8 @@ pub fn init_portal(event_loop: &EventLoop<'static, CalloopData>) {
 /// winit -- there is no equivalent renderer handle to reach for there (see
 /// the M3/M4 milestone report for why real-content validation is deferred to
 /// the user's next udev/TTY session rather than exercised here).
-fn run_capture_tick(active_captures: &ActiveCaptures, data: &mut CalloopData) {
-    let Some(udev) = data.state.udev_handle.clone() else { return };
+fn run_capture_tick(active_captures: &ActiveCaptures, data: &mut RubixState) {
+    let Some(udev) = data.udev_handle.clone() else { return };
 
     let targets: Vec<(OwnedObjectPath, CaptureTarget, capture::FrameSlot)> = {
         let guard = active_captures.lock().unwrap();
@@ -637,7 +637,7 @@ fn run_capture_tick(active_captures: &ActiveCaptures, data: &mut CalloopData) {
     };
 
     for (session_handle, target, slot) in targets {
-        match capture::capture_frame(&data.state, &mut renderer, &target) {
+        match capture::capture_frame(data, &mut renderer, &target) {
             Ok(frame) => *slot.lock().unwrap() = Some(Arc::new(frame)),
             Err(e) => {
                 tracing::debug!("[portal] capture tick: {session_handle} ({target:?}) failed: {e}")

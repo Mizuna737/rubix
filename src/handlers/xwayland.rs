@@ -1,5 +1,4 @@
 use smithay::{
-    delegate_xwayland_shell,
     desktop::Window,
     utils::{Logical, Rectangle},
     wayland::{
@@ -14,7 +13,7 @@ use smithay::{
 
 use crate::{
     model::{geometry::Rect, tiling::SplitDirection},
-    CalloopData, RubixState,
+    RubixState,
 };
 
 impl XWaylandShellHandler for RubixState {
@@ -208,82 +207,24 @@ impl XwmHandler for RubixState {
     }
 }
 
-// NOTE: there is no `delegate_xwm!` macro in smithay 0.7.0 -- `XwmHandler` is
-// consumed directly by calloop's X11 event source (`handle_event` in
-// smithay::xwayland::xwm), not through a wayland-server `Dispatch` impl. It's
-// still required on `RubixState` because `Dispatch<XwaylandShellV1, ..>` (see
-// `delegate_xwayland_shell!` below) bounds its `D` on `XwmHandler +
-// XWaylandShellHandler`, and `D` there is `RubixState` (the `Display`'s state
-// type).
-delegate_xwayland_shell!(RubixState);
-
-// `X11Wm::start_wm`'s `D: XwmHandler + XWaylandShellHandler` is the calloop
-// event-loop Data type, which in this project is `CalloopData` (wrapping
-// `RubixState`), not `RubixState` directly. These two thin impls forward
-// every call into the real logic on `RubixState` above.
-impl XwmHandler for CalloopData {
-    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
-        self.state.xwm_state(xwm)
-    }
-
-    fn new_window(&mut self, xwm: XwmId, window: X11Surface) {
-        self.state.new_window(xwm, window)
-    }
-
-    fn new_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
-        self.state.new_override_redirect_window(xwm, window)
-    }
-
-    fn map_window_request(&mut self, xwm: XwmId, window: X11Surface) {
-        self.state.map_window_request(xwm, window)
-    }
-
-    fn mapped_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
-        self.state.mapped_override_redirect_window(xwm, window)
-    }
-
-    fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) {
-        self.state.unmapped_window(xwm, window)
-    }
-
-    fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) {
-        self.state.destroyed_window(xwm, window)
-    }
-
-    fn configure_request(
-        &mut self,
-        xwm: XwmId,
-        window: X11Surface,
-        x: Option<i32>,
-        y: Option<i32>,
-        w: Option<u32>,
-        h: Option<u32>,
-        reorder: Option<Reorder>,
-    ) {
-        self.state.configure_request(xwm, window, x, y, w, h, reorder)
-    }
-
-    fn configure_notify(
-        &mut self,
-        xwm: XwmId,
-        window: X11Surface,
-        geometry: Rectangle<i32, Logical>,
-        above: Option<u32>,
-    ) {
-        self.state.configure_notify(xwm, window, geometry, above)
-    }
-
-    fn resize_request(&mut self, xwm: XwmId, window: X11Surface, button: u32, resize_edge: ResizeEdge) {
-        self.state.resize_request(xwm, window, button, resize_edge)
-    }
-
-    fn move_request(&mut self, xwm: XwmId, window: X11Surface, button: u32) {
-        self.state.move_request(xwm, window, button)
-    }
-}
-
-impl XWaylandShellHandler for CalloopData {
-    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
-        self.state.xwayland_shell_state()
-    }
-}
+// NOTE: there is no `delegate_xwm!` macro -- `XwmHandler` is consumed directly
+// by calloop's X11 event source (`handle_event` in smithay::xwayland::xwm),
+// not through a wayland-server `Dispatch` impl. It's still required on
+// `RubixState` because the fork's unified `delegate_dispatch2!(RubixState)`
+// (handlers/mod.rs) generates `Dispatch<XwaylandShellV1, ..>` for any state
+// implementing `XWaylandShellHandler`, and the surface bind path additionally
+// needs `XwmHandler` bound, with `D` there being `RubixState` (the `Display`'s
+// state type).
+//
+// `RubixState` is now the calloop event-loop `Data` type directly (the
+// `CalloopData` wrapper was removed), so the impls above already satisfy
+// `X11Wm::start_wm`'s `D: XwmHandler + XWaylandShellHandler` bound with no
+// forwarding shim needed.
+//
+// The fork's `X11Wm::start_wm` additionally requires `D: SeatHandler +
+// DndGrabHandler` (plus `DndFocus<D>` on the pointer/touch focus types, which
+// is blanket-implemented for `WlSurface` given `SeatHandler + DataDeviceHandler`
+// -- both already implemented for `RubixState` in `handlers/mod.rs`).
+// `DndGrabHandler`'s `dropped`/`cancelled` hooks default to no-ops; Rubix owns
+// layout/focus itself and doesn't need custom XWayland drag'n'drop behavior.
+impl smithay::input::dnd::DndGrabHandler for RubixState {}

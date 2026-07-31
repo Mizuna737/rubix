@@ -11,16 +11,16 @@ use crate::RubixState;
 // Wl Seat
 //
 
+use smithay::delegate_dispatch2;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
-    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
 use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
 use smithay::wayland::selection::SelectionHandler;
-use smithay::{delegate_data_control, delegate_data_device, delegate_output, delegate_seat};
 
 impl SeatHandler for RubixState {
     type KeyboardFocus = KeyboardFocusTarget;
@@ -44,8 +44,6 @@ impl SeatHandler for RubixState {
     }
 }
 
-delegate_seat!(RubixState);
-
 //
 // Wl Data Device
 //
@@ -55,27 +53,28 @@ impl SelectionHandler for RubixState {
 }
 
 impl DataDeviceHandler for RubixState {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
     }
 }
 
-impl ClientDndGrabHandler for RubixState {}
-impl ServerDndGrabHandler for RubixState {}
-
-delegate_data_device!(RubixState);
+impl WaylandDndGrabHandler for RubixState {}
 
 impl DataControlHandler for RubixState {
-    fn data_control_state(&self) -> &DataControlState {
-        &self.data_control_state
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control_state
     }
 }
-
-delegate_data_control!(RubixState);
 
 //
 // Wl Output & Xdg Output
 //
 
 impl OutputHandler for RubixState {}
-delegate_output!(RubixState);
+
+// Every per-protocol `delegate_*!` macro (seat, data device, data control,
+// output, compositor, shm, dmabuf, layer shell, xdg shell, xwayland shell)
+// was removed by the HDR fork's `Dispatch2`/`GlobalDispatch2` rework in favor
+// of one blanket `Dispatch`/`GlobalDispatch` impl per state type. This single
+// call is the fork's replacement for all of them.
+delegate_dispatch2!(RubixState);

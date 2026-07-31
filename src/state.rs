@@ -42,7 +42,6 @@ use crate::{
         geometry::Rect,
         grid::Workspace,
     },
-    CalloopData,
 };
 
 // Stashed in an Output's user-data map at bind time (`bind_output_monitor`) so
@@ -179,7 +178,7 @@ pub struct RubixState {
 }
 
 impl RubixState {
-    pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>, config: Config) -> Self {
+    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>, config: Config) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
@@ -298,7 +297,7 @@ impl RubixState {
 
     fn init_wayland_listener(
         display: Display<RubixState>,
-        event_loop: &mut EventLoop<CalloopData>,
+        event_loop: &mut EventLoop<RubixState>,
     ) -> OsString {
         // Creates a new listening socket, automatically choosing the next available `wayland` socket name.
         let listening_socket = ListeningSocketSource::new_auto().unwrap();
@@ -328,7 +327,7 @@ impl RubixState {
                 |_, display, state| {
                     // Safety: we don't drop the display
                     unsafe {
-                        display.get_mut().dispatch_clients(&mut state.state).unwrap();
+                        display.get_mut().dispatch_clients(state).unwrap();
                     }
                     Ok(PostAction::Continue)
                 },

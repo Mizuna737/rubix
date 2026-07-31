@@ -20,8 +20,8 @@
 //!
 //! Instead the backend state lives behind an `Rc<RefCell<UdevData>>`. Each source
 //! closure captures its own clone; the clones keep the allocation alive for the
-//! loop's lifetime. Every callback still receives `&mut CalloopData` for
-//! `data.state` (space/seat) *plus* its own `udev.borrow_mut()` -- disjoint
+//! loop's lifetime. Every callback still receives `&mut RubixState` directly
+//! (space/seat) *plus* its own `udev.borrow_mut()` -- disjoint
 //! allocations, safe to hold at once. This is panic-free only because calloop
 //! dispatches sources non-reentrantly and Rubix never renders synchronously from
 //! input (render lives solely on the VBlank/Timer path), so two `udev` borrows
@@ -80,7 +80,7 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
 use crate::state::Pos;
-use crate::{CalloopData, RubixState};
+use crate::RubixState;
 
 // The four `DrmOutputManager`/`DrmOutput` generics never vary in this backend:
 //   A = GbmAllocator<DrmDeviceFd>          (scanout buffer allocator)
@@ -131,7 +131,7 @@ pub(crate) struct UdevData {
     backends: HashMap<DrmNode, BackendData>,
     /// Loop handle for inserting per-device VBlank sources and frame timers from
     /// inside the udev/device callbacks.
-    loop_handle: LoopHandle<'static, CalloopData>,
+    loop_handle: LoopHandle<'static, RubixState>,
     /// Whether we currently own the VT. Set false on `PauseSession` (VT switched
     /// away): the DRM device is paused, so rendering would only produce rejected
     /// page-flips. `render` bails while inactive and stops rescheduling; the
@@ -170,8 +170,8 @@ struct SurfaceData {
 /// Entry point for the TTY/DRM backend. Mirrors `winit::init_winit`'s signature
 /// so `main` can dispatch to either behind [`crate::Backend`].
 pub fn init_udev(
-    event_loop: &mut smithay::reexports::calloop::EventLoop<'static, CalloopData>,
-    data: &mut CalloopData,
+    event_loop: &mut smithay::reexports::calloop::EventLoop<'static, RubixState>,
+    data: &mut RubixState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ---- session ----
     let (session, notifier) = LibSeatSession::new()?;
@@ -211,7 +211,7 @@ pub fn init_udev(
 
     // Give `RubixState` a handle back into the renderer, so `DmabufHandler::dmabuf_imported`
     // (which fires on `RubixState`, not `UdevData`) can validate imported buffers.
-    data.state.udev_handle = Some(udev.clone());
+    data.udev_handle = Some(udev.clone());
 
     // ---- udev device monitor ----
     let udev_backend = UdevBackend::new(&seat_name)?;
@@ -270,12 +270,12 @@ pub fn init_udev(
             if let InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. } = &event {
                 return;
             }
-            data.state.process_input_event(event);
+            data.process_input_event(event);
             // A VT-switch chord sets `pending_vt` inside `process_input_event`
             // (it has the xkb state); only the backend owns the session, so we
             // perform the actual switch here. Without this the compositor holds
             // DRM master forever and Ctrl+Alt+Fn is swallowed -- trapping the TTY.
-            if let Some(vt) = data.state.pending_vt.take() {
+            if let Some(vt) = data.pending_vt.take() {
                 tracing::info!("switching to VT {vt}");
                 if let Err(e) = udev_for_input.borrow_mut().session.change_vt(vt) {
                     tracing::error!("failed to switch to VT {vt}: {e}");
@@ -309,7 +309,7 @@ pub fn init_udev(
                         let mut guard = udev.borrow_mut();
                         guard.active = true;
                         for backend in guard.backends.values_mut() {
-                            if let Err(e) = backend.drm_output_manager.activate(false) {
+                            if let Err(e) = backend.drm_output_manager.lock().activate(false) {
                                 tracing::error!("failed to reactivate DRM: {e}");
                             }
                         }
@@ -336,7 +336,7 @@ pub fn init_udev(
     // otherwise inherit `tty` from the TTY launch and land on XWayland.
     // SAFETY: set once at startup before any client threads exist (see winit).
     unsafe {
-        std::env::set_var("WAYLAND_DISPLAY", &data.state.socket_name);
+        std::env::set_var("WAYLAND_DISPLAY", &data.socket_name);
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
     }
 
@@ -349,7 +349,7 @@ pub fn init_udev(
 /// source, then scan its connectors.
 fn device_added(
     udev: &Rc<RefCell<UdevData>>,
-    data: &mut CalloopData,
+    data: &mut RubixState,
     node: DrmNode,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -389,7 +389,7 @@ fn device_added(
     // formats, so GPU-accelerated Wayland clients can hand us dmabuf buffers
     // instead of falling back to SHM. Only the primary node's formats are
     // published; secondary GPUs (if any) aren't wired into the dmabuf path yet.
-    if data.state.dmabuf_global.is_none() && render_node == udev_data.primary_gpu {
+    if data.dmabuf_global.is_none() && render_node == udev_data.primary_gpu {
         // Advertise dmabuf v4 with *default feedback* naming the primary render
         // node as the main device. XWayland (and other feedback-aware clients)
         // read this to discover the GPU and enable glamor/DRI3 -- without it,
@@ -401,10 +401,9 @@ fn device_added(
             .build()
             .expect("failed to build dmabuf default feedback");
         let global = data
-            .state
             .dmabuf_state
             .create_global_with_default_feedback::<RubixState>(&data.display_handle, &feedback);
-        data.state.dmabuf_global = Some(global);
+        data.dmabuf_global = Some(global);
         tracing::info!(
             "advertised zwp_linux_dmabuf_v1 with default feedback ({} formats, main device {})",
             render_formats.iter().count(),
@@ -459,7 +458,7 @@ fn device_added(
 }
 
 /// Re-scan a device's connectors, creating/tearing down outputs to match.
-fn device_changed(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode) {
+fn device_changed(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode) {
     let scan = {
         let mut guard = udev.borrow_mut();
         let Some(backend) = guard.backends.get_mut(&node) else {
@@ -493,7 +492,7 @@ fn device_changed(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: Dr
 
 /// A DRM device went away: tear down its outputs, drop it from the renderer, and
 /// remove its VBlank source.
-fn device_removed(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode) {
+fn device_removed(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode) {
     let crtcs: Vec<crtc::Handle> = {
         let guard = udev.borrow();
         match guard.backends.get(&node) {
@@ -519,7 +518,7 @@ fn device_removed(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: Dr
 /// first render.
 fn connector_connected(
     udev: &Rc<RefCell<UdevData>>,
-    data: &mut CalloopData,
+    data: &mut RubixState,
     node: DrmNode,
     connector: connector::Info,
     crtc: crtc::Handle,
@@ -541,7 +540,6 @@ fn connector_connected(
     // connector, prefer the DRM mode matching those dimensions when one exists;
     // otherwise fall through to the same preferred/first selection.
     let output_config = data
-        .state
         .config
         .outputs
         .iter()
@@ -571,10 +569,9 @@ fn connector_connected(
         Some(o) => o.position,
         None => {
             let x: i32 = data
-                .state
                 .space
                 .outputs()
-                .map(|o| data.state.space.output_geometry(o).map_or(0, |geo| geo.size.w))
+                .map(|o| data.space.output_geometry(o).map_or(0, |geo| geo.size.w))
                 .sum();
             (x, 0)
         }
@@ -588,14 +585,18 @@ fn connector_connected(
             subpixel: Subpixel::Unknown,
             make: "Rubix".into(),
             model: "DRM".into(),
+            // `display-info` (EDID name/serial parsing) is disabled -- see the
+            // `default-features = false` comment on `smithay-drm-extras` in
+            // Cargo.toml -- so there's no EDID serial to read here.
+            serial_number: "Unknown".into(),
         },
     );
     let global = output.create_global::<RubixState>(&data.display_handle);
     output.set_preferred(wl_mode);
     let transform = output_config.map(|o| o.transform).unwrap_or(Transform::Normal);
     output.change_current_state(Some(wl_mode), Some(transform), None, Some(position.into()));
-    data.state.space.map_output(&output, position);
-    data.state.bind_output_monitor(&output);
+    data.space.map_output(&output, position);
+    data.bind_output_monitor(&output);
 
     // NVIDIA breaks with overlay planes assigned -- clear them before init.
     let mut planes = backend
@@ -618,7 +619,7 @@ fn connector_connected(
         .single_renderer(&backend.render_node)
         .expect("failed to get renderer for output init");
 
-    let drm_output = match backend.drm_output_manager.initialize_output::<
+    let drm_output = match backend.drm_output_manager.lock().initialize_output::<
         _,
         SpaceRenderElements<RubixRenderer<'_>, <Window as smithay::backend::renderer::element::AsRenderElements<RubixRenderer<'_>>>::RenderElement>,
     >(
@@ -665,7 +666,7 @@ fn connector_connected(
 
     drop(guard);
     // First frame on the next loop turn (also does the initial tiling pass).
-    data.state.apply_layout();
+    data.apply_layout();
     schedule_render(udev, node, crtc, Duration::ZERO);
 }
 
@@ -746,7 +747,7 @@ fn set_hdr_output_properties(device: &impl ControlDevice, connector: connector::
 /// A connector on a CRTC went away: unmap and drop its output.
 fn connector_disconnected(
     udev: &Rc<RefCell<UdevData>>,
-    data: &mut CalloopData,
+    data: &mut RubixState,
     node: DrmNode,
     crtc: crtc::Handle,
 ) {
@@ -758,7 +759,7 @@ fn connector_disconnected(
         return;
     };
 
-    data.state.space.unmap_output(&surface.output);
+    data.space.unmap_output(&surface.output);
     if let Some(global) = surface.global {
         data.display_handle.remove_global::<RubixState>(global);
     }
@@ -768,7 +769,7 @@ fn connector_disconnected(
 /// Render one surface's frame: build render elements from the space, scan them
 /// out through the `DrmOutput`, and either queue the flip (on damage) or arm a
 /// retry timer (idle). Frame callbacks fire to keep clients animating.
-fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, crtc: crtc::Handle) {
+fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, crtc: crtc::Handle) {
     let mut guard = udev.borrow_mut();
     let udev_data = &mut *guard;
 
@@ -801,15 +802,15 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, c
         return;
     };
 
-    let animating = data.state.step_animations();
+    let animating = data.step_animations();
 
-    let result = render_surface(surface, &mut renderer, &mut data.state);
+    let result = render_surface(surface, &mut renderer, data);
 
     // Service any screencopy captures against the frame we just rendered, using
     // this surface's live renderer (re-renders into its own offscreen buffer).
-    if !data.state.pending_screencopy.is_empty() {
+    if !data.pending_screencopy.is_empty() {
         let sc_output = surface.output.clone();
-        crate::screencopy::fulfill_pending(&mut data.state, &mut renderer, &sc_output);
+        crate::screencopy::fulfill_pending(data, &mut renderer, &sc_output);
     }
 
     let reschedule = match result {
@@ -831,9 +832,9 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut CalloopData, node: DrmNode, c
 
     let frame_duration = surface.frame_duration;
     // Send frame callbacks so clients keep producing content.
-    let start = data.state.start_time;
+    let start = data.start_time;
     let output = surface.output.clone();
-    data.state.space.elements().for_each(|window| {
+    data.space.elements().for_each(|window| {
         window.send_frame(&output, start.elapsed(), Some(Duration::ZERO), |_, _| {
             Some(output.clone())
         })
@@ -1018,8 +1019,8 @@ pub(crate) fn nudge_all_renders(udev: &Rc<RefCell<UdevData>>) {
 
 /// Arm a one-shot timer that renders `(node, crtc)` after `delay`. All render
 /// entry points funnel through here so the borrow discipline stays in one place.
-/// The timer closure captures its own `udev` clone and reaches `data.state`
-/// through the loop's shared `CalloopData`, exactly like every other source.
+/// The timer closure captures its own `udev` clone and reaches `&mut RubixState`
+/// directly through the loop's shared calloop data, exactly like every other source.
 fn schedule_render(udev: &Rc<RefCell<UdevData>>, node: DrmNode, crtc: crtc::Handle, delay: Duration) {
     let loop_handle = udev.borrow().loop_handle.clone();
     let udev = udev.clone();

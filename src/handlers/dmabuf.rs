@@ -1,6 +1,5 @@
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
-use smithay::delegate_dmabuf;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 
 use crate::RubixState;
@@ -35,4 +34,5 @@ impl DmabufHandler for RubixState {
     }
 }
 
-delegate_dmabuf!(RubixState);
+// See handlers/mod.rs for the single `delegate_dispatch2!(RubixState)` call
+// that now covers this (and every other) protocol.

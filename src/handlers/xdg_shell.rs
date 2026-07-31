@@ -1,5 +1,4 @@
 use smithay::{
-    delegate_xdg_shell,
     desktop::{find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window},
     input::{
         pointer::{Focus, GrabStartData as PointerGrabStartData},
@@ -192,8 +191,8 @@ impl XdgShellHandler for RubixState {
     }
 }
 
-// Xdg Shell
-delegate_xdg_shell!(RubixState);
+// Xdg Shell: see handlers/mod.rs for the single `delegate_dispatch2!(RubixState)`
+// call that now covers this (and every other) protocol.
 
 fn check_grab(
     seat: &Seat<RubixState>,
