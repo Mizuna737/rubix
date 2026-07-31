@@ -45,7 +45,7 @@ use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
 use smithay::backend::drm::compositor::FrameFlags;
 use smithay::backend::drm::{
-    DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
+    Colorspace, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
 };
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::egl::context::ContextPriority;
@@ -69,7 +69,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
-use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
+use smithay::reexports::drm::control::{connector, crtc, ModeTypeFlags};
 use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
@@ -648,10 +648,9 @@ fn connector_connected(
     };
 
     // HDR groundwork: gated per-output, default off. Only reached when the
-    // config explicitly opts this connector in. See `set_hdr_output_properties`
-    // for why this is currently a documented no-op rather than a live commit.
+    // config explicitly opts this connector in.
     if output_hdr {
-        set_hdr_output_properties(backend.drm_output_manager.device(), connector.handle());
+        set_hdr_output_properties(&drm_output);
     }
 
     backend.surfaces.insert(
@@ -703,45 +702,83 @@ fn connector_connected(
 /// smithay#tracking-hdr upstream, or a version bump) -- or when this project
 /// decides a raw parallel (non-atomic) property poke is an acceptable risk.
 ///
-/// This function is intentionally a no-op beyond logging: it looks up the two
-/// property handles (to confirm they exist on this connector, matching the
-/// hardware verification this phase relies on) and returns without touching
-/// them, so the `hdr == true` path never diverges from `hdr == false` at
-/// runtime yet. Tier 2's blob builder (`crate::hdr::build_hdr_metadata_blob`)
-/// is ready to feed either integration path above once one exists.
-fn set_hdr_output_properties(device: &impl ControlDevice, connector: connector::Handle) {
-    let Ok(props) = device.get_properties(connector) else {
-        tracing::warn!("HDR: failed to query properties for {connector:?}; leaving HDR unset");
-        return;
-    };
+/// Probes the connector's colorspace/HDR-metadata/max-bpc support through the
+/// `DrmCompositor` (the only path that can fold these properties into its
+/// atomic commit -- see `RubixDrmOutput::with_compositor`) and, if supported,
+/// stages `crate::hdr::default_hdr_color_state()` for the next commit via
+/// `use_color_state`. Never panics: any missing support or fork-call error is
+/// logged and the output is left on its current (SDR) color state.
+fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
+    drm_output.with_compositor(|comp| {
+        let Some(conn) = comp.current_connectors().into_iter().next() else {
+            tracing::warn!("HDR: output has no connectors attached; leaving HDR unset");
+            return;
+        };
 
-    let mut found_colorspace = false;
-    let mut found_hdr_metadata = false;
-    for (handle, _value) in props {
-        let Ok(info) = device.get_property(handle) else { continue };
-        match info.name().to_str() {
-            Ok("Colorspace") => found_colorspace = true,
-            Ok("HDR_OUTPUT_METADATA") => found_hdr_metadata = true,
-            _ => {}
+        let colorspaces = match comp.supported_colorspaces(conn) {
+            Ok(cs) => cs,
+            Err(e) => {
+                tracing::warn!("HDR: failed to query supported colorspaces for {conn:?}: {e}");
+                return;
+            }
+        };
+        if !colorspaces.contains(&Colorspace::Bt2020Rgb) {
+            tracing::warn!(
+                "HDR requested for {conn:?} but BT.2020 RGB colorspace is unsupported \
+                 (supported: {colorspaces:?}); leaving output SDR"
+            );
+            return;
         }
-    }
 
-    if found_colorspace && found_hdr_metadata {
-        // Blob built and ready to hand to a real integration the moment one
-        // exists (see doc comment above); not applied anywhere yet.
-        let _blob = crate::hdr::build_hdr_metadata_blob(crate::hdr::HdrMetadata::default());
-        tracing::info!(
-            "HDR requested for {connector:?}: Colorspace/HDR_OUTPUT_METADATA properties present, \
-             but not yet applied -- blocked on Smithay 0.7 atomic-commit integration (see \
-             set_hdr_output_properties doc comment). Output stays SDR."
-        );
-    } else {
-        tracing::warn!(
-            "HDR requested for {connector:?} but this connector is missing \
-             Colorspace/HDR_OUTPUT_METADATA (found_colorspace={found_colorspace}, \
-             found_hdr_metadata={found_hdr_metadata}); nothing to apply regardless"
-        );
-    }
+        match comp.hdr_metadata_supported(conn) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "HDR requested for {conn:?} but HDR_OUTPUT_METADATA is unsupported; \
+                     leaving output SDR"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("HDR: failed to query HDR metadata support for {conn:?}: {e}");
+                return;
+            }
+        }
+
+        let mut desired = crate::hdr::default_hdr_color_state();
+        match comp.max_bpc_range(conn) {
+            Ok(Some(range)) => {
+                if let Some(max_bpc) = desired.max_bpc {
+                    if max_bpc > *range.end() {
+                        tracing::info!(
+                            "HDR: clamping max_bpc {max_bpc} to connector {conn:?} range end {}",
+                            range.end()
+                        );
+                        desired.max_bpc = Some(*range.end());
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "HDR: {conn:?} exposes no max bpc range; proceeding without a bpc request"
+                );
+                desired.max_bpc = None;
+            }
+            Err(e) => {
+                tracing::warn!("HDR: failed to query max bpc range for {conn:?}: {e}");
+                return;
+            }
+        }
+
+        if comp.pending_color_state() != desired {
+            match comp.use_color_state(desired) {
+                Ok(()) => tracing::info!("HDR: staged BT.2020/HDR color state for {conn:?}"),
+                Err(e) => tracing::warn!(
+                    "HDR: failed to stage color state for {conn:?}: {e}; leaving output SDR"
+                ),
+            }
+        }
+    });
 }
 
 /// A connector on a CRTC went away: unmap and drop its output.
