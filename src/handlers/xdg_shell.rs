@@ -87,7 +87,12 @@ impl XdgShellHandler for RubixState {
             .map(|(id, _)| *id);
 
         if let Some(id) = destroyed_id {
-            self.monitor.remove_window(id);
+            // A destroyed window may be on any monitor, not just the active
+            // one -- remove_window is id-based and a no-op when absent, so
+            // sweeping all monitors is safe.
+            for monitor in &mut self.workspace.monitors {
+                monitor.remove_window(id);
+            }
             self.windows.remove(&id);
             self.apply_layout();
             self.ipc_dirty = true;
@@ -300,26 +305,40 @@ impl RubixState {
         focused_id
     }
 
+    // NOTE: focused-window ops route through the ACTIVE monitor -- this
+    // assumes the keyboard-focused window is on the active monitor, which
+    // holds true after nav (nav mutates + refocuses the active monitor).
+    // Click-to-focus on another head not yet syncing active_monitor is a
+    // known follow-up, not addressed here.
     pub fn move_focused_window_to_new_column(&mut self) {
         let Some(id) = self.focused_window_id() else { return };
-        self.monitor.move_window_to_new_column(id);
+        if let Some(monitor) = self.workspace.active_monitor_mut() {
+            monitor.move_window_to_new_column(id);
+        }
         self.apply_layout();
     }
 
     pub fn flip_focused_parent_split_direction(&mut self) {
         let Some(id) = self.focused_window_id() else { return };
-        self.monitor.flip_split_direction(id);
+        if let Some(monitor) = self.workspace.active_monitor_mut() {
+            monitor.flip_split_direction(id);
+        }
         self.apply_layout();
     }
 
     pub fn move_focused_window_by_direction(&mut self,direction: Direction) {
         let Some(focused_id) = self.focused_window_id() else { return };
-        let Some((c,g)) = self.monitor.find_group_by_direction(focused_id, direction) else { return };
-        let split_direction = self.monitor.find_first_leaf_id(c,g)
+        // Read phase: two shared borrows of self (via active_monitor()) are
+        // fine together, including the nested self.window_rect() call -- only
+        // the write below needs the mutable borrow, taken separately.
+        let Some(monitor) = self.workspace.active_monitor() else { return };
+        let Some((c,g)) = monitor.find_group_by_direction(focused_id, direction) else { return };
+        let split_direction = monitor.find_first_leaf_id(c,g)
             .and_then(|target_id| self.window_rect(target_id))
             .map(Rect::longer_axis)
             .unwrap_or(SplitDirection::Horizontal);
-        self.monitor.move_window_to_group(focused_id, c, g, split_direction);
+        let Some(monitor) = self.workspace.active_monitor_mut() else { return };
+        monitor.move_window_to_group(focused_id, c, g, split_direction);
         self.apply_layout();
     }
 }

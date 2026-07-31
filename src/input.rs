@@ -298,14 +298,32 @@ impl RubixState {
         );
 
         match action {
-            NavAction::RotateColumnsLeft => { self.pending_transition = Some(Transition::Rotate); self.monitor.rotate_columns(-1); },
-            NavAction::RotateColumnsRight => { self.pending_transition = Some(Transition::Rotate); self.monitor.rotate_columns(1); },
-            NavAction::ScrollColumnUp => { self.pending_transition = Some(Transition::Scroll { down: false }); self.monitor.scroll_active_column(-1); },
-            NavAction::ScrollColumnDown => { self.pending_transition = Some(Transition::Scroll { down: true }); self.monitor.scroll_active_column(1); },
+            NavAction::RotateColumnsLeft => {
+                self.pending_transition = Some(Transition::Rotate);
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.rotate_columns(-1); }
+            },
+            NavAction::RotateColumnsRight => {
+                self.pending_transition = Some(Transition::Rotate);
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.rotate_columns(1); }
+            },
+            NavAction::ScrollColumnUp => {
+                self.pending_transition = Some(Transition::Scroll { down: false });
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.scroll_active_column(-1); }
+            },
+            NavAction::ScrollColumnDown => {
+                self.pending_transition = Some(Transition::Scroll { down: true });
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.scroll_active_column(1); }
+            },
             NavAction::MoveToNewColumn => { self.move_focused_window_to_new_column() },
-            NavAction::MoveActiveColumnLeft => self.monitor.move_active_column(-1),
-            NavAction::MoveActiveColumnRight => self.monitor.move_active_column(1),
-            NavAction::NewGroup => self.monitor.grow_active_column(),
+            NavAction::MoveActiveColumnLeft => {
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.move_active_column(-1); }
+            },
+            NavAction::MoveActiveColumnRight => {
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.move_active_column(1); }
+            },
+            NavAction::NewGroup => {
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.grow_active_column(); }
+            },
             NavAction::Spawn(command) => {
                 // Set DISPLAY explicitly from the live XWayland display number so
                 // spawned X11 clients find the server regardless of when XWayland
@@ -323,8 +341,12 @@ impl RubixState {
                 tracing::info!("quit requested; stopping event loop");
                 self.loop_signal.stop();
             },
-            NavAction::IncrementVisibleColumns => self.monitor.increment_visible_columns(1),
-            NavAction::DecrementVisibleColumns => self.monitor.increment_visible_columns(-1),
+            NavAction::IncrementVisibleColumns => {
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.increment_visible_columns(1); }
+            },
+            NavAction::DecrementVisibleColumns => {
+                if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.increment_visible_columns(-1); }
+            },
             NavAction::FlipSplitDirection => self.flip_focused_parent_split_direction(),
             NavAction::MoveFocusedWindowUp => self.move_focused_window_by_direction(Direction::Up),
             NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),
@@ -367,7 +389,7 @@ impl RubixState {
     /// focus; nav chords still work because the input filter intercepts them
     /// regardless of who holds focus.
     pub(crate) fn focus_active_window(&mut self) {
-        match self.monitor.active_window() {
+        match self.workspace.active_monitor().and_then(|m| m.active_window()) {
             Some(id) => self.focus_by_id(id),
             None => {
                 let serial = SERIAL_COUNTER.next_serial();

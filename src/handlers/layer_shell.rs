@@ -94,7 +94,9 @@ impl WlrLayerShellHandler for RubixState {
         }
         // A bar went away; reflow tiled windows back into the reclaimed area.
         if arranged {
-            let bounds = self.output_bounds();
+            // See compositor.rs handle_commit: reserved_bounds tracks only the
+            // active monitor for now (multi-monitor bar-reflow is a follow-up).
+            let bounds = self.workspace.active_monitor().and_then(|m| self.output_bounds_for(m.id));
             if bounds != self.reserved_bounds {
                 self.reserved_bounds = bounds;
                 self.apply_layout();

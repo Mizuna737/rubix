@@ -126,7 +126,7 @@ impl CountWindows for Column {
     }
 }
 pub struct Monitor {
-    id: u32,
+    pub id: u32,
     visible_columns: usize,
     active_column: usize,
     columns: Vec<Column>
@@ -134,12 +134,18 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn new(id: u32, visible_columns: usize) -> Self {
-        Monitor {
+        let mut monitor = Monitor {
             id,
             visible_columns,
             active_column: 0,
             columns: Vec::new(),
+        };
+        for _ in 0..visible_columns {
+            let mut column = Column::new(0);
+            column.add_group(Group { layout: None });
+            monitor.columns.push(column);
         }
+        monitor
     }
 
     pub fn increment_visible_columns(&mut self, change: isize) {
@@ -342,6 +348,50 @@ impl Monitor {
             }
         }
         monitor_vec
+    }
+}
+
+pub struct Workspace {
+    pub(crate) monitors: Vec<Monitor>,
+    pub active_monitor: u32,
+}
+
+impl Workspace {
+    pub fn new() -> Workspace {
+        Workspace { monitors: Vec::new(), active_monitor: 0 }
+    }
+    pub fn active_monitor_mut(&mut self) -> Option<&mut Monitor> {
+        if self.monitors.len() == 0 {
+            return None;
+        }
+        for monitor in self.monitors.iter_mut() {
+            if self.active_monitor == monitor.id {
+                return Some(monitor);
+            }
+        }
+        None
+    }
+    pub fn active_monitor(&self) -> Option<&Monitor> {
+        if self.monitors.len() == 0 {
+            return None;
+        }
+        for monitor in self.monitors.iter() {
+            if self.active_monitor == monitor.id {
+                return Some(monitor);
+            }
+        }
+        None
+    }
+    pub fn set_active_monitor(&mut self, id: u32) {
+        self.active_monitor = id;
+    }
+    pub fn ensure_monitor(&mut self, id: u32, visible_columns: usize) -> &Monitor {
+        if let Some(idx) = self.monitors.iter().position(|m| m.id == id) {
+            &mut self.monitors[idx]
+        } else {
+            self.monitors.push(Monitor::new(id, visible_columns));
+            self.monitors.last_mut().unwrap()
+        }
     }
 }
 

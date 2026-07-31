@@ -38,8 +38,13 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
         .map(|(id, _)| *id);
 
     if let Some(id) = id {
-        // No-op if this id was never added to the tiling model (OR windows).
-        state.monitor.remove_window(id);
+        // No-op if this id was never added to the tiling model (OR windows). A
+        // destroyed window may be on any monitor, not just the active one --
+        // remove_window is id-based and a no-op when absent, so sweeping all
+        // monitors is safe.
+        for monitor in &mut state.workspace.monitors {
+            monitor.remove_window(id);
+        }
         if let Some(win) = state.windows.remove(&id) {
             state.space.unmap_elem(&win);
         }
@@ -73,7 +78,9 @@ impl XwmHandler for RubixState {
             .and_then(|fid| self.window_rect(fid))
             .map(Rect::longer_axis)
             .unwrap_or(SplitDirection::Horizontal);
-        self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
+        if let Some(monitor) = self.workspace.active_monitor_mut() {
+            monitor.add_window(direction, id, focused_id.unwrap_or(0));
+        }
         self.apply_layout();
         // Focus follows spawn (mirrors xdg_shell::new_toplevel): name the new id
         // directly, since the focus-agnostic model won't surface it via re-derive.
@@ -89,7 +96,7 @@ impl XwmHandler for RubixState {
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
         // OR windows own their own geometry -- no tiling, no configure. Insert
         // into `self.windows` (so it renders + is destroyable) but do NOT add
-        // to `self.monitor`.
+        // to any monitor in `self.workspace`.
         let loc = window.geometry().loc;
         let id = self.next_window_id();
         let win = Window::new_x11_window(window);

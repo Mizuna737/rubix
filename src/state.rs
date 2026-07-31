@@ -40,10 +40,16 @@ use crate::{
     config::Config,
     model::{
         geometry::Rect,
-        grid::{Column, Group, Monitor},
+        grid::Workspace,
     },
     CalloopData,
 };
+
+// Stashed in an Output's user-data map at bind time (`bind_output_monitor`) so
+// any code holding an `Output` can recover which model `Monitor` it drives,
+// without a name-based lookup back through config.
+#[derive(Clone, Copy)]
+pub(crate) struct MonitorId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Pos {
@@ -98,10 +104,11 @@ pub struct RubixState {
     pub config: Config,
 
     // Rubix model + translation registry.
-    // `monitor` is the pure tiling model (fixed column slots); `windows` maps its
-    // synthetic u32 ids to live Smithay handles; `next_id` mints those ids (starts
-    // at 1 -- 0 is TilingNode::remove_window's transient placeholder, never real).
-    pub monitor: Monitor,
+    // `workspace` is the pure tiling model, one Monitor per bound output;
+    // `windows` maps its synthetic u32 ids to live Smithay handles; `next_id`
+    // mints those ids (starts at 1 -- 0 is TilingNode::remove_window's
+    // transient placeholder, never real).
+    pub workspace: Workspace,
     pub windows: HashMap<u32, Window>,
     pub next_id: u32,
 
@@ -230,19 +237,10 @@ impl RubixState {
             })
             .unwrap_or_else(|| (0.0, 0.0).into());
 
-        // Seed the monitor with exactly visible_columns column slots so the
-        // active-column cursor (rem_euclid(visible_columns)) always indexes a real
-        // column. Columns are fixed slots -- never removed below this floor. Each
-        // slot carries one empty-layout placeholder group so `groups[active_row]`
-        // is always valid (rotate_columns swaps it; the layout walk renders a
-        // `layout: None` group as a blank band). The 0 width is a placeholder; the
-        // walk derives band width from output geometry.
-        let mut monitor = Monitor::new(0, config.visible_columns);
-        for _ in 0..config.visible_columns {
-            let mut column = Column::new(0);
-            column.add_group(Group { layout: None });
-            monitor.add_column(column);
-        }
+        // Monitors are created lazily, one per bound output, in
+        // `bind_output_monitor` once each backend's output-connect path maps
+        // an Output into `space` (see udev.rs/winit.rs). Empty at construction.
+        let workspace = Workspace::new();
 
         Self {
             start_time,
@@ -255,7 +253,7 @@ impl RubixState {
 
             config,
 
-            monitor,
+            workspace,
             windows: HashMap::new(),
             next_id: 1,
             unmapped: HashMap::new(),
@@ -414,6 +412,38 @@ impl RubixState {
         None
     }
 
+    /// Bind a freshly-mapped Output to a model Monitor: idempotently create/get
+    /// the Monitor whose id matches the output's `[[output]]` config entry (by
+    /// name), stash that id in the Output's user-data so later lookups
+    /// (`output_bounds_for`, remove-on-disconnect) can go the other way, and
+    /// make it the active monitor if none is active yet (first head connected
+    /// wins). Unconfigured outputs (e.g. winit's nested "winit" name, or a
+    /// hotplugged head with no matching entry) get an id appended above the
+    /// configured range rather than colliding with a configured id.
+    pub(crate) fn bind_output_monitor(&mut self, output: &Output) {
+        let name = output.name();
+        let id = self
+            .config
+            .outputs
+            .iter()
+            .position(|o| o.name == name)
+            .map(|i| i as u32)
+            .unwrap_or_else(|| {
+                let base = self.config.outputs.len() as u32;
+                base + self
+                    .workspace
+                    .monitors
+                    .iter()
+                    .filter(|m| m.id >= base)
+                    .count() as u32
+            });
+        self.workspace.ensure_monitor(id, self.config.visible_columns);
+        output.user_data().insert_if_missing(|| MonitorId(id));
+        if self.workspace.active_monitor().is_none() {
+            self.workspace.set_active_monitor(id);
+        }
+    }
+
     /// Hot-reload keybinds from the user config file. Only the keybind set is
     /// swapped; `visible_columns` is structural (it seeds the monitor's fixed
     /// column slots at startup), so a live change is logged and ignored until a
@@ -458,8 +488,13 @@ impl RubixState {
     /// configure) onto the live window. Idempotent -- call it after every model
     /// mutation; re-mapping a window at an unchanged rect is a no-op and
     /// `send_pending_configure` only emits when the pending size actually differs.
-    pub(crate) fn output_bounds(&self) -> Option<Rect> {
-        let Some(output) = self.space.outputs().next().cloned() else {
+    pub(crate) fn output_bounds_for(&self, monitor_id: u32) -> Option<Rect> {
+        let Some(output) = self
+            .space
+            .outputs()
+            .find(|o| o.user_data().get::<MonitorId>().is_some_and(|m| m.0 == monitor_id))
+            .cloned()
+        else {
             return None;
         };
         let Some(output_geo) = self.space.output_geometry(&output) else {
@@ -482,8 +517,9 @@ impl RubixState {
     }
     
     pub fn window_rect(&self, id: u32) -> Option<Rect> {
-        let bounds = self.output_bounds()?;
-        self.monitor
+        let monitor = self.workspace.active_monitor()?;
+        let bounds = self.output_bounds_for(monitor.id)?;
+        monitor
             .compute_layout(bounds, self.config.outer_gap, self.config.inner_gap)
             .into_iter()
             .find(|(wid, _)| *wid == id)
@@ -691,8 +727,12 @@ impl RubixState {
     }
 
     pub fn apply_layout(&mut self) {
-        let Some(bounds) = self.output_bounds() else { return };
-        let targets = self.monitor.compute_layout(bounds, self.config.outer_gap, self.config.inner_gap);
+        let mut targets: Vec<(u32, Rect)> = Vec::new();
+        for monitor in &self.workspace.monitors {
+            if let Some(bounds) = self.output_bounds_for(monitor.id) {
+                targets.extend(monitor.compute_layout(bounds, self.config.outer_gap, self.config.inner_gap));
+            }
+        }
 
         match self.pending_transition.take() {
             None => {
@@ -745,6 +785,21 @@ impl RubixState {
             }
             Some(transition) => {
                 // ANIMATE PATH
+                // Nav dispatch (the only source of a pending_transition) always
+                // mutates the ACTIVE monitor, so the active monitor's bounds are
+                // the correct off-screen reference frame for this tween -- not an
+                // approximation. If the active monitor has no bound output (or
+                // there's no active monitor), settle in-flight tweens and bail,
+                // matching the prior no-output early-return.
+                let Some(bounds) = self
+                    .workspace
+                    .active_monitor()
+                    .and_then(|m| self.output_bounds_for(m.id))
+                else {
+                    self.settle_tweens();
+                    return;
+                };
+
                 // 1. Settle in-flight tweens first so Space is a clean baseline.
                 self.settle_tweens();
 

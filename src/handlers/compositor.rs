@@ -69,7 +69,9 @@ impl CompositorHandler for RubixState {
                         .and_then(|fid| self.window_rect(fid))
                         .map(Rect::longer_axis)
                         .unwrap_or(SplitDirection::Horizontal);
-                    self.monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                    if let Some(monitor) = self.workspace.active_monitor_mut() {
+                        monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                    }
                     self.apply_layout();
                     // Focus follows spawn: name the new id directly. The model is
                     // focus-agnostic, so focus_active_window would re-derive the
@@ -98,7 +100,10 @@ impl CompositorHandler for RubixState {
             // A bar committed; if it changed the reserved area (exclusive zone),
             // reflow tiled windows into the new bounds -- once per change, not
             // every repaint frame.
-            let bounds = self.output_bounds();
+            // reserved_bounds tracks only the active monitor's exclusive zone
+            // for now -- a bar reflow on a non-active monitor is a known
+            // multi-monitor follow-up, not addressed in this stage.
+            let bounds = self.workspace.active_monitor().and_then(|m| self.output_bounds_for(m.id));
             if bounds != self.reserved_bounds {
                 self.reserved_bounds = bounds;
                 self.apply_layout();

@@ -99,7 +99,7 @@ struct WindowView {
     focused: bool,
 }
 
-/// Assemble a snapshot from `state.monitor`'s read-only accessors plus
+/// Assemble a snapshot from the active monitor's read-only accessors plus
 /// `state.windows` for app_id/title. MVP: app_id/title extraction only covers
 /// the cheap cases (wayland xdg toplevel surface data); anything else is left
 /// `None` rather than blocking the feature on perfect title extraction.
@@ -119,8 +119,12 @@ fn keyboard_focused_id(state: &RubixState) -> Option<u32> {
 
 fn build_snapshot(state: &RubixState) -> StateSnapshot {
     let focused = keyboard_focused_id(state);
-    let columns = state
-        .monitor
+    let Some(monitor) = state.workspace.active_monitor() else {
+        // No active monitor (no output bound yet) -- empty snapshot rather
+        // than panicking.
+        return StateSnapshot { visible_columns: 0, active_column: 0, columns: Vec::new() };
+    };
+    let columns = monitor
         .columns()
         .iter()
         .map(|column| ColumnView {
@@ -140,8 +144,8 @@ fn build_snapshot(state: &RubixState) -> StateSnapshot {
         .collect();
 
     StateSnapshot {
-        visible_columns: state.monitor.visible_columns(),
-        active_column: state.monitor.active_column(),
+        visible_columns: monitor.visible_columns(),
+        active_column: monitor.active_column(),
         columns,
     }
 }

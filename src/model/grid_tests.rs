@@ -71,7 +71,10 @@
     }
     #[test]
     fn rotate_moves_active_groups_across_columns() {
-        let mut mon = Monitor::new(1, 3);
+        // Zero seeded columns: the loop below builds the exact 3-column grid
+        // the test drives; Monitor::new(1, 3) would seed 3 empty decoys ahead
+        // of them.
+        let mut mon = Monitor::new(1, 0);
         for i in 1..=3 { let mut c = Column::new(50); c.add_group(leaf_group(i)); mon.add_column(c); }
         mon.rotate_columns(-1);
         // trace your bubble on [1,2,3] to lock the direction, then assert all three:
@@ -171,7 +174,10 @@
         // Single-group column (active_row 0 == last row): grow adds a second
         // group and jumps active_row to it. The new group is empty; the existing
         // window is left untouched at row 0.
-        let mut mon = Monitor::new(0, 1);
+        // Zero seeded columns: this test builds the single column it inspects
+        // itself, so Monitor::new(0, 1) would leave a decoy seeded column at
+        // index 0 ahead of the one built below.
+        let mut mon = Monitor::new(0, 0);
         let mut c = Column::new(0);
         c.add_group(leaf_group(1));
         mon.add_column(c);
@@ -191,7 +197,8 @@
         // fresh group directly *after* the active row (row 2) and activate it --
         // not append after g3. g3 shifts down to row 3, untouched. This is the
         // positional-insert guarantee that scroll(1) relies on to be correct.
-        let mut mon = Monitor::new(0, 1);
+        // Zero seeded columns, same reasoning as the test above.
+        let mut mon = Monitor::new(0, 0);
         let mut c = Column::new(0);
         for i in 1..=3 { c.add_group(leaf_group(i)); }
         mon.add_column(c);
@@ -243,7 +250,11 @@
     // column's cursor. Enough to exercise ragged-grid row selection. Columns
     // here are always non-empty -- the empty-group cases are built by hand below.
     fn monitor_from(columns: &[&[u32]], active_rows: &[usize]) -> Monitor {
-        let mut mon = Monitor::new(0, columns.len().max(1));
+        // Monitor::new pre-seeds `visible_columns` empty columns; that would
+        // interleave decoys ahead of the hand-built columns below, so start
+        // from zero seeded columns and set visible_columns directly once the
+        // real columns are in place.
+        let mut mon = Monitor::new(0, 0);
         for (ci, ids) in columns.iter().enumerate() {
             let mut col = Column::new(0);
             for &id in ids.iter() {
@@ -252,6 +263,7 @@
             col.active_row = active_rows[ci];
             mon.add_column(col);
         }
+        mon.visible_columns = columns.len().max(1);
         mon
     }
 
@@ -338,7 +350,10 @@
         // the destination leaf(2) splits vertically to hold both windows, and the
         // axis is exactly the one handed to move_window_to_group (policy decides
         // it upstream; the model only threads it through).
-        let mut mon = Monitor::new(0, 2);
+        // Zero seeded columns: this test builds and indexes the exact two
+        // columns it moves between, so Monitor::new(0, 2) would put decoy
+        // seeded columns ahead of c0/c1.
+        let mut mon = Monitor::new(0, 0);
         let mut c0 = Column::new(0);
         c0.add_group(leaf_group(1));
         mon.add_column(c0);
@@ -417,13 +432,18 @@
         // Left column holds an h-split(1|2); right column a lone leaf 3. The inner
         // gap lives inside column 0's split; the outer gap sits between the columns.
         // Neither should perturb the other's arithmetic.
-        let mut mon = Monitor::new(0, 2);
+        // Zero seeded columns, then set visible_columns directly: this test
+        // drives compute_layout, which reads visible_columns, so it still
+        // needs it set to 2 -- just without decoy seeded columns ahead of
+        // c0/c1 the way Monitor::new(0, 2) would produce.
+        let mut mon = Monitor::new(0, 0);
         let mut c0 = Column::new(0);
         c0.add_group(split_group(1, 2));
         mon.add_column(c0);
         let mut c1 = Column::new(0);
         c1.add_group(leaf_group(3));
         mon.add_column(c1);
+        mon.visible_columns = 2;
 
         let layout = mon.compute_layout(rect(0, 0, 800, 600), 20, 10);
         let (w1, w2, w3) = (find(&layout, 1), find(&layout, 2), find(&layout, 3));

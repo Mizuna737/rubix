@@ -593,6 +593,7 @@ fn connector_connected(
     output.set_preferred(wl_mode);
     output.change_current_state(Some(wl_mode), Some(Transform::Normal), None, Some(position.into()));
     data.state.space.map_output(&output, position);
+    data.state.bind_output_monitor(&output);
 
     // NVIDIA breaks with overlay planes assigned -- clear them before init.
     let mut planes = backend
