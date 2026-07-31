@@ -9,8 +9,17 @@
 //! once per output (`compile_hdr_shaders`, cached on udev's per-output
 //! `SurfaceData::hdr_shaders`) -- never per frame.
 
-use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTexProgram};
+use smithay::backend::renderer::gles::{
+    GlesError, GlesRenderer, GlesTexProgram, UniformName, UniformType,
+};
 use smithay::backend::renderer::Color32F;
+
+/// BT.2408 reference SDR white, in nits. Fed to `ENCODE_LINEAR_TO_PQ`'s
+/// `sdr_white_nits` uniform so the scene-referred [0,1] linear offscreen maps
+/// to an absolute PQ luminance. Phase 4 replaces this constant with a live
+/// per-output value from the SDR-brightness slider (80-300 nits) -- static
+/// 203 nits is correct for now (no slider exists yet).
+pub const SDR_WHITE_NITS: f32 = 203.0;
 
 /// Decode pass: samples the client-submitted sRGB texture, converts to
 /// linear light (piecewise sRGB EOTF, IEC 61966-2-1: 0.04045 threshold,
@@ -58,13 +67,14 @@ void main() {
 }
 "#;
 
-/// Encode pass: samples the linear 16F offscreen and converts back to sRGB
-/// (piecewise, the exact inverse of `DECODE_SRGB_TO_LINEAR` above: 0.0031308
-/// linear-domain threshold, `*12.92` below, `1.055*c^(1/2.4)-0.055` above).
-/// This is Phase 2's identity round-trip -- the whole point of this shader is
-/// that decode-then-encode reproduces the input exactly (mod float
-/// precision), so the HDR output looks byte-identical to the non-HDR path.
-pub const ENCODE_LINEAR_TO_SRGB: &str = r#"
+/// Encode pass: samples the linear BT.709, scene-referred 16F offscreen,
+/// converts to BT.2020 primaries, scales to absolute PQ luminance by
+/// `sdr_white_nits`, and applies the SMPTE ST 2084 (PQ) OETF -- the real HDR
+/// output encode that supersedes Phase 2's identity sRGB round-trip. All
+/// content is still SDR-referred (no HDR clients until Phase 1b), so nothing
+/// exceeds panel peak and no tone-mapping is needed this phase -- a straight
+/// SDR-white-scaled PQ encode is the whole job.
+pub const ENCODE_LINEAR_TO_PQ: &str = r#"
 #version 100
 
 //_DEFINES_
@@ -81,30 +91,35 @@ uniform sampler2D tex;
 #endif
 
 uniform float alpha;
+uniform float sdr_white_nits;
 varying vec2 v_coords;
 
-vec3 linear_to_srgb(vec3 c) {
-    vec3 lo = c * 12.92;
-    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-    vec3 cutoff = step(vec3(0.0031308), c);
-    return mix(lo, hi, cutoff);
+// BT.709 -> BT.2020 primaries, linear-light 3x3. GLSL mat3(...) is
+// column-major, so this is the transpose of the row-major matrix whose ROWS
+// are [0.6274 0.3293 0.0433] / [0.0691 0.9195 0.0114] / [0.0164 0.0880
+// 0.8956]. Verified: BT709_TO_BT2020 * vec3(1,1,1) ~= vec3(1,1,1) (each row
+// sums to ~1.0), i.e. white maps to white.
+const mat3 BT709_TO_BT2020 = mat3(
+    0.627403896, 0.069097289, 0.016391439,   // column 0
+    0.329283038, 0.919540395, 0.088013308,   // column 1
+    0.043313066, 0.011362316, 0.895595253);  // column 2
+
+// SMPTE ST 2084 / Rec. 2100 PQ OETF, m1 m2 c1 c2 c3.
+vec3 pq_oetf(vec3 y) {
+    const float m1 = 0.1593017578125;   // 2610/16384
+    const float m2 = 78.84375;          // 2523/4096 * 128
+    const float c1 = 0.8359375;         // 3424/4096
+    const float c2 = 18.8515625;        // 2413/4096 * 32
+    const float c3 = 18.6875;           // 2392/4096 * 32
+    vec3 ym = pow(y, vec3(m1));
+    return pow((c1 + c2 * ym) / (1.0 + c3 * ym), vec3(m2));
 }
 
-// Phase 3 seam: ENCODE_LINEAR_TO_PQ replaces linear_to_srgb() below with the
-// SMPTE ST 2084 PQ OETF plus a nits-scale uniform, once BT.2020 primaries /
-// absolute-luminance scanout coordination land (Phase 3/4). Not implemented
-// here -- Phase 2 is a pure sRGB round-trip, no nits-scaling yet.
-
 void main() {
-    vec4 color = texture2D(tex, v_coords);
-
-#if defined(NO_ALPHA)
-    color = vec4(linear_to_srgb(color.rgb), 1.0) * alpha;
-#else
-    color = vec4(linear_to_srgb(color.rgb), color.a) * alpha;
-#endif
-
-    gl_FragColor = color;
+    vec3 lin709 = texture2D(tex, v_coords).rgb;
+    vec3 lin2020 = BT709_TO_BT2020 * lin709;
+    vec3 y = clamp(lin2020 * sdr_white_nits / 10000.0, 0.0, 1.0);
+    gl_FragColor = vec4(pq_oetf(y), 1.0) * alpha;
 }
 "#;
 
@@ -125,7 +140,10 @@ pub struct HdrShaders {
 /// `SurfaceData::hdr_shaders` -- never per frame.
 pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, GlesError> {
     let decode = renderer.compile_custom_texture_shader(DECODE_SRGB_TO_LINEAR, &[])?;
-    let encode = renderer.compile_custom_texture_shader(ENCODE_LINEAR_TO_SRGB, &[])?;
+    let encode = renderer.compile_custom_texture_shader(
+        ENCODE_LINEAR_TO_PQ,
+        &[UniformName::new("sdr_white_nits", UniformType::_1f)],
+    )?;
     Ok(HdrShaders { decode, encode })
 }
 

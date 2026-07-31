@@ -55,7 +55,7 @@ use smithay::backend::renderer::damage::{Error as OutputDamageTrackerError, Outp
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Id, Kind};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiRenderer};
 use smithay::backend::renderer::{Bind, Offscreen, Renderer};
@@ -81,7 +81,7 @@ use smithay::utils::{Buffer as BufferCoord, DeviceFd, Physical, Point, Scale, Si
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
-use crate::hdr_shaders::{compile_hdr_shaders, srgb_to_linear_solid, HdrShaders};
+use crate::hdr_shaders::{compile_hdr_shaders, srgb_to_linear_solid, HdrShaders, SDR_WHITE_NITS};
 use crate::state::Pos;
 use crate::RubixState;
 
@@ -714,6 +714,23 @@ fn connector_connected(
     // HDR groundwork: gated per-output, default off. Only reached when the
     // config explicitly opts this connector in.
     if output_hdr {
+        // Diagnostic only: confirm the connector actually negotiated a
+        // 10-bit scanout format -- PQ over 8-bit bands severely. Does not
+        // change SUPPORTED_FORMATS or negotiation; just logs what was
+        // chosen so the user can check the journal.
+        let scanout_format = drm_output.format();
+        if matches!(scanout_format, Fourcc::Abgr8888 | Fourcc::Argb8888) {
+            tracing::warn!(
+                "HDR output {}: negotiated 8-bit scanout format {scanout_format:?} \
+                 (10-bit was offered) -- PQ will band",
+                output.name(),
+            );
+        } else {
+            tracing::info!(
+                "HDR output {}: negotiated scanout format = {scanout_format:?}",
+                output.name(),
+            );
+        }
         set_hdr_output_properties(&drm_output);
     }
 
@@ -1276,7 +1293,10 @@ fn render_surface_hdr<'a>(
         None,
         Kind::Unspecified,
     );
-    gles.set_default_tex_program_override(Some((shaders.encode.clone(), Vec::new())));
+    gles.set_default_tex_program_override(Some((
+        shaders.encode.clone(),
+        vec![Uniform::new("sdr_white_nits", SDR_WHITE_NITS)],
+    )));
     let encode_elements = [RubixRenderElement::Texture(texture_element)];
     // See the doc comment above for why `FrameFlags::empty()` (not
     // `FrameFlags::DEFAULT`) is required here: it forces GL composition so
