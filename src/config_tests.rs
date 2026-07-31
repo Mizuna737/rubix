@@ -203,6 +203,45 @@
         assert_eq!(cfg.outputs[0].transform, Transform::Normal);
     }
 
+    // ---- hdr ----
+
+    #[test]
+    fn output_with_hdr_true_resolves_to_hdr_true() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+
+            [[output]]
+            name = "DP-3"
+            position = [0, 0]
+            hdr = true
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config with hdr parses");
+        let cfg = Config::resolve(raw);
+        assert!(cfg.outputs[0].hdr);
+    }
+
+    #[test]
+    fn output_omitting_hdr_defaults_to_false() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+
+            [[output]]
+            name = "DP-3"
+            position = [0, 0]
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without hdr still parses");
+        let cfg = Config::resolve(raw);
+        assert!(!cfg.outputs[0].hdr);
+    }
+
     // ---- hot-reload event filtering ----
 
     use calloop_notify::notify::{

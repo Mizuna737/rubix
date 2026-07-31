@@ -33,6 +33,7 @@ inner_gap = 10
 # position = [0, 0]        # top-left corner in global compositor space
 # mode = "1920x1080"       # optional; omit to use the output's preferred mode
 # primary = true           # optional, defaults to false
+# hdr = true   # opt-in HDR (BT.2020/PQ) for this output; default false. Requires an HDR display.
 #
 # [[output]]
 # name = "HDMI-A-1"

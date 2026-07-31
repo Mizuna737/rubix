@@ -46,6 +46,10 @@ pub struct OutputConfig {
     /// Output transform (rotation/flip). Defaults to `Transform::Normal` when
     /// the config omits `transform` or the string is unrecognized.
     pub transform: Transform,
+    /// Opt-in HDR (BT.2020/PQ) for this output. Default false -- omitting
+    /// `hdr` (or setting it false) leaves the SDR path byte-for-byte
+    /// unchanged. Requires an HDR-capable display; see src/hdr.rs.
+    pub hdr: bool,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -103,6 +107,8 @@ struct RawOutput {
     primary: bool,
     #[serde(default)]
     transform: Option<String>,
+    #[serde(default)]
+    hdr: bool,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +182,7 @@ impl Config {
                 mode: o.mode.as_deref().and_then(parse_mode),
                 primary: o.primary,
                 transform: o.transform.as_deref().and_then(parse_transform).unwrap_or(Transform::Normal),
+                hdr: o.hdr,
             })
             .collect();
 

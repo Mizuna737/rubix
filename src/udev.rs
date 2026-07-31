@@ -69,7 +69,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
-use smithay::reexports::drm::control::{connector, crtc, ModeTypeFlags};
+use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
 use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
@@ -546,6 +546,7 @@ fn connector_connected(
         .outputs
         .iter()
         .find(|o| o.name == output_name);
+    let output_hdr = output_config.map(|o| o.hdr).unwrap_or(false);
     let drm_mode = *output_config
         .and_then(|o| o.mode)
         .and_then(|(w, h)| {
@@ -645,6 +646,13 @@ fn connector_connected(
         Duration::from_secs_f64(1.0 / 60.0)
     };
 
+    // HDR groundwork: gated per-output, default off. Only reached when the
+    // config explicitly opts this connector in. See `set_hdr_output_properties`
+    // for why this is currently a documented no-op rather than a live commit.
+    if output_hdr {
+        set_hdr_output_properties(backend.drm_output_manager.device(), connector.handle());
+    }
+
     backend.surfaces.insert(
         crtc,
         SurfaceData {
@@ -659,6 +667,80 @@ fn connector_connected(
     // First frame on the next loop turn (also does the initial tiling pass).
     data.state.apply_layout();
     schedule_render(udev, node, crtc, Duration::ZERO);
+}
+
+/// HDR Phase 1, Tier 3: apply the `Colorspace` and `HDR_OUTPUT_METADATA`
+/// connector properties for an output opted into HDR (`OutputConfig::hdr`).
+///
+/// BLOCKED: Smithay 0.7's `DrmSurface`/`DrmCompositor`/`DrmOutput` (see
+/// `smithay-0.7.0/src/backend/drm/{surface,compositor,output}/mod.rs`) expose
+/// no API to add arbitrary connector properties to the atomic commit they
+/// drive. `AtomicDrmSurface` (`surface/atomic.rs`) hardcodes exactly one
+/// connector property per commit (`CRTC_ID`) via a private `connector_props`
+/// map built inside `commit()`/`page_flip()`; there is no builder, callback,
+/// or extension point for `Colorspace`/`HDR_OUTPUT_METADATA`.
+///
+/// The lower layer (`drm-rs`'s `Device` trait, already in scope here as
+/// `BaseDrmDevice`) *does* expose `create_property_blob` and `set_property`
+/// directly on the device fd. But calling those here would mean issuing a
+/// legacy `DRM_IOCTL_MODE_OBJ_SETPROPERTY` outside Smithay's atomic commit
+/// cycle: on atomic-only KMS drivers (nouveau/amdgpu/i915, i.e. anything
+/// Rubix targets) the kernel does not accept out-of-band single-property
+/// sets for objects under atomic control, and even where it did, the next
+/// `AtomicDrmSurface::commit()` recomputes its own tracked connector property
+/// set with no knowledge of ours -- a race with undefined ordering against
+/// Smithay's internal state, not a supported integration. That is the
+/// "fighting the commit cycle" case the spec calls out to stop at.
+///
+/// What full integration needs from Smithay: either (a) a public hook to
+/// register extra `(connector, property_name, value)` entries that
+/// `AtomicDrmSurface`/`DrmCompositor` folds into every atomic commit/test
+/// alongside its own managed properties, or (b) upstream support for
+/// `Colorspace`/`HDR_OUTPUT_METADATA` as first-class `DrmOutput` config,
+/// mirroring how `use_vrr`/`VRR_ENABLED` is already handled internally.
+/// Neither exists in 0.7. Revisit if/when Smithay grows one (see
+/// smithay#tracking-hdr upstream, or a version bump) -- or when this project
+/// decides a raw parallel (non-atomic) property poke is an acceptable risk.
+///
+/// This function is intentionally a no-op beyond logging: it looks up the two
+/// property handles (to confirm they exist on this connector, matching the
+/// hardware verification this phase relies on) and returns without touching
+/// them, so the `hdr == true` path never diverges from `hdr == false` at
+/// runtime yet. Tier 2's blob builder (`crate::hdr::build_hdr_metadata_blob`)
+/// is ready to feed either integration path above once one exists.
+fn set_hdr_output_properties(device: &impl ControlDevice, connector: connector::Handle) {
+    let Ok(props) = device.get_properties(connector) else {
+        tracing::warn!("HDR: failed to query properties for {connector:?}; leaving HDR unset");
+        return;
+    };
+
+    let mut found_colorspace = false;
+    let mut found_hdr_metadata = false;
+    for (handle, _value) in props {
+        let Ok(info) = device.get_property(handle) else { continue };
+        match info.name().to_str() {
+            Ok("Colorspace") => found_colorspace = true,
+            Ok("HDR_OUTPUT_METADATA") => found_hdr_metadata = true,
+            _ => {}
+        }
+    }
+
+    if found_colorspace && found_hdr_metadata {
+        // Blob built and ready to hand to a real integration the moment one
+        // exists (see doc comment above); not applied anywhere yet.
+        let _blob = crate::hdr::build_hdr_metadata_blob(crate::hdr::HdrMetadata::default());
+        tracing::info!(
+            "HDR requested for {connector:?}: Colorspace/HDR_OUTPUT_METADATA properties present, \
+             but not yet applied -- blocked on Smithay 0.7 atomic-commit integration (see \
+             set_hdr_output_properties doc comment). Output stays SDR."
+        );
+    } else {
+        tracing::warn!(
+            "HDR requested for {connector:?} but this connector is missing \
+             Colorspace/HDR_OUTPUT_METADATA (found_colorspace={found_colorspace}, \
+             found_hdr_metadata={found_hdr_metadata}); nothing to apply regardless"
+        );
+    }
 }
 
 /// A connector on a CRTC went away: unmap and drop its output.

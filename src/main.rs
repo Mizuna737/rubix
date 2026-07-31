@@ -6,6 +6,7 @@ mod config;
 mod cursor;
 mod focus;
 mod grabs;
+mod hdr;
 mod input;
 mod ipc;
 mod model;
