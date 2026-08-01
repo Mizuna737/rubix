@@ -44,6 +44,7 @@ pub(crate) enum NavAction {
     MoveFocusedWindowRight,
     IncreaseSdrWhite,
     DecreaseSdrWhite,
+    ToggleHdr,
 }
 
 /// Per-press adjustment for the IncreaseSdrWhite/DecreaseSdrWhite chords, in
@@ -370,6 +371,11 @@ impl RubixState {
             NavAction::DecreaseSdrWhite => {
                 self.sdr_white_nits = (self.sdr_white_nits - SDR_WHITE_STEP).clamp(80.0, 300.0);
                 self.nudge_render();
+            },
+            NavAction::ToggleHdr => {
+                // toggle_hdr does its own render scheduling; don't also fall
+                // through to apply_layout for geometry it doesn't need.
+                self.toggle_hdr();
             },
         }
         self.apply_layout();

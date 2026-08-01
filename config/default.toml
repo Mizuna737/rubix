@@ -101,6 +101,10 @@ duration_ms = 250
 # Super for a real TTY session (matches "Super+space" launcher above).
 "Alt+XF86AudioRaiseVolume" = "IncreaseSdrWhite"
 "Alt+XF86AudioLowerVolume" = "DecreaseSdrWhite"
+# Live A/B toggle: flips HDR on/off on every HDR-capable output with no
+# restart. Shifted-letter final token (matches Alt+Shift+H/+L/+J/+K above --
+# the key event's keysym is already the shifted symbol when Shift is held).
+"Alt+Shift+T" = "ToggleHdr"
 # Exit the compositor. On the TTY backend this is the only in-session quit (winit
 # also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
 # Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the

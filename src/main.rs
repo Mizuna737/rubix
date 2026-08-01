@@ -2,6 +2,7 @@
 
 mod handlers;
 
+mod color_management;
 mod config;
 mod cursor;
 mod focus;

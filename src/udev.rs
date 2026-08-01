@@ -45,7 +45,8 @@ use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
 use smithay::backend::drm::compositor::FrameFlags;
 use smithay::backend::drm::{
-    Colorspace, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
+    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode,
+    NodeType,
 };
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::egl::context::ContextPriority;
@@ -54,11 +55,11 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::damage::{Error as OutputDamageTrackerError, OutputDamageTracker};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
-use smithay::backend::renderer::element::{AsRenderElements, Id, Kind};
+use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiRenderer};
-use smithay::backend::renderer::{Bind, Offscreen, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
@@ -69,6 +70,7 @@ use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{connector, crtc, ModeTypeFlags};
@@ -76,12 +78,15 @@ use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::{Buffer as BufferCoord, DeviceFd, Physical, Point, Scale, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
+use crate::color_management::{surface_decode_kind, DecodeKind};
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
-use crate::hdr_shaders::{compile_hdr_shaders, srgb_to_linear_solid, HdrShaders};
+use crate::hdr_shaders::{compile_hdr_shaders, sdr_solid_transform, HdrShaders};
 use crate::state::Pos;
 use crate::RubixState;
 
@@ -142,7 +147,10 @@ pub(crate) struct UdevData {
     /// Multi-GPU renderer registry (one node registered per DRM device).
     pub(crate) gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     /// One entry per DRM device (GPU), keyed by its primary node.
-    backends: HashMap<DrmNode, BackendData>,
+    ///
+    /// `pub(crate)` so `color_management.rs`'s `description_for_output` can
+    /// walk it read-only to find an output's live `hdr` state.
+    pub(crate) backends: HashMap<DrmNode, BackendData>,
     /// Loop handle for inserting per-device VBlank sources and frame timers from
     /// inside the udev/device callbacks.
     loop_handle: LoopHandle<'static, RubixState>,
@@ -155,13 +163,15 @@ pub(crate) struct UdevData {
 
 /// Per-DRM-device state: the output manager (owns the DRM device + allocator),
 /// the connector scanner, and the live per-CRTC surfaces.
-struct BackendData {
+pub(crate) struct BackendData {
     /// Manages DRM outputs (scanout, damage, plane assignment) for this device.
     drm_output_manager: RubixDrmOutputManager,
     /// Scans connectors→CRTCs on hotplug/probe.
     drm_scanner: DrmScanner,
     /// Live outputs on this device, keyed by CRTC.
-    surfaces: HashMap<crtc::Handle, SurfaceData>,
+    ///
+    /// `pub(crate)` -- see `UdevData::backends`.
+    pub(crate) surfaces: HashMap<crtc::Handle, SurfaceData>,
     /// The EGL render node backing this device (== primary_gpu on single-GPU).
     render_node: DrmNode,
     /// calloop token for this device's DRM VBlank source, removed on unplug.
@@ -170,9 +180,11 @@ struct BackendData {
 
 /// Per-CRTC (per-monitor) state: the smithay `Output`, its global, and the
 /// `DrmOutput` we scan out through.
-struct SurfaceData {
+pub(crate) struct SurfaceData {
     /// The logical output mapped into the space.
-    output: Output,
+    ///
+    /// `pub(crate)` -- see `UdevData::backends`.
+    pub(crate) output: Output,
     /// Wayland global for the output, destroyed on disconnect.
     global: Option<GlobalId>,
     /// The DRM scanout target (wraps a DrmCompositor internally).
@@ -180,10 +192,17 @@ struct SurfaceData {
     /// Frame interval derived from the mode refresh, for scheduling repaint.
     frame_duration: Duration,
     /// HDR Phase 2: whether this output composites through the linear 16F
-    /// pipeline (`render_surface`'s HDR branch). Set once at
-    /// `connector_connected` from `OutputConfig::hdr`; never changes live
-    /// (matches `set_hdr_output_properties`'s own connector-property gating).
-    hdr: bool,
+    /// pipeline (`render_surface`'s HDR branch). This is the *live* state --
+    /// `toggle_hdr` flips it at runtime (gated by `hdr_capable` below) to A/B
+    /// HDR vs SDR on the same output without a config-edit + TTY restart.
+    ///
+    /// `pub(crate)` -- see `UdevData::backends`.
+    pub(crate) hdr: bool,
+    /// Fixed at `connector_connected` from `OutputConfig::hdr`: whether this
+    /// output may ever use HDR. Never changes live -- it's the gate that
+    /// keeps `toggle_hdr` from trying to enable HDR on a non-HDR-capable
+    /// output (e.g. the HDMI strip).
+    hdr_capable: bool,
     /// HDR Phase 2 shader cache. Compiled once (lazily, on this output's
     /// first HDR frame) via `compile_hdr_shaders` and never recompiled.
     /// Cached HERE (per-output) rather than on `UdevData`: `render_surface`
@@ -742,6 +761,7 @@ fn connector_connected(
             drm_output,
             frame_duration,
             hdr: output_hdr,
+            hdr_capable: output_hdr,
             hdr_shaders: None,
             hdr_offscreen: None,
         },
@@ -863,6 +883,79 @@ fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
             }
         }
     });
+}
+
+/// Revert a connector to the SDR default color state (`Colorspace::Default`
+/// i.e. sRGB/BT.709, no HDR metadata, no max_bpc request). Mirrors
+/// `set_hdr_output_properties`'s `with_compositor` shape. `use_color_state`
+/// stages for the next atomic commit and is safe to call repeatedly at
+/// runtime -- no re-init needed.
+fn set_sdr_output_properties(drm_output: &RubixDrmOutput) {
+    drm_output.with_compositor(|comp| {
+        let desired = ConnectorColorState::default();
+        if comp.pending_color_state() != desired {
+            match comp.use_color_state(desired) {
+                Ok(()) => tracing::info!("HDR: reverted connector to SDR default color state"),
+                Err(e) => tracing::warn!("HDR: failed to revert to SDR color state: {e}"),
+            }
+        }
+    });
+}
+
+/// Toggle live HDR on/off on every HDR-capable output. Flips `SurfaceData::hdr`
+/// and stages the corresponding connector color state (HDR or SDR default),
+/// then forces a repaint so the staged state actually reaches the next atomic
+/// commit. Outputs that were never HDR-capable (`hdr_capable == false`, e.g. a
+/// non-HDR HDMI strip) are left untouched.
+///
+/// Borrow discipline matches `nudge_all_renders`: mutate surfaces and collect
+/// `(DrmNode, crtc::Handle)` targets inside a short `udev.borrow_mut()`, then
+/// drop the borrow before calling `schedule_render` (which re-borrows `udev`
+/// for the loop handle).
+///
+/// Returns the toggled outputs so the caller (`RubixState::toggle_hdr`) can
+/// notify their bound `wp_color_management_output_v1` objects
+/// (`ColorManagementState::output_description_changed`) to re-query
+/// `description_for_output` -- without needing a second borrow of `udev`
+/// alongside `self.color_management_state`.
+pub(crate) fn toggle_hdr(udev: &Rc<RefCell<UdevData>>) -> Vec<Output> {
+    let (targets, outputs): (Vec<(DrmNode, crtc::Handle)>, Vec<Output>) = {
+        let mut guard = udev.borrow_mut();
+        let mut targets = Vec::new();
+        let mut outputs = Vec::new();
+        for (node, backend) in guard.backends.iter_mut() {
+            for (crtc, surface) in backend.surfaces.iter_mut() {
+                if !surface.hdr_capable {
+                    continue;
+                }
+                surface.hdr = !surface.hdr;
+                if surface.hdr {
+                    set_hdr_output_properties(&surface.drm_output);
+                } else {
+                    set_sdr_output_properties(&surface.drm_output);
+                }
+                tracing::info!(
+                    "HDR toggle: {} is now {}",
+                    surface.output.name(),
+                    if surface.hdr { "HDR" } else { "SDR" }
+                );
+                targets.push((*node, *crtc));
+                outputs.push(surface.output.clone());
+            }
+        }
+        (targets, outputs)
+    };
+
+    if targets.is_empty() {
+        tracing::info!("HDR toggle: no HDR-capable output");
+        return outputs;
+    }
+
+    for (node, crtc) in targets {
+        schedule_render(udev, node, crtc, Duration::ZERO);
+    }
+
+    outputs
 }
 
 /// A connector on a CRTC went away: unmap and drop its output.
@@ -1076,16 +1169,32 @@ fn render_surface(
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
 
-    // HDR Phase 2: `hdr == true` outputs composite through a linear-light 16F
-    // offscreen instead of drawing `elements` straight to scanout (below).
-    // On ANY failure (shader compile, offscreen bind, either render call)
-    // `render_surface_hdr` returns `Err` and touches nothing further -- fall
+    // HDR Phase 2/1b: `hdr == true` outputs composite through a linear-light
+    // 16F offscreen instead of drawing `elements` straight to scanout
+    // (below). On ANY failure (shader compile, offscreen bind, either render
+    // call) the HDR path returns `Err` and touches nothing further -- fall
     // through to the exact same `render_frame` call every non-HDR output
     // takes, degrading this one frame to SDR rather than panicking the
     // session. The non-HDR path below is intentionally untouched byte-for-
     // byte by this branch: most outputs (e.g. HDMI-A-1) never enter it.
+    //
+    // Phase 1b: when at least one HDR-declared surface contributes to this
+    // output, the fast single-pass decode (below, unchanged since Phase 2)
+    // can no longer be used -- it applies one shader override to every
+    // surface. `output_has_hdr_window` is a cheap per-window check (no
+    // renderer work) run first so the common case (no HDR content anywhere,
+    // e.g. every normal desktop frame) takes the exact proven fast path with
+    // zero extra cost. Only when it's actually needed is the more expensive
+    // per-window gather (`gather_tagged_elements`) done and the z-run decode
+    // (`render_surface_hdr_zrun`) used instead.
     if surface.hdr {
-        match render_surface_hdr(surface, renderer, &elements, state.sdr_white_nits) {
+        let hdr_result = if output_has_hdr_window(state, &surface.output) {
+            let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
+            render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits)
+        } else {
+            render_surface_hdr(surface, renderer, &elements, state.sdr_white_nits)
+        };
+        match hdr_result {
             Ok(presented) => return Ok(presented),
             Err(err) => {
                 tracing::warn!(
@@ -1122,71 +1231,177 @@ fn render_surface(
     Ok(true)
 }
 
-/// HDR Phase 2's linear-light pipeline for one `hdr = true` output. Two
-/// passes over the SAME `elements` `render_surface` already built (the
-/// element-collection code above is shared, unchanged, by both branches):
+/// Cheap pre-check: does any window contributing to `output` currently
+/// declare an HDR (ST 2084 PQ) color-management description? No renderer
+/// work -- just `Space`/surface-state lookups -- so it's safe to run on
+/// every frame of every `hdr = true` output, including the common case where
+/// the answer is "no" (plain desktop use). Layer-shell surfaces, ghosts, and
+/// the cursor never carry HDR content (compositor/shell chrome), so only
+/// space windows need checking. Filters by output-region bbox overlap, same
+/// as `Space::render_elements_for_region`, so a window tiled on a DIFFERENT
+/// output doesn't wrongly force this one onto the slow path.
+fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
+    let Some(region) = state.space.output_geometry(output) else {
+        return false;
+    };
+    state.space.elements().any(|window| {
+        state
+            .space
+            .element_bbox(window)
+            .is_some_and(|bbox| region.overlaps(bbox))
+            && window
+                .wl_surface()
+                .is_some_and(|s| surface_decode_kind(&s) == DecodeKind::HdrPq)
+    })
+}
+
+/// Slow-path element gather for HDR Phase 1b: same front-to-back z-order as
+/// `render_surface`'s plain `elements` (cursor, overlay, top, ghosts, space,
+/// bottom, background), but paired with each element's [`DecodeKind`] so
+/// `render_surface_hdr_zrun` can decode each surface through its own
+/// transfer function. Cursor/layer-shell/ghost elements are always `Sdr`
+/// (compositor/shell chrome, never client HDR content) and are rebuilt here
+/// via fresh, independent `render_elements` calls -- cheap (element structs
+/// referencing existing textures, no new GPU work) and avoids needing the
+/// non-`Clone` `WaylandSurfaceRenderElement`/`RubixRenderElement` values
+/// built by `render_surface`'s own (untouched) element collection to somehow
+/// be shared between the fast and slow paths.
 ///
-/// 1. **Decode** -- `elements` render into a cached 16F offscreen via
-///    `OutputDamageTracker::render_output`, with the renderer-global
-///    texture-program override set to the decode shader and the solid-color
-///    transform set to `srgb_to_linear_solid`, so every surface texture AND
-///    solid-color draw linearizes on the way in. Both overrides are cleared
-///    immediately after the render call, win or lose (`decode_result` is
-///    computed first and `?`-propagated only after the clear).
-/// 2. **Encode** -- the offscreen, wrapped as a single fullscreen
-///    `RubixRenderElement::Texture`, goes through the SAME
-///    `drm_output.render_frame` call the non-HDR path uses, with the
-///    override set to the encode shader, then cleared the same way.
-///
-/// Both passes reach `&mut GlesRenderer` via `renderer.as_mut()`
-/// (`MultiRenderer`'s `AsMut<GlesRenderer>` impl -- confirmed in this spec's
-/// Deliverable 0) because the shader-compile/override APIs live on
-/// `GlesRenderer`, not `MultiRenderer`. The decode pass's offscreen bind and
-/// `render_output` call go through the OUTER `renderer: &mut
-/// RubixRenderer<'_>` instead, because `elements` is typed
-/// `RubixRenderElement<RubixRenderer<'_>>` by the caller -- `MultiRenderer`
-/// implements `Offscreen`/`Bind` generically for exactly this reason
-/// (multigpu/mod.rs:1027-1124), so no type mismatch. The encode pass's
-/// `drm_output.render_frame` call, by contrast, is handed the raw `&mut
-/// GlesRenderer` directly: `render_frame`'s `R`/`E` are generic per call
-/// (compositor/mod.rs:1688-1699, `E: RenderElement<R>, R: Renderer +
-/// Bind<Dmabuf>`), and the single texture element wrapping the 16F offscreen
-/// is a native `GlesTexture` (from the decode pass's `Offscreen::<GlesTexture>
-/// ::create_buffer` call) -- routing it back through `MultiRenderer` would
-/// mean converting to `MultiTexture` first (`MultiTexture::from_native_texture`,
-/// needs a `ContextId` round-trip) for no benefit on Rubix's single-GPU,
-/// always-zero-copy configuration (`RubixRenderer<'_>`'s own doc comment,
-/// udev.rs:103-105).
-///
-/// `FrameFlags::empty()` on the encode call is the direct-scanout-promotion
-/// fix flagged in the spec: `DrmCompositor::render_frame` only skips
-/// assigning elements to scanout planes when `!frame_flags.intersects
-/// (FrameFlags::ALLOW_SCANOUT)` (compositor/mod.rs:2887) -- i.e. it composes
-/// via GL only when NONE of the `ALLOW_*` bits are set. A single fullscreen
-/// opaque element with the default `FrameFlags::DEFAULT` (which sets every
-/// `ALLOW_*` bit) is exactly the shape `DrmCompositor` promotes straight to
-/// a scanout plane, which would skip the encode shader and scan the RAW
-/// LINEAR buffer out. Passing `FrameFlags::empty()` clears every `ALLOW_*`
-/// bit, so that condition holds unconditionally and the element is forced
-/// through GL composition every time -- the encode shader is guaranteed to
-/// run. (Confirmed by reading `render_frame`'s scanout-eligibility check
-/// directly, not inferred -- see compositor/mod.rs:2880-2911.)
-///
-/// Any failure (compile, bind, or either render call) returns `Err`
-/// immediately and leaves `surface.hdr_offscreen`/`hdr_shaders` exactly as
-/// they were (a pre-first-success failure leaves them `None`, so the next
-/// frame retries the compile/bind from scratch; a failure after both have
-/// been cached once just skips this frame's HDR pass, the caches stay warm
-/// for the next). The caller falls back to the plain
-/// `drm_output.render_frame(renderer, &elements, ..)` path for that frame.
-fn render_surface_hdr<'a>(
-    surface: &mut SurfaceData,
+/// Space windows are gathered **per window** (`window.render_elements`, the
+/// same call the ghost path already uses) rather than via the single
+/// `Space::render_elements_for_region` batch, so each window's elements can
+/// be tagged with that window's own root-surface decode kind
+/// (`surface_decode_kind(window.wl_surface())`). The per-window geometry here
+/// reproduces `render_elements_for_region`'s algorithm exactly (smithay's
+/// `desktop/space/mod.rs`): iterate `Space::elements()` (back-to-front) in
+/// reverse for front-to-back order, skip windows whose bbox doesn't overlap
+/// the output region, and use `element_location - window.geometry().loc -
+/// region.loc` (physical-rounded) as the render location -- `InnerElement::
+/// render_location() - region.loc`, spelled out because `Space`'s internal
+/// `InnerElement` type isn't public.
+fn gather_tagged_elements<'a>(
+    state: &RubixState,
     renderer: &mut RubixRenderer<'a>,
-    elements: &[RubixRenderElement<RubixRenderer<'a>>],
-    sdr_white_nits: f32,
-) -> Result<bool, String> {
-    // Compile once, cache forever (SurfaceData::hdr_shaders -- see its doc
-    // comment for why the cache lives here and not on UdevData).
+    output: &Output,
+    scale: f64,
+) -> Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> {
+    let mut background: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut bottom: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut top: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut overlay: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    {
+        let map = layer_map_for_output(output);
+        for layer in map.layers() {
+            let Some(geo) = map.layer_geometry(layer) else { continue };
+            let loc = geo.loc.to_physical_precise_round(scale);
+            let elems = layer.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
+                renderer,
+                loc,
+                Scale::from(scale),
+                1.0,
+            );
+            match layer.layer() {
+                Layer::Background => background.extend(elems),
+                Layer::Bottom => bottom.extend(elems),
+                Layer::Top => top.extend(elems),
+                Layer::Overlay => overlay.extend(elems),
+            }
+        }
+    }
+
+    let output_geo = state.space.output_geometry(output);
+
+    let mut space_tagged: Vec<(DecodeKind, WaylandSurfaceRenderElement<RubixRenderer<'a>>)> = Vec::new();
+    if let Some(region) = output_geo {
+        for window in state.space.elements().rev() {
+            let Some(bbox) = state.space.element_bbox(window) else { continue };
+            if !region.overlaps(bbox) {
+                continue;
+            }
+            let Some(location) = state.space.element_location(window) else { continue };
+            let render_location: Point<i32, Logical> = location - window.geometry().loc - region.loc;
+            let kind = window
+                .wl_surface()
+                .map(|s| surface_decode_kind(&s))
+                .unwrap_or(DecodeKind::Sdr);
+            let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
+                renderer,
+                render_location.to_physical_precise_round(scale),
+                Scale::from(scale),
+                1.0,
+            );
+            space_tagged.extend(elems.into_iter().map(|e| (kind, e)));
+        }
+    }
+
+    let ghost_windows: Vec<(Window, Pos)> = state
+        .active_ghosts
+        .iter()
+        .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
+        .collect();
+    let mut ghosts: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    for (window, pos) in ghost_windows {
+        ghosts.extend(window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
+            renderer,
+            Point::<i32, Physical>::from((pos.x, pos.y)),
+            Scale::from(1.0),
+            1.0,
+        ));
+    }
+
+    let cursor_elements: Vec<RubixRenderElement<RubixRenderer<'a>>> = match output_geo {
+        Some(geo) if geo.to_f64().contains(state.pointer_location) => {
+            let local = state.pointer_location - geo.loc.to_f64();
+            pointer_render_elements(renderer, &state.cursor_status, local, scale)
+        }
+        _ => Vec::new(),
+    };
+
+    // Same front-to-back order as `render_surface`'s `elements`: cursor,
+    // overlay, top, ghosts, space, bottom, background.
+    let mut tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
+    tagged.extend(cursor_elements.into_iter().map(|e| (DecodeKind::Sdr, e)));
+    tagged.extend(
+        overlay
+            .into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+    );
+    tagged.extend(
+        top.into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+    );
+    tagged.extend(
+        ghosts
+            .into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+    );
+    tagged.extend(space_tagged.into_iter().map(|(k, e)| (k, RubixRenderElement::Surface(e))));
+    tagged.extend(
+        bottom
+            .into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+    );
+    tagged.extend(
+        background
+            .into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+    );
+    tagged
+}
+
+/// Shared HDR resource prep for both the fast (`render_surface_hdr`) and
+/// slow (`render_surface_hdr_zrun`) decode paths: compile the three HDR
+/// shaders once (cached on `SurfaceData::hdr_shaders` forever after) and
+/// (re)allocate the linear 16F offscreen when the output's mode size has
+/// changed (or on first use) -- never per frame either way. Any failure
+/// (compile or bind) returns `Err` and leaves `surface.hdr_offscreen`/
+/// `hdr_shaders` exactly as they were (pre-first-success: stays `None` so
+/// the next frame retries from scratch; failure after caching once: caches
+/// stay warm, this frame's HDR pass is just skipped).
+fn ensure_hdr_resources(
+    surface: &mut SurfaceData,
+    renderer: &mut RubixRenderer<'_>,
+) -> Result<HdrShaders, String> {
     if surface.hdr_shaders.is_none() {
         let gles: &mut GlesRenderer = renderer.as_mut();
         let shaders =
@@ -1195,8 +1410,6 @@ fn render_surface_hdr<'a>(
     }
     let shaders = surface.hdr_shaders.clone().expect("just set above");
 
-    // Allocate/resize the offscreen only when the output's mode size has
-    // changed (or on first use) -- never per frame.
     let mode = surface
         .output
         .current_mode()
@@ -1242,12 +1455,88 @@ fn render_surface_hdr<'a>(
             return Err(format!("HDR offscreen bind failed: {}", bind_errors.join("; ")));
         }
     }
+    Ok(shaders)
+}
+
+/// Shared HDR encode pass for both decode paths: the linear 16F offscreen,
+/// wrapped as a single fullscreen `RubixRenderElement::Texture`, goes through
+/// the SAME `drm_output.render_frame` call the non-HDR path uses, with the
+/// renderer-global override set to the (Phase 1b: now bare-PQ, no uniforms)
+/// encode shader. Fresh `Id` every frame on purpose: the offscreen is fully
+/// re-rendered each frame, so the encode element must report full damage
+/// each frame or `DrmCompositor` leaves stale/black backbuffers (see
+/// `HdrOffscreen`'s doc). `FrameFlags::empty()` forces GL composition so the
+/// encode shader can't be bypassed by direct-scanout promotion (see
+/// `compositor/mod.rs:2880-2911`'s scanout-eligibility check).
+fn encode_pass(surface: &mut SurfaceData, renderer: &mut RubixRenderer<'_>, shaders: &HdrShaders) -> Result<bool, String> {
+    let texture = {
+        let offscreen = surface.hdr_offscreen.as_ref().expect("just ensured above");
+        offscreen.texture.clone()
+    };
+    let gles: &mut GlesRenderer = renderer.as_mut();
+    let context_id = gles.context_id();
+    let texture_element = TextureRenderElement::from_static_texture(
+        Id::new(),
+        context_id,
+        Point::<f64, Physical>::from((0.0, 0.0)),
+        texture,
+        1,
+        Transform::Normal,
+        None,
+        None,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    // Phase 1b: the encode shader dropped `sdr_white_nits` (moved into the
+    // SDR decode) -- no uniforms now.
+    gles.set_default_tex_program_override(Some((shaders.encode.clone(), Vec::new())));
+    let encode_elements = [RubixRenderElement::Texture(texture_element)];
+    let render_result =
+        surface
+            .drm_output
+            .render_frame(gles, &encode_elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::empty());
+    {
+        let gles: &mut GlesRenderer = renderer.as_mut();
+        gles.set_default_tex_program_override(None);
+    }
+    let frame = render_result.map_err(|e| format!("HDR encode render_frame: {e:?}"))?;
+    if frame.is_empty {
+        return Ok(false);
+    }
+    surface
+        .drm_output
+        .queue_frame(None)
+        .map_err(|e| format!("HDR encode queue_frame: {e:?}"))?;
+    Ok(true)
+}
+
+/// HDR Phase 2/1b's fast-path linear-light pipeline for one `hdr = true`
+/// output with no HDR-declared surfaces on it -- the common case (plain
+/// desktop use). Single decode pass over the SAME `elements` `render_surface`
+/// already built, via `OutputDamageTracker::render_output`, with the
+/// renderer-global texture-program override set to `DECODE_SDR` (now
+/// carrying the `sdr_white_nits` uniform -- Phase 1b moved the BT.709-
+/// >BT.2020 + nits scaling out of the encode shader and into this one) and
+/// the solid-color transform set to `sdr_solid_transform(sdr_white_nits)`
+/// (ditto). Both overrides are cleared immediately after the render call,
+/// win or lose. Then the shared [`encode_pass`].
+fn render_surface_hdr<'a>(
+    surface: &mut SurfaceData,
+    renderer: &mut RubixRenderer<'a>,
+    elements: &[RubixRenderElement<RubixRenderer<'a>>],
+    sdr_white_nits: f32,
+) -> Result<bool, String> {
+    let shaders = ensure_hdr_resources(surface, renderer)?;
 
     // --- decode pass: elements -> linear 16F offscreen ----------------------
     {
         let gles: &mut GlesRenderer = renderer.as_mut();
-        gles.set_default_tex_program_override(Some((shaders.decode.clone(), Vec::new())));
-        gles.set_solid_color_transform(Some(Box::new(srgb_to_linear_solid)));
+        gles.set_default_tex_program_override(Some((
+            shaders.decode_sdr.clone(),
+            vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
+        )));
+        gles.set_solid_color_transform(Some(Box::new(sdr_solid_transform(sdr_white_nits))));
     }
     let decode_result: Result<(), String> = (|| {
         let offscreen = surface.hdr_offscreen.as_mut().expect("just ensured above");
@@ -1271,58 +1560,107 @@ fn render_surface_hdr<'a>(
     }
     decode_result?;
 
-    // --- encode pass: linear 16F offscreen -> scanout ------------------------
-    // Fresh `Id` every frame on purpose: the offscreen is fully re-rendered
-    // each frame, so the encode element must report full damage each frame or
-    // `DrmCompositor` leaves stale/black backbuffers (see `HdrOffscreen`'s doc).
-    let texture = {
-        let offscreen = surface.hdr_offscreen.as_ref().expect("just ensured above");
-        offscreen.texture.clone()
-    };
-    let gles: &mut GlesRenderer = renderer.as_mut();
-    let context_id = gles.context_id();
-    let texture_element = TextureRenderElement::from_static_texture(
-        Id::new(),
-        context_id,
-        Point::<f64, Physical>::from((0.0, 0.0)),
-        texture,
-        1,
-        Transform::Normal,
-        None,
-        None,
-        None,
-        None,
-        Kind::Unspecified,
-    );
-    gles.set_default_tex_program_override(Some((
-        shaders.encode.clone(),
-        // Live value threaded from RubixState::sdr_white_nits (via
-        // render_surface's caller), not the SDR_WHITE_NITS const -- that
-        // const now only serves as the serde default / clamp-bounds
-        // reference (see its doc comment in hdr_shaders.rs).
-        vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
-    )));
-    let encode_elements = [RubixRenderElement::Texture(texture_element)];
-    // See the doc comment above for why `FrameFlags::empty()` (not
-    // `FrameFlags::DEFAULT`) is required here: it forces GL composition so
-    // the encode shader cannot be bypassed by direct-scanout promotion.
-    let render_result =
-        surface
-            .drm_output
-            .render_frame(gles, &encode_elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::empty());
+    encode_pass(surface, renderer, &shaders)
+}
+
+/// HDR Phase 1b's slow-path pipeline: used only when [`output_has_hdr_window`]
+/// found at least one HDR-declared surface on this output. Because the
+/// shader override is renderer-global-only (`MultiFrame` doesn't expose the
+/// underlying `GlesFrame` for a per-element override), each surface is
+/// decoded through its own transfer function via **multiple render passes
+/// grouped into maximal contiguous z-runs of equal `DecodeKind`**,
+/// accumulating into the same offscreen:
+///
+/// 1. Partition `tagged_elements` (front-to-back) into runs, then reverse the
+///    run order (and each run's own element order) for back-to-front
+///    painter's-algorithm drawing -- equivalent to reversing the whole
+///    sequence once, just done in two nested steps so each run's `DecodeKind`
+///    stays intact.
+/// 2. Bind the offscreen once; set the SDR solid-color transform (live nits)
+///    once for the whole pass -- solids are never HDR.
+/// 3. For each run, back-to-front: set the renderer-global override to that
+///    run's decode shader (`decode_sdr` + `sdr_white_nits` uniform, or
+///    `decode_hdr_pq` with no uniforms), open a fresh `MultiFrame` via
+///    `renderer.render`, clear to black on the FIRST run only (subsequent
+///    runs must NOT clear, so content accumulates), draw each element with
+///    full per-element damage (the offscreen is redrawn fully every frame --
+///    matches the fresh-`Id` full-damage behavior the encode pass relies on),
+///    then drop the frame to release the renderer borrow before the next
+///    run's override.
+/// 4. Clear the tex override and solid transform after the pass. Then the
+///    shared [`encode_pass`] (structurally unchanged, no uniforms now).
+fn render_surface_hdr_zrun<'a>(
+    surface: &mut SurfaceData,
+    renderer: &mut RubixRenderer<'a>,
+    tagged_elements: &[(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)],
+    sdr_white_nits: f32,
+) -> Result<bool, String> {
+    let shaders = ensure_hdr_resources(surface, renderer)?;
+
+    // Maximal contiguous runs of equal `DecodeKind`, preserving `tagged_elements`'s
+    // front-to-back order; reversed below (run order AND per-run element
+    // order) for back-to-front drawing.
+    let mut runs: Vec<(DecodeKind, Vec<&RubixRenderElement<RubixRenderer<'a>>>)> = Vec::new();
+    for (kind, elem) in tagged_elements {
+        match runs.last_mut() {
+            Some((last_kind, elems)) if *last_kind == *kind => elems.push(elem),
+            _ => runs.push((*kind, vec![elem])),
+        }
+    }
+    runs.reverse();
+
+    {
+        let gles: &mut GlesRenderer = renderer.as_mut();
+        gles.set_solid_color_transform(Some(Box::new(sdr_solid_transform(sdr_white_nits))));
+    }
+    let decode_result: Result<(), String> = (|| {
+        let offscreen = surface.hdr_offscreen.as_mut().expect("just ensured above");
+        let mut fb = renderer
+            .bind(&mut offscreen.texture)
+            .map_err(|e| format!("HDR z-run offscreen bind: {e:?}"))?;
+        let size = Size::<i32, Physical>::from((offscreen.size.w, offscreen.size.h));
+        let full_rect = Rectangle::new(Point::from((0, 0)), size);
+
+        for (i, (kind, elems)) in runs.iter().enumerate() {
+            {
+                let gles: &mut GlesRenderer = renderer.as_mut();
+                let prog = match kind {
+                    DecodeKind::Sdr => (
+                        shaders.decode_sdr.clone(),
+                        vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
+                    ),
+                    DecodeKind::HdrPq => (shaders.decode_hdr_pq.clone(), Vec::new()),
+                };
+                gles.set_default_tex_program_override(Some(prog));
+            }
+            let mut frame = renderer
+                .render(&mut fb, size, Transform::Normal)
+                .map_err(|e| format!("HDR z-run render: {e:?}"))?;
+            if i == 0 {
+                frame
+                    .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full_rect])
+                    .map_err(|e| format!("HDR z-run clear: {e:?}"))?;
+            }
+            for elem in elems.iter().rev() {
+                let dst = elem.geometry(Scale::from(1.0));
+                let src = elem.src();
+                let damage = [Rectangle::new(Point::from((0, 0)), dst.size)];
+                let opaque_regions = elem.opaque_regions(Scale::from(1.0));
+                elem.draw(&mut frame, src, dst, &damage, &opaque_regions, None)
+                    .map_err(|e| format!("HDR z-run draw: {e:?}"))?;
+            }
+            drop(frame);
+        }
+        Ok(())
+    })();
     {
         let gles: &mut GlesRenderer = renderer.as_mut();
         gles.set_default_tex_program_override(None);
+        gles.set_solid_color_transform(None);
     }
-    let frame = render_result.map_err(|e| format!("HDR encode render_frame: {e:?}"))?;
-    if frame.is_empty {
-        return Ok(false);
-    }
-    surface
-        .drm_output
-        .queue_frame(None)
-        .map_err(|e| format!("HDR encode queue_frame: {e:?}"))?;
-    Ok(true)
+    decode_result?;
+
+    encode_pass(surface, renderer, &shaders)
 }
 
 /// VBlank handler: a queued flip completed. Ack it to the `DrmOutput`, then

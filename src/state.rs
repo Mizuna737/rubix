@@ -13,7 +13,7 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
+        calloop::{generic::Generic, EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction},
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
@@ -23,6 +23,7 @@ use smithay::{
     },
     utils::{Logical, Point, Rectangle},
     wayland::{
+        color::management::ColorManagementState,
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
@@ -31,6 +32,7 @@ use smithay::{
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
         xwayland_shell::XWaylandShellState,
     },
     xwayland::X11Wm,
@@ -155,6 +157,7 @@ pub struct RubixState {
     // Display number (e.g. `1` for `:1`), stored for logging/env once XWayland is ready.
     pub xdisplay: Option<u32>,
     pub shm_state: ShmState,
+    pub viewporter_state: ViewporterState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<RubixState>,
     pub data_device_state: DataDeviceState,
@@ -183,15 +186,28 @@ pub struct RubixState {
     // frame `copy` handler (screencopy.rs), drained by each backend's render
     // path via `screencopy::fulfill_pending` right after it presents.
     pub(crate) pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
+
+    // HDR Phase 1b: wp_color_management_v1 state (advertised TFs/primaries,
+    // known image-description identities). See `color_management::init`.
+    pub(crate) color_management_state: ColorManagementState,
+
+    // Loop handle stashed so `ColorManagementHandler::schedule_image_description_info`
+    // can defer `wp_image_description_info_v1`'s events to an idle callback
+    // (required -- see that impl's doc comment). Cloned from `event_loop.handle()`
+    // at construction; calloop's `LoopHandle` is itself a cheap `Rc`-backed clone.
+    pub(crate) loop_handle: LoopHandle<'static, RubixState>,
 }
 
 impl RubixState {
-    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>, config: Config) -> Self {
+    pub fn new(event_loop: &mut EventLoop<'static, Self>, display: Display<Self>, config: Config) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
+        let loop_handle = event_loop.handle();
 
         let compositor_state = CompositorState::new::<Self>(&dh);
+        let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let color_management_state = crate::color_management::init(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
@@ -274,6 +290,7 @@ impl RubixState {
             active_ghosts: Vec::new(),
 
             compositor_state,
+            viewporter_state,
             xdg_shell_state,
             layer_shell_state,
             xwayland_shell_state,
@@ -293,6 +310,9 @@ impl RubixState {
             pointer_location,
             cursor_status: CursorImageStatus::default_named(),
             pending_screencopy: Vec::new(),
+
+            color_management_state,
+            loop_handle,
         }
     }
 
@@ -303,6 +323,26 @@ impl RubixState {
     pub(crate) fn nudge_render(&self) {
         if let Some(udev) = &self.udev_handle {
             crate::udev::nudge_all_renders(udev);
+        }
+    }
+
+    /// Live A/B toggle of HDR on every HDR-capable output; see
+    /// `crate::udev::toggle_hdr`. Notifies bound `wp_color_management_output_v1`
+    /// objects for the toggled outputs afterward, so HDR-aware clients
+    /// (browsers) re-query `description_for_output` and flip HDR detection
+    /// without a page reload. `udev::toggle_hdr` returns the toggled outputs
+    /// rather than us re-borrowing `udev` here -- avoids a second borrow
+    /// alongside `self.color_management_state`.
+    pub(crate) fn toggle_hdr(&mut self) {
+        // Clone the `Rc` (not a borrow of `self`) first so the subsequent
+        // `&mut self.color_management_state` below doesn't conflict with a
+        // live `&self.udev_handle` borrow.
+        let Some(udev) = self.udev_handle.clone() else {
+            return;
+        };
+        let outputs = crate::udev::toggle_hdr(&udev);
+        for output in &outputs {
+            self.color_management_state.output_description_changed(output);
         }
     }
 
