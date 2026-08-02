@@ -48,6 +48,7 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
         if let Some(win) = state.windows.remove(&id) {
             state.space.unmap_elem(&win);
         }
+        state.fullscreen_windows.remove(&id);
         state.apply_layout();
         state.ipc_dirty = true;
     }
@@ -143,7 +144,7 @@ impl XwmHandler for RubixState {
 
         // Tiled: deny the client geometry, tiling owns it. Reply with our
         // current tile rect if we have one yet, else echo the request so the
-        // handshake completes.
+        // handshake completes. Fullscreen windows get the full output bounds.
         let target = window.wl_surface();
         let id = self
             .windows
@@ -151,12 +152,30 @@ impl XwmHandler for RubixState {
             .find(|(_, win)| win.wl_surface().as_deref() == target.as_ref())
             .map(|(id, _)| *id);
 
-        let rect = id.and_then(|id| self.window_rect(id)).map(|rect| {
-            Rectangle::<i32, Logical>::new(
-                (rect.x as i32, rect.y as i32).into(),
-                (rect.width as i32, rect.height as i32).into(),
-            )
-        });
+        let rect = if let Some(id) = id {
+            if self.fullscreen_windows.contains(&id) {
+                // Fullscreen: provide the full output geometry
+                self.workspace
+                    .active_monitor()
+                    .and_then(|m| self.output_bounds_for(m.id))
+                    .map(|bounds| {
+                        Rectangle::<i32, Logical>::new(
+                            (bounds.x as i32, bounds.y as i32).into(),
+                            (bounds.width as i32, bounds.height as i32).into(),
+                        )
+                    })
+            } else {
+                // Tiled: provide the current tile rect
+                self.window_rect(id).map(|rect| {
+                    Rectangle::<i32, Logical>::new(
+                        (rect.x as i32, rect.y as i32).into(),
+                        (rect.width as i32, rect.height as i32).into(),
+                    )
+                })
+            }
+        } else {
+            None
+        };
 
         match rect {
             Some(rect) => {
@@ -205,6 +224,26 @@ impl XwmHandler for RubixState {
 
     fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
         // Rubix owns layout -- no client-driven move.
+    }
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let target = window.wl_surface();
+        if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.wl_surface().as_deref() == target.as_ref()) {
+            let id = *id;
+            self.fullscreen_windows.insert(id);
+            self.apply_layout();
+            self.ipc_dirty = true;
+        }
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let target = window.wl_surface();
+        if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.wl_surface().as_deref() == target.as_ref()) {
+            let id = *id;
+            self.fullscreen_windows.remove(&id);
+            self.apply_layout();
+            self.ipc_dirty = true;
+        }
     }
 }
 

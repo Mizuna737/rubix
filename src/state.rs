@@ -138,6 +138,9 @@ pub struct RubixState {
     // inject a second draw of the wrapping surface. Not Space state.
     pub(crate) active_ghosts: Vec<(u32, Pos)>,
 
+    // Windows currently in fullscreen state (bypass normal tiling).
+    pub(crate) fullscreen_windows: HashSet<u32>,
+
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -262,6 +265,7 @@ impl RubixState {
             animations: HashMap::new(),
             pending_transition: None,
             active_ghosts: Vec::new(),
+            fullscreen_windows: HashSet::new(),
 
             compositor_state,
             xdg_shell_state,
@@ -734,6 +738,34 @@ impl RubixState {
             }
         }
 
+        // Add fullscreen windows to targets with their full output bounds.
+        let fullscreen_ids: Vec<u32> = self.fullscreen_windows.iter().cloned().collect();
+        for id in fullscreen_ids {
+            if let Some(window) = self.windows.get(&id) {
+                // Find which monitor this window is on by checking its current location
+                let output = self
+                    .space
+                    .element_location(window)
+                    .and_then(|loc| self.output_at(loc.to_f64()))
+                    .or_else(|| self.space.outputs().next().cloned());
+
+                if let Some(output) = output {
+                    if let Some(bounds) = self.space.output_geometry(&output) {
+                        let rect = Rect {
+                            x: bounds.loc.x as u32,
+                            y: bounds.loc.y as u32,
+                            width: bounds.size.w as u32,
+                            height: bounds.size.h as u32,
+                        };
+                        // Only add if not already in targets (shouldn't happen, but be safe)
+                        if !targets.iter().any(|(tid, _)| *tid == id) {
+                            targets.push((id, rect));
+                        }
+                    }
+                }
+            }
+        }
+
         match self.pending_transition.take() {
             None => {
                 // SNAP PATH — byte-for-byte today's behavior.
@@ -758,14 +790,25 @@ impl RubixState {
                         continue;
                     };
 
+                    let is_fullscreen = self.fullscreen_windows.contains(&id);
+
                     match window.underlying_surface() {
                         WindowSurface::Wayland(toplevel) => {
                             toplevel.with_pending_state(|state| {
                                 state.size = Some((rect.width as i32, rect.height as i32).into());
-                                state.states.set(xdg_toplevel::State::TiledLeft);
-                                state.states.set(xdg_toplevel::State::TiledRight);
-                                state.states.set(xdg_toplevel::State::TiledTop);
-                                state.states.set(xdg_toplevel::State::TiledBottom);
+                                if is_fullscreen {
+                                    state.states.set(xdg_toplevel::State::Fullscreen);
+                                    state.states.unset(xdg_toplevel::State::TiledLeft);
+                                    state.states.unset(xdg_toplevel::State::TiledRight);
+                                    state.states.unset(xdg_toplevel::State::TiledTop);
+                                    state.states.unset(xdg_toplevel::State::TiledBottom);
+                                } else {
+                                    state.states.set(xdg_toplevel::State::TiledLeft);
+                                    state.states.set(xdg_toplevel::State::TiledRight);
+                                    state.states.set(xdg_toplevel::State::TiledTop);
+                                    state.states.set(xdg_toplevel::State::TiledBottom);
+                                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                                }
                             });
                             toplevel.send_pending_configure();
                         }
@@ -816,14 +859,26 @@ impl RubixState {
                     let Some(window) = self.windows.get(id).cloned() else {
                         continue;
                     };
+
+                    let is_fullscreen = self.fullscreen_windows.contains(id);
+
                     match window.underlying_surface() {
                         WindowSurface::Wayland(toplevel) => {
                             toplevel.with_pending_state(|state| {
                                 state.size = Some((rect.width as i32, rect.height as i32).into());
-                                state.states.set(xdg_toplevel::State::TiledLeft);
-                                state.states.set(xdg_toplevel::State::TiledRight);
-                                state.states.set(xdg_toplevel::State::TiledTop);
-                                state.states.set(xdg_toplevel::State::TiledBottom);
+                                if is_fullscreen {
+                                    state.states.set(xdg_toplevel::State::Fullscreen);
+                                    state.states.unset(xdg_toplevel::State::TiledLeft);
+                                    state.states.unset(xdg_toplevel::State::TiledRight);
+                                    state.states.unset(xdg_toplevel::State::TiledTop);
+                                    state.states.unset(xdg_toplevel::State::TiledBottom);
+                                } else {
+                                    state.states.set(xdg_toplevel::State::TiledLeft);
+                                    state.states.set(xdg_toplevel::State::TiledRight);
+                                    state.states.set(xdg_toplevel::State::TiledTop);
+                                    state.states.set(xdg_toplevel::State::TiledBottom);
+                                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                                }
                             });
                             toplevel.send_pending_configure();
                         }

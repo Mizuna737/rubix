@@ -8,7 +8,7 @@ use smithay::{
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            protocol::{wl_seat, wl_surface::WlSurface},
+            protocol::{wl_seat, wl_output, wl_surface::WlSurface},
             Resource,
         },
     },
@@ -94,6 +94,7 @@ impl XdgShellHandler for RubixState {
                 monitor.remove_window(id);
             }
             self.windows.remove(&id);
+            self.fullscreen_windows.remove(&id);
             self.apply_layout();
             self.ipc_dirty = true;
             tracing::info!(
@@ -189,6 +190,34 @@ impl XdgShellHandler for RubixState {
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
         // TODO popup grabs
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _wl_output: Option<wl_output::WlOutput>) {
+        let wl_surface = surface.wl_surface();
+        if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface)) {
+            let id = *id;
+            self.fullscreen_windows.insert(id);
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            });
+            surface.send_pending_configure();
+            self.apply_layout();
+            self.ipc_dirty = true;
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface)) {
+            let id = *id;
+            self.fullscreen_windows.remove(&id);
+            surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            });
+            surface.send_pending_configure();
+            self.apply_layout();
+            self.ipc_dirty = true;
+        }
     }
 }
 
