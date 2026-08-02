@@ -1149,13 +1149,36 @@ fn render_surface(
     // translated into that output's local space (subtract its geometry origin) --
     // otherwise every output redraws the cursor at the raw global coordinate,
     // producing a phantom cursor per extra monitor.
+    //
+    // When a fullscreen window is present on this output, suppress cursor elements
+    // to stabilize the element list for scanout promotion. This prevents `try_assign_element`
+    // from flapping between scanout and composite modes as the mouse moves in/out,
+    // which causes rapid CRTC blanks (visible flicker). The hardware cursor plane will
+    // handle the cursor independently in this case.
     let output_geo = state.space.output_geometry(&surface.output);
-    let cursor_elements = match output_geo {
-        Some(geo) if geo.to_f64().contains(state.pointer_location) => {
-            let local = state.pointer_location - geo.loc.to_f64();
-            pointer_render_elements(renderer, &state.cursor_status, local, scale)
+    let has_fullscreen_on_output = state.fullscreen_windows.iter().any(|fullscreen_id| {
+        state.windows
+            .get(fullscreen_id)
+            .and_then(|window| state.space.element_location(window))
+            .and_then(|loc| {
+                output_geo.as_ref().map(|geo| {
+                    geo.to_f64().contains((loc.x as f64, loc.y as f64))
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    let cursor_elements = if has_fullscreen_on_output {
+        // Suppress cursor rendering to stabilize element list during exclusive fullscreen.
+        Vec::new()
+    } else {
+        match output_geo {
+            Some(geo) if geo.to_f64().contains(state.pointer_location) => {
+                let local = state.pointer_location - geo.loc.to_f64();
+                pointer_render_elements(renderer, &state.cursor_status, local, scale)
+            }
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
     };
 
     // Cursor prepended -- front of the Vec is topmost, and it must draw above
