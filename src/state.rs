@@ -27,6 +27,8 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
+        relative_pointer::RelativePointerManagerState,
         selection::{data_device::DataDeviceState, wlr_data_control::DataControlState},
         shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
         shell::xdg::XdgShellState,
@@ -150,6 +152,11 @@ pub struct RubixState {
     // Windows currently in fullscreen state (bypass normal tiling).
     pub(crate) fullscreen_windows: HashSet<u32>,
 
+    // Track the last configured geometry and fullscreen state for each window
+    // to avoid redundant configure resends when layout is recomputed but geometry
+    // hasn't changed (prevents flicker during exclusive fullscreen scanout).
+    last_configured: HashMap<u32, (Rect, bool)>,
+
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -174,6 +181,12 @@ pub struct RubixState {
     // (which fires on `RubixState`) can reach `GpuManager::single_renderer` to
     // validate an imported dmabuf. None on winit.
     pub(crate) udev_handle: Option<std::rc::Rc<std::cell::RefCell<crate::udev::UdevData>>>,
+
+    // Pointer constraints: allows clients to lock or confine the pointer.
+    // Used by games for mouselook/aim functionality.
+    pub pointer_constraints_state: PointerConstraintsState,
+    // Relative pointer: allows clients to receive raw pointer deltas when locked.
+    pub relative_pointer_manager_state: RelativePointerManagerState,
 
     pub seat: Seat<Self>,
 
@@ -211,6 +224,8 @@ impl RubixState {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let color_management_state = crate::color_management::init(&dh);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
+        let relative_pointer_manager_state = RelativePointerManagerState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
@@ -292,6 +307,7 @@ impl RubixState {
             pending_transition: None,
             active_ghosts: Vec::new(),
             fullscreen_windows: HashSet::new(),
+            last_configured: HashMap::new(),
 
             compositor_state,
             viewporter_state,
@@ -309,6 +325,8 @@ impl RubixState {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             udev_handle: None,
+            pointer_constraints_state,
+            relative_pointer_manager_state,
             seat,
 
             pointer_location,
@@ -860,34 +878,48 @@ impl RubixState {
 
                     let is_fullscreen = self.fullscreen_windows.contains(&id);
 
-                    match window.underlying_surface() {
-                        WindowSurface::Wayland(toplevel) => {
-                            toplevel.with_pending_state(|state| {
-                                state.size = Some((rect.width as i32, rect.height as i32).into());
-                                if is_fullscreen {
-                                    state.states.set(xdg_toplevel::State::Fullscreen);
-                                    state.states.unset(xdg_toplevel::State::TiledLeft);
-                                    state.states.unset(xdg_toplevel::State::TiledRight);
-                                    state.states.unset(xdg_toplevel::State::TiledTop);
-                                    state.states.unset(xdg_toplevel::State::TiledBottom);
-                                } else {
-                                    state.states.set(xdg_toplevel::State::TiledLeft);
-                                    state.states.set(xdg_toplevel::State::TiledRight);
-                                    state.states.set(xdg_toplevel::State::TiledTop);
-                                    state.states.set(xdg_toplevel::State::TiledBottom);
-                                    state.states.unset(xdg_toplevel::State::Fullscreen);
-                                }
-                            });
-                            toplevel.send_pending_configure();
-                        }
-                        WindowSurface::X11(x11) => {
-                            // X11 configure carries position AND size in one rect.
-                            // map_element below still sets the compositor-side
-                            // location; keep both.
-                            let _ = x11.configure(Some(Rectangle::new(
-                                (rect.x as i32, rect.y as i32).into(),
-                                (rect.width as i32, rect.height as i32).into(),
-                            )));
+                    // Check if geometry or fullscreen state has actually changed since last configure.
+                    // This gates redundant configure resends during reflows of unrelated windows,
+                    // preventing spurious swapchain recreations that cause flicker during exclusive
+                    // fullscreen scanout.
+                    let state_changed = self.last_configured.get(&id)
+                        .map(|(last_rect, last_fullscreen)| {
+                            last_rect != &rect || *last_fullscreen != is_fullscreen
+                        })
+                        .unwrap_or(true);
+
+                    if state_changed {
+                        match window.underlying_surface() {
+                            WindowSurface::Wayland(toplevel) => {
+                                toplevel.with_pending_state(|state| {
+                                    state.size = Some((rect.width as i32, rect.height as i32).into());
+                                    if is_fullscreen {
+                                        state.states.set(xdg_toplevel::State::Fullscreen);
+                                        state.states.unset(xdg_toplevel::State::TiledLeft);
+                                        state.states.unset(xdg_toplevel::State::TiledRight);
+                                        state.states.unset(xdg_toplevel::State::TiledTop);
+                                        state.states.unset(xdg_toplevel::State::TiledBottom);
+                                    } else {
+                                        state.states.set(xdg_toplevel::State::TiledLeft);
+                                        state.states.set(xdg_toplevel::State::TiledRight);
+                                        state.states.set(xdg_toplevel::State::TiledTop);
+                                        state.states.set(xdg_toplevel::State::TiledBottom);
+                                        state.states.unset(xdg_toplevel::State::Fullscreen);
+                                    }
+                                });
+                                toplevel.send_pending_configure();
+                                self.last_configured.insert(id, (rect.clone(), is_fullscreen));
+                            }
+                            WindowSurface::X11(x11) => {
+                                // X11 configure carries position AND size in one rect.
+                                // map_element below still sets the compositor-side
+                                // location; keep both.
+                                let _ = x11.configure(Some(Rectangle::new(
+                                    (rect.x as i32, rect.y as i32).into(),
+                                    (rect.width as i32, rect.height as i32).into(),
+                                )));
+                                self.last_configured.insert(id, (rect.clone(), is_fullscreen));
+                            }
                         }
                     }
 

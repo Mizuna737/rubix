@@ -8,9 +8,10 @@ use smithay::{
             keysyms::{KEY_XF86Switch_VT_1, KEY_XF86Switch_VT_12},
             FilterResult,
         },
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
     },
     utils::SERIAL_COUNTER,
+    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 
 use serde::Deserialize;
@@ -117,28 +118,107 @@ impl RubixState {
             // is clamped per-axis to the geometry of whichever output the
             // pointer is currently in, so the cursor stops at that head's
             // edge where there's no neighbour.
+            //
+            // Pointer constraints (lock/confine): when a client locks the pointer,
+            // motion is still received but the pointer stays visually at the lock
+            // position while the client gets raw relative deltas via relative_pointer.
+            // When confined, motion is clamped to the confine region.
             InputEvent::PointerMotion { event, .. } => {
-                let proposed = self.pointer_location + event.delta();
+                let delta = event.delta();
+                let proposed = self.pointer_location + delta;
 
-                let loc = if self.output_at(proposed).is_some() {
-                    proposed
+                let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
+                let focused_surface = pointer.current_focus();
+
+                // Check for pointer constraints on the focused surface
+                let (loc, send_relative) = if let Some(ref surface) = focused_surface {
+                    with_pointer_constraint(surface, &pointer, |constraint| {
+                        match constraint {
+                            Some(ref constraint_ref) => {
+                                // Pointer is locked or confined
+                                match &**constraint_ref {
+                                    PointerConstraint::Locked(_) => {
+                                        // Locked pointer: position stays frozen, send relative deltas
+                                        // The client expects motion events at the lock position with relative deltas
+                                        (self.pointer_location, true)
+                                    }
+                                    PointerConstraint::Confined(_) => {
+                                        // Confined pointer: clamp to confinement region
+                                        // For now, we'll just clamp to output as before
+                                        // (full region support would require checking constraint.region())
+                                        let current_output = self
+                                            .output_at(self.pointer_location)
+                                            .or_else(|| self.space.outputs().next().cloned());
+                                        let Some(current_output) = current_output else { return (self.pointer_location, false); };
+                                        let Some(output_geo) = self.space.output_geometry(&current_output) else { return (self.pointer_location, false); };
+
+                                        let mut clamped = proposed;
+                                        clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
+                                        clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
+                                        (clamped, false)
+                                    }
+                                }
+                            }
+                            None => {
+                                // No constraint: normal clamping behavior
+                                let loc = if self.output_at(proposed).is_some() {
+                                    proposed
+                                } else {
+                                    let current_output = self
+                                        .output_at(self.pointer_location)
+                                        .or_else(|| self.space.outputs().next().cloned());
+                                    let Some(current_output) = current_output else { return (self.pointer_location, false); };
+                                    let Some(output_geo) = self.space.output_geometry(&current_output) else { return (self.pointer_location, false); };
+
+                                    let mut clamped = proposed;
+                                    clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
+                                    clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
+                                    clamped
+                                };
+                                (loc, false)
+                            }
+                        }
+                    })
                 } else {
-                    let current_output = self
-                        .output_at(self.pointer_location)
-                        .or_else(|| self.space.outputs().next().cloned());
-                    let Some(current_output) = current_output else { return; };
-                    let Some(output_geo) = self.space.output_geometry(&current_output) else { return; };
+                    // No focused surface: normal clamping
+                    let loc = if self.output_at(proposed).is_some() {
+                        proposed
+                    } else {
+                        let current_output = self
+                            .output_at(self.pointer_location)
+                            .or_else(|| self.space.outputs().next().cloned());
+                        let Some(current_output) = current_output else { return; };
+                        let Some(output_geo) = self.space.output_geometry(&current_output) else { return; };
 
-                    let mut clamped = proposed;
-                    clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
-                    clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
-                    clamped
+                        let mut clamped = proposed;
+                        clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
+                        clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
+                        clamped
+                    };
+                    (loc, false)
                 };
+
                 self.pointer_location = loc;
 
                 let serial = SERIAL_COUNTER.next_serial();
-                let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
                 let under = self.surface_under(loc);
+
+                // If pointer is locked, send relative motion event
+                if send_relative {
+                    if let Some(ref surface) = focused_surface {
+                        pointer.relative_motion(
+                            self,
+                            Some((surface.clone(), loc)),
+                            &RelativeMotionEvent {
+                                delta,
+                                delta_unaccel: delta,
+                                utime: event.time_msec() as u64 * 1_000_000, // Convert ms to us
+                            },
+                        );
+                    }
+                }
+
+                // Always send motion event (even for locked pointers, to maintain protocol compliance)
                 pointer.motion(
                     self,
                     under,

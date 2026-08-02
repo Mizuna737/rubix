@@ -1,6 +1,7 @@
 mod compositor;
 mod dmabuf;
 mod layer_shell;
+mod pointer_constraints;
 mod xdg_shell;
 pub mod xwayland;
 
