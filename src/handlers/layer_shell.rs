@@ -1,5 +1,4 @@
 use smithay::{
-    delegate_layer_shell,
     desktop::{layer_map_for_output, LayerSurface, Space, Window, WindowSurfaceType},
     output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -142,7 +141,8 @@ impl RubixState {
     }
 }
 
-delegate_layer_shell!(RubixState);
+// See handlers/mod.rs for the single `delegate_dispatch2!(RubixState)` call
+// that now covers this (and every other) protocol.
 
 /// Should be called on `WlSurface::commit`, mirroring `xdg_shell::handle_commit`.
 /// Phase 1: `arrange()` always runs (it positions AND sizes the surface -- an

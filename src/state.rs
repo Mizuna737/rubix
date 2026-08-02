@@ -13,7 +13,7 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
+        calloop::{generic::Generic, EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction},
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
@@ -23,6 +23,7 @@ use smithay::{
     },
     utils::{Logical, Point, Rectangle},
     wayland::{
+        color::management::ColorManagementState,
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
@@ -31,6 +32,7 @@ use smithay::{
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
         xwayland_shell::XWaylandShellState,
     },
     xwayland::X11Wm,
@@ -42,7 +44,6 @@ use crate::{
         geometry::Rect,
         grid::Workspace,
     },
-    CalloopData,
 };
 
 // Stashed in an Output's user-data map at bind time (`bind_output_monitor`) so
@@ -103,6 +104,14 @@ pub struct RubixState {
     // User configuration (keybinds + layout), resolved at startup.
     pub config: Config,
 
+    // Live SDR-white-nits value the HDR encode pass reads each frame
+    // (render_surface_hdr, threaded through render_surface). Seeded from
+    // `config.sdr_white_nits` in `new` and re-seeded in `reload_config`, but
+    // also adjustable independently at runtime via the IncreaseSdrWhite /
+    // DecreaseSdrWhite keybinds (input.rs dispatch_nav) without touching the
+    // config struct. Always in [80, 300].
+    pub sdr_white_nits: f32,
+
     // Rubix model + translation registry.
     // `workspace` is the pure tiling model, one Monitor per bound output;
     // `windows` maps its synthetic u32 ids to live Smithay handles; `next_id`
@@ -151,6 +160,7 @@ pub struct RubixState {
     // Display number (e.g. `1` for `:1`), stored for logging/env once XWayland is ready.
     pub xdisplay: Option<u32>,
     pub shm_state: ShmState,
+    pub viewporter_state: ViewporterState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<RubixState>,
     pub data_device_state: DataDeviceState,
@@ -179,15 +189,28 @@ pub struct RubixState {
     // frame `copy` handler (screencopy.rs), drained by each backend's render
     // path via `screencopy::fulfill_pending` right after it presents.
     pub(crate) pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
+
+    // HDR Phase 1b: wp_color_management_v1 state (advertised TFs/primaries,
+    // known image-description identities). See `color_management::init`.
+    pub(crate) color_management_state: ColorManagementState,
+
+    // Loop handle stashed so `ColorManagementHandler::schedule_image_description_info`
+    // can defer `wp_image_description_info_v1`'s events to an idle callback
+    // (required -- see that impl's doc comment). Cloned from `event_loop.handle()`
+    // at construction; calloop's `LoopHandle` is itself a cheap `Rc`-backed clone.
+    pub(crate) loop_handle: LoopHandle<'static, RubixState>,
 }
 
 impl RubixState {
-    pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>, config: Config) -> Self {
+    pub fn new(event_loop: &mut EventLoop<'static, Self>, display: Display<Self>, config: Config) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
+        let loop_handle = event_loop.handle();
 
         let compositor_state = CompositorState::new::<Self>(&dh);
+        let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let color_management_state = crate::color_management::init(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
@@ -245,6 +268,8 @@ impl RubixState {
         // an Output into `space` (see udev.rs/winit.rs). Empty at construction.
         let workspace = Workspace::new();
 
+        let sdr_white_nits = config.sdr_white_nits.clamp(80.0, 300.0);
+
         Self {
             start_time,
             display_handle: dh,
@@ -255,6 +280,7 @@ impl RubixState {
             socket_name,
 
             config,
+            sdr_white_nits,
 
             workspace,
             windows: HashMap::new(),
@@ -268,6 +294,7 @@ impl RubixState {
             fullscreen_windows: HashSet::new(),
 
             compositor_state,
+            viewporter_state,
             xdg_shell_state,
             layer_shell_state,
             xwayland_shell_state,
@@ -287,6 +314,9 @@ impl RubixState {
             pointer_location,
             cursor_status: CursorImageStatus::default_named(),
             pending_screencopy: Vec::new(),
+
+            color_management_state,
+            loop_handle,
         }
     }
 
@@ -300,9 +330,29 @@ impl RubixState {
         }
     }
 
+    /// Live A/B toggle of HDR on every HDR-capable output; see
+    /// `crate::udev::toggle_hdr`. Notifies bound `wp_color_management_output_v1`
+    /// objects for the toggled outputs afterward, so HDR-aware clients
+    /// (browsers) re-query `description_for_output` and flip HDR detection
+    /// without a page reload. `udev::toggle_hdr` returns the toggled outputs
+    /// rather than us re-borrowing `udev` here -- avoids a second borrow
+    /// alongside `self.color_management_state`.
+    pub(crate) fn toggle_hdr(&mut self) {
+        // Clone the `Rc` (not a borrow of `self`) first so the subsequent
+        // `&mut self.color_management_state` below doesn't conflict with a
+        // live `&self.udev_handle` borrow.
+        let Some(udev) = self.udev_handle.clone() else {
+            return;
+        };
+        let outputs = crate::udev::toggle_hdr(&udev);
+        for output in &outputs {
+            self.color_management_state.output_description_changed(output);
+        }
+    }
+
     fn init_wayland_listener(
         display: Display<RubixState>,
-        event_loop: &mut EventLoop<CalloopData>,
+        event_loop: &mut EventLoop<RubixState>,
     ) -> OsString {
         // Creates a new listening socket, automatically choosing the next available `wayland` socket name.
         let listening_socket = ListeningSocketSource::new_auto().unwrap();
@@ -332,7 +382,7 @@ impl RubixState {
                 |_, display, state| {
                     // Safety: we don't drop the display
                     unsafe {
-                        display.get_mut().dispatch_clients(&mut state.state).unwrap();
+                        display.get_mut().dispatch_clients(state).unwrap();
                     }
                     Ok(PostAction::Continue)
                 },
@@ -443,7 +493,17 @@ impl RubixState {
             });
         self.workspace.ensure_monitor(id, self.config.visible_columns);
         output.user_data().insert_if_missing(|| MonitorId(id));
-        if self.workspace.active_monitor().is_none() {
+        // The configured primary output claims active focus even if another head
+        // bound first (connectors can enumerate in any order); otherwise the first
+        // output to bind seeds it.
+        let is_primary = self
+            .config
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.primary)
+            .unwrap_or(false);
+        if is_primary || self.workspace.active_monitor().is_none() {
             self.workspace.set_active_monitor(id);
         }
     }
@@ -475,7 +535,15 @@ impl RubixState {
         self.config.outer_gap = new.outer_gap;
         self.config.inner_gap = new.inner_gap;
         self.config.outputs = new.outputs;
+        self.config.sdr_white_nits = new.sdr_white_nits;
+        // Re-seed the live runtime value too (already clamped by resolve()),
+        // so a plain config-file edit takes effect immediately without
+        // needing a keybind nudge -- matches the gaps' live-swap behavior.
+        self.sdr_white_nits = self.config.sdr_white_nits;
         tracing::info!("reloaded config: {count} keybinds active");
+        // Force a repaint so an sdr_white_nits edit is visible immediately,
+        // same reasoning as the keybind path in dispatch_nav below.
+        self.nudge_render();
     }
 
     /// Mint the next synthetic window id. Monotonic, never reused within a run.

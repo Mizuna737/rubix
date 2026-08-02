@@ -6,7 +6,6 @@ use crate::{
 };
 use smithay::{
     backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
-    delegate_compositor, delegate_shm,
     reexports::wayland_server::{
         protocol::{wl_buffer, wl_surface::WlSurface},
         Client,
@@ -126,5 +125,7 @@ impl ShmHandler for RubixState {
     }
 }
 
-delegate_compositor!(RubixState);
-delegate_shm!(RubixState);
+// `delegate_compositor!`/`delegate_shm!` (and every other per-protocol
+// `delegate_*!` macro) were removed by the HDR fork's dispatch2 rework; all
+// protocols now go through a single `delegate_dispatch2!(RubixState)` call
+// in `handlers/mod.rs`.

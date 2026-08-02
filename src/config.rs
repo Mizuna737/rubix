@@ -32,6 +32,13 @@ pub struct Config {
     /// Empty when the user config omits the section (or has no entries) --
     /// the udev backend falls back to auto left-to-right layout in that case.
     pub outputs: Vec<OutputConfig>,
+    /// SDR white luminance (nits) fed to the HDR encode shader's
+    /// `sdr_white_nits` uniform for `hdr = true` outputs. Live/hot-reloadable;
+    /// also adjustable at runtime via the IncreaseSdrWhite/DecreaseSdrWhite
+    /// keybinds (see RubixState::sdr_white_nits, the actual live value the
+    /// render path reads -- this field only seeds/reseeds it). Always in
+    /// [80, 300], clamped here at resolve time.
+    pub sdr_white_nits: f32,
 }
 
 /// Resolved placement for one physical output, matched by connector name
@@ -84,6 +91,14 @@ struct RawConfig {
     layout: RawLayout,
     #[serde(default)]
     animation: RawAnimation,
+    // Top-level scalar (must sit before the first [table] header in the TOML
+    // file -- see config/default.toml). Live/hot-reloadable: HDR Phase 4's
+    // SDR-white-nits slider, adjustable via keybind (IncreaseSdrWhite /
+    // DecreaseSdrWhite) or by editing this value and saving. Default mirrors
+    // hdr_shaders::SDR_WHITE_NITS (BT.2408 reference SDR white); resolved
+    // value is clamped to [80, 300] in `Config::resolve`.
+    #[serde(default = "default_sdr_white_nits")]
+    sdr_white_nits: f32,
     keybinds: HashMap<String, NavAction>,
     // Optional: a config omitting `startup` parses fine (empty list = run nothing).
     #[serde(default)]
@@ -148,6 +163,10 @@ fn default_inner_gap() -> u32 {
     10
 }
 
+fn default_sdr_white_nits() -> f32 {
+    crate::hdr_shaders::SDR_WHITE_NITS
+}
+
 impl Config {
     /// Load and resolve the config: user file if present and valid, else the
     /// built-in default. Never panics on a missing or malformed user file.
@@ -194,6 +213,7 @@ impl Config {
             animation_duration: Duration::from_millis(raw.animation.duration_ms),
             startup: raw.startup,
             outputs,
+            sdr_white_nits: raw.sdr_white_nits.clamp(80.0, 300.0),
         }
     }
 

@@ -17,15 +17,12 @@ use smithay::{
 };
 
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
-use crate::{CalloopData, RubixState};
+use crate::RubixState;
 
 pub fn init_winit(
-    event_loop: &mut EventLoop<CalloopData>,
-    data: &mut CalloopData,
+    event_loop: &mut EventLoop<RubixState>,
+    data: &mut RubixState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let display_handle = &mut data.display_handle;
-    let state = &mut data.state;
-
     let (mut backend, winit) = winit::init()?;
 
     // TODO(winit dmabuf): winit never creates the zwp_linux_dmabuf_v1 global
@@ -45,14 +42,15 @@ pub fn init_winit(
             subpixel: Subpixel::Unknown,
             make: "Smithay".into(),
             model: "Winit".into(),
+            serial_number: "Unknown".into(),
         },
     );
-    let _global = output.create_global::<RubixState>(display_handle);
+    let _global = output.create_global::<RubixState>(&data.display_handle);
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
 
-    state.space.map_output(&output, (0, 0));
-    state.bind_output_monitor(&output);
+    data.space.map_output(&output, (0, 0));
+    data.bind_output_monitor(&output);
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
@@ -62,14 +60,11 @@ pub fn init_winit(
     // from other threads would be UB. We set this once at startup, before any
     // client threads exist, so there is no concurrent access.
     unsafe {
-        std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);
+        std::env::set_var("WAYLAND_DISPLAY", &data.socket_name);
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
     }
 
     event_loop.handle().insert_source(winit, move |event, _, data| {
-        let display = &mut data.display_handle;
-        let state = &mut data.state;
-
         match event {
             WinitEvent::Resized { size, .. } => {
                 output.change_current_state(
@@ -82,12 +77,12 @@ pub fn init_winit(
                     None,
                 );
             }
-            WinitEvent::Input(event) => state.process_input_event(event),
+            WinitEvent::Input(event) => data.process_input_event(event),
             WinitEvent::Redraw => {
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
 
-                state.step_animations();
+                data.step_animations();
 
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
@@ -133,10 +128,10 @@ pub fn init_winit(
                     // double-render every layer surface if combined with the
                     // pass above. `render_elements_for_region` gives the space's
                     // own contribution alone.
-                    let space_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+                    let space_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = data
                         .space
                         .output_geometry(&output)
-                        .map(|geo| state.space.render_elements_for_region(renderer, &geo, scale, 1.0))
+                        .map(|geo| data.space.render_elements_for_region(renderer, &geo, scale, 1.0))
                         .unwrap_or_default();
 
                     // Ghost elements for any in-flight rotation wrap, built from
@@ -147,10 +142,10 @@ pub fn init_winit(
                     // logical point instead. Rendered between top/overlay and
                     // the space so ghosts stay above tiled windows but below
                     // chrome-style layer surfaces.
-                    let ghost_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+                    let ghost_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = data
                         .active_ghosts
                         .iter()
-                        .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
+                        .filter_map(|(id, pos)| data.windows.get(id).map(|w| (w.clone(), *pos)))
                         .flat_map(|(w, pos)| {
                             w.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
                                 renderer,
@@ -167,8 +162,8 @@ pub fn init_winit(
                     // borrow is released before `damage_tracker.render_output`.
                     let cursor_elements = pointer_render_elements(
                         renderer,
-                        &state.cursor_status,
-                        state.pointer_location,
+                        &data.cursor_status,
+                        data.pointer_location,
                         scale,
                     );
 
@@ -197,15 +192,15 @@ pub fn init_winit(
                 // borrow ended with the render block); fulfill re-renders the
                 // output into its own offscreen buffer, so the winit surface we
                 // just submitted is untouched.
-                if !state.pending_screencopy.is_empty() {
+                if !data.pending_screencopy.is_empty() {
                     let (renderer, _fb) = backend.bind().unwrap();
-                    crate::screencopy::fulfill_pending(state, renderer, &output);
+                    crate::screencopy::fulfill_pending(data, renderer, &output);
                 }
 
-                state.space.elements().for_each(|window| {
+                data.space.elements().for_each(|window| {
                     window.send_frame(
                         &output,
-                        state.start_time.elapsed(),
+                        data.start_time.elapsed(),
                         Some(Duration::ZERO),
                         |_, _| Some(output.clone()),
                     )
@@ -217,22 +212,22 @@ pub fn init_winit(
                     for layer in map.layers() {
                         layer.send_frame(
                             &output,
-                            state.start_time.elapsed(),
+                            data.start_time.elapsed(),
                             Some(Duration::ZERO),
                             |_, _| Some(output.clone()),
                         );
                     }
                 }
 
-                state.space.refresh();
-                state.popups.cleanup();
-                let _ = display.flush_clients();
+                data.space.refresh();
+                data.popups.cleanup();
+                let _ = data.display_handle.flush_clients();
 
                 // Ask for redraw to schedule new frame.
                 backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
-                state.loop_signal.stop();
+                data.loop_signal.stop();
             }
             _ => (),
         };

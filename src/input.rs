@@ -42,7 +42,15 @@ pub(crate) enum NavAction {
     MoveFocusedWindowDown,
     MoveFocusedWindowLeft,
     MoveFocusedWindowRight,
+    IncreaseSdrWhite,
+    DecreaseSdrWhite,
+    ToggleHdr,
 }
+
+/// Per-press adjustment for the IncreaseSdrWhite/DecreaseSdrWhite chords, in
+/// nits. Tunable; the resolved value is always clamped to [80, 300] (mirrors
+/// hdr_shaders::SDR_WHITE_NITS's doc comment and Config::resolve's clamp).
+const SDR_WHITE_STEP: f32 = 10.0;
 
 /// The outcome of the keyboard filter: either a config-bound navigation action,
 /// or a VT switch. VT switching is a backend/session concern (only the udev
@@ -352,6 +360,23 @@ impl RubixState {
             NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),
             NavAction::MoveFocusedWindowLeft => self.move_focused_window_by_direction(Direction::Left),
             NavAction::MoveFocusedWindowRight => self.move_focused_window_by_direction(Direction::Right),
+            NavAction::IncreaseSdrWhite => {
+                self.sdr_white_nits = (self.sdr_white_nits + SDR_WHITE_STEP).clamp(80.0, 300.0);
+                // apply_layout below doesn't touch geometry for this action, so
+                // the udev backend (which renders on demand) would otherwise
+                // stay on the last-painted frame until something else dirties
+                // the screen -- force one now, same as screencopy's nudge.
+                self.nudge_render();
+            },
+            NavAction::DecreaseSdrWhite => {
+                self.sdr_white_nits = (self.sdr_white_nits - SDR_WHITE_STEP).clamp(80.0, 300.0);
+                self.nudge_render();
+            },
+            NavAction::ToggleHdr => {
+                // toggle_hdr does its own render scheduling; don't also fall
+                // through to apply_layout for geometry it doesn't need.
+                self.toggle_hdr();
+            },
         }
         self.apply_layout();
         if refocus {

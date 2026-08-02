@@ -2,11 +2,13 @@
 
 mod handlers;
 
+mod color_management;
 mod config;
 mod cursor;
 mod focus;
 mod grabs;
 mod hdr;
+mod hdr_shaders;
 mod input;
 mod ipc;
 mod model;
@@ -23,11 +25,6 @@ use smithay::reexports::{
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
 use std::process::Stdio;
 pub use state::RubixState;
-
-pub struct CalloopData {
-    state: RubixState,
-    display_handle: DisplayHandle,
-}
 
 /// Which rendering/input backend to drive.
 enum Backend {
@@ -61,7 +58,7 @@ fn detect_backend() -> Backend {
 /// (no config dir, watcher creation, or registering the watch) logs and leaves
 /// the compositor running with its startup binds -- hot-reload is a convenience,
 /// never a hard dependency.
-fn init_config_watch(event_loop: &EventLoop<CalloopData>) {
+fn init_config_watch(event_loop: &EventLoop<RubixState>) {
     use calloop_notify::notify::{RecursiveMode, Watcher};
     use calloop_notify::NotifySource;
 
@@ -88,7 +85,7 @@ fn init_config_watch(event_loop: &EventLoop<CalloopData>) {
         // the ground truth for tuning `should_reload` (run with RUST_LOG=rubix=debug).
         tracing::debug!("fs event: {event:?}");
         if crate::config::should_reload(&event, &file_name) {
-            data.state.reload_config();
+            data.reload_config();
         }
     });
 
@@ -102,11 +99,12 @@ fn init_config_watch(event_loop: &EventLoop<CalloopData>) {
 /// Best-effort: any failure to spawn just logs and leaves X11 app support
 /// off for this run -- XWayland is a convenience layer, never a hard
 /// dependency for the wayland-native compositor to start.
-fn init_xwayland(event_loop: &EventLoop<'static, CalloopData>, display_handle: &DisplayHandle) {
+fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &DisplayHandle) {
     let (xwayland, xclient) = match XWayland::spawn(
         display_handle,
         None,
         std::iter::empty::<(String, String)>(),
+        std::iter::empty::<String>(),
         true,
         Stdio::null(),
         Stdio::null(),
@@ -120,17 +118,18 @@ fn init_xwayland(event_loop: &EventLoop<'static, CalloopData>, display_handle: &
     };
 
     let loop_handle = event_loop.handle();
+    let display_handle = display_handle.clone();
     let registered = event_loop.handle().insert_source(xwayland, move |event, _, data| match event {
         XWaylandEvent::Ready { x11_socket, display_number } => {
-            match X11Wm::start_wm(loop_handle.clone(), x11_socket, xclient.clone()) {
+            match X11Wm::start_wm(loop_handle.clone(), &display_handle, x11_socket, xclient.clone()) {
                 Ok(wm) => {
-                    data.state.xwm = Some(wm);
+                    data.xwm = Some(wm);
                     // Stored, not exported: `Ready` fires mid-event-loop with the
                     // libinput/render threads alive, so a global set_var here would
                     // be UB (edition 2024 marks it unsafe for exactly that reason).
                     // Spawned clients get DISPLAY set explicitly from xdisplay at
                     // spawn time (see NavAction::Spawn in input.rs).
-                    data.state.xdisplay = Some(display_number);
+                    data.xdisplay = Some(display_number);
                     tracing::info!("XWayland ready on :{display_number}");
 
                     // Fire configured startup commands once, now that the
@@ -138,7 +137,7 @@ fn init_xwayland(event_loop: &EventLoop<'static, CalloopData>, display_handle: &
                     // (children inherit WAYLAND_DISPLAY) and XWayland is ready
                     // (DISPLAY set explicitly, as in NavAction::Spawn). `Ready`
                     // is a one-shot event, so this runs exactly once.
-                    for command in &data.state.config.startup {
+                    for command in &data.config.startup {
                         let mut cmd = std::process::Command::new("sh");
                         cmd.arg("-c").arg(command);
                         cmd.env("DISPLAY", format!(":{display_number}"));
@@ -195,17 +194,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let mut event_loop: EventLoop<RubixState> = EventLoop::try_new()?;
 
     let display: Display<RubixState> = Display::new()?;
-    let display_handle = display.handle();
     let config = crate::config::Config::load();
-    let state = RubixState::new(&mut event_loop, display, config);
-
-    let mut data = CalloopData {
-        state,
-        display_handle,
-    };
+    let mut data = RubixState::new(&mut event_loop, display, config);
 
     match detect_backend() {
         Backend::Winit => {
@@ -224,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     crate::screencopy::init(&data.display_handle);
 
-    let ipc_clients = crate::ipc::init_ipc(&event_loop, data.state.xdisplay);
+    let ipc_clients = crate::ipc::init_ipc(&event_loop, data.xdisplay);
 
     crate::portal::init_portal(&event_loop);
 
@@ -246,12 +239,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // got away with flushing only in its Redraw handler; the udev render loop
     // doesn't, so this backend-neutral flush is what lets clients start at all).
     event_loop.run(None, &mut data, move |data| {
-        data.state.space.refresh();
-        data.state.popups.cleanup();
+        data.space.refresh();
+        data.popups.cleanup();
         let _ = data.display_handle.flush_clients();
-        if std::mem::take(&mut data.state.ipc_dirty) {
+        if std::mem::take(&mut data.ipc_dirty) {
             if let Some(clients) = &ipc_clients {
-                crate::ipc::broadcast_snapshot(&data.state, clients);
+                crate::ipc::broadcast_snapshot(data, clients);
             }
         }
     })?;

@@ -41,3 +41,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xcursor = "0.3"
 zbus = "5"
+
+# HDR Phase 1a: pin the dividebysandwich/smithay fork, which adds connector
+# color-state support (Colorspace/HDR metadata/max_bpc commit) not yet upstream.
+# smithay and smithay-drm-extras are one workspace in the fork and must move
+# together. The fork still reports version 0.7.0, so this patch is accepted
+# against the "0.7"/"0.1" version requirements above.
+[patch.crates-io]
+smithay = { git = "https://github.com/dividebysandwich/smithay", rev = "57c805c8e6d0b34601b07d89053b376905008d8a" }
+smithay-drm-extras = { git = "https://github.com/dividebysandwich/smithay", rev = "57c805c8e6d0b34601b07d89053b376905008d8a" }
