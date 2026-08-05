@@ -68,9 +68,25 @@ impl XwmHandler for RubixState {
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_mapped(true);
+        // Read before the surface is moved into `Window::new_x11_window` below:
+        // EWMH clients that want to start fullscreen set `_NET_WM_STATE` before
+        // `XMapWindow`, and the pinned smithay fork already folds that into
+        // `net_state` ahead of dispatching here, so `is_fullscreen()` is accurate
+        // at this point. The post-map `_NET_WM_STATE` ClientMessage path
+        // (`fullscreen_request`) never fires for this case.
+        let starts_fullscreen = window.is_fullscreen();
+        let class = window.class();
+        let title = window.title();
         let win = Window::new_x11_window(window);
         let id = self.next_window_id();
         self.windows.insert(id, win);
+
+        if starts_fullscreen {
+            self.fullscreen_windows.insert(id);
+            tracing::info!(
+                "X11 window {id} maps already fullscreen (pre-map _NET_WM_STATE): class={class:?} title={title:?}"
+            );
+        }
 
         // Mirror `xdg_shell::new_toplevel`: split the currently-focused window.
         let focused_id = self.focused_window_id();

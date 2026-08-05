@@ -73,6 +73,12 @@ impl XdgShellHandler for RubixState {
             .map(|(id, _)| *id);
         if let Some(id) = unmapped_id {
             self.unmapped.remove(&id);
+            // A toplevel can request fullscreen (Deliverable 2) before its
+            // first commit; if it dies before mapping, the id must not linger
+            // in fullscreen_windows -- apply_layout's raise loop and the
+            // scanout target iterate it regardless of whether the id is
+            // actually a live, tracked window.
+            self.fullscreen_windows.remove(&id);
             return;
         }
 
@@ -202,6 +208,34 @@ impl XdgShellHandler for RubixState {
             surface.send_pending_configure();
             self.apply_layout();
             self.ipc_dirty = true;
+            return;
+        }
+
+        // Not mapped yet: the client called set_fullscreen before its first
+        // commit -- the normal way a game starts fullscreen. Stage the
+        // fullscreen state now so it is live by the time `handle_commit`
+        // promotes the id into `self.windows`; do NOT call `apply_layout()`
+        // here, the window isn't in the model yet and the promotion path
+        // already calls it.
+        if let Some((id, _)) = self
+            .unmapped
+            .iter()
+            .find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+        {
+            let id = *id;
+            self.fullscreen_windows.insert(id);
+            let bounds = self
+                .workspace
+                .active_monitor()
+                .and_then(|m| self.output_bounds_for(m.id));
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                if let Some(bounds) = bounds {
+                    state.size = Some((bounds.width as i32, bounds.height as i32).into());
+                }
+            });
+            surface.send_pending_configure();
+            tracing::info!("pre-map fullscreen request captured -> window {id}");
         }
     }
 
@@ -216,6 +250,20 @@ impl XdgShellHandler for RubixState {
             surface.send_pending_configure();
             self.apply_layout();
             self.ipc_dirty = true;
+            return;
+        }
+
+        if let Some((id, _)) = self
+            .unmapped
+            .iter()
+            .find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+        {
+            let id = *id;
+            self.fullscreen_windows.remove(&id);
+            surface.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            });
+            surface.send_pending_configure();
         }
     }
 }

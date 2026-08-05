@@ -843,8 +843,12 @@ impl RubixState {
                             width: bounds.size.w as u32,
                             height: bounds.size.h as u32,
                         };
-                        // Only add if not already in targets (shouldn't happen, but be safe)
-                        if !targets.iter().any(|(tid, _)| *tid == id) {
+                        // Override the tiled target with the full-output rect: a
+                        // fullscreen window stays in the grid model, so compute_layout
+                        // already produced a tiled entry for it above that must not win.
+                        if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
+                            entry.1 = rect;
+                        } else {
                             targets.push((id, rect));
                         }
                     }
@@ -1011,6 +1015,15 @@ impl RubixState {
                     }
                 }
                 self.animations = plan;
+            }
+        }
+
+        // A fullscreen window must be topmost in the Space stack or a tiled
+        // window rendered above it kills primary-plane promotion. Raise after
+        // both the SNAP and ANIMATE paths have finished mapping.
+        for id in self.fullscreen_windows.iter().copied().collect::<Vec<_>>() {
+            if let Some(window) = self.windows.get(&id).cloned() {
+                self.space.raise_element(&window, false);
             }
         }
     }

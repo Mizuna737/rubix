@@ -39,14 +39,15 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
-use smithay::backend::drm::compositor::FrameFlags;
+use smithay::backend::drm::compositor::{FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::{
     Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode,
-    NodeType,
+    DrmSurface, NodeType,
 };
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::egl::context::ContextPriority;
@@ -55,21 +56,26 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::damage::{Error as OutputDamageTrackerError, OutputDamageTracker};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
-use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
+use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
+use smithay::backend::renderer::element::{
+    AsRenderElements, Element, Id, Kind, RenderElement, default_primary_scanout_output_compare,
+};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiRenderer};
-use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, Frame, ImportDma, Offscreen, Renderer};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
 use smithay::backend::SwapBuffersError;
 use smithay::desktop::space::SpaceRenderElements;
-use smithay::desktop::utils::OutputPresentationFeedback;
+use smithay::desktop::utils::{
+    surface_primary_scanout_output, update_surface_primary_scanout_output, OutputPresentationFeedback,
+};
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::shell::wlr_layer::Layer;
-use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
@@ -77,6 +83,7 @@ use smithay::reexports::drm::control::{connector, crtc, ModeTypeFlags};
 use smithay::reexports::drm::Device as BaseDrmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::utils::{
     Buffer as BufferCoord, DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
@@ -221,6 +228,96 @@ pub(crate) struct SurfaceData {
     /// output's current mode. Re-created only when the mode size changes
     /// (`render_surface_hdr`'s resize check) -- never per frame.
     hdr_offscreen: Option<HdrOffscreen>,
+    /// Connector color state currently staged on this output. `render_surface`
+    /// is the sole owner: it computes the desired mode each frame and only
+    /// touches DRM on a transition, so nothing else may call
+    /// `set_hdr_output_properties` / `set_sdr_output_properties` directly.
+    /// `None` at bringup so the first frame always applies.
+    applied_connector_hdr: Option<bool>,
+    /// Whether the previous frame's primary-plane scanout attempt promoted
+    /// (direct scanout) or fell back to composite. Tracked so the
+    /// direct-scanout diagnostic in `render_surface` logs only on change.
+    last_scanout_promoted: Option<bool>,
+    /// The two dmabuf feedback objects clients on this output should pick
+    /// between (see `select_dmabuf_feedback`): `render_feedback` names only
+    /// the primary GPU's render-optimal formats/modifiers; `scanout_feedback`
+    /// additionally advertises a `Scanout`-flagged tranche naming the CRTC's
+    /// plane formats (intersected with what we can also render, so there's
+    /// always a fallback). `None` if building it at bringup failed (e.g. no
+    /// renderer for the primary GPU) -- feedback is then simply not sent and
+    /// clients fall back to the default global's formats (udev.rs ~495).
+    dmabuf_feedback: Option<SurfaceDmabufFeedback>,
+}
+
+/// The pair of dmabuf feedback objects sent to a surface depending on whether
+/// its buffer, this frame, ended up being scanned out directly or composited
+/// (`select_dmabuf_feedback` decides which). See `get_surface_dmabuf_feedback`.
+pub(crate) struct SurfaceDmabufFeedback {
+    render_feedback: DmabufFeedback,
+    scanout_feedback: DmabufFeedback,
+    /// Format count of the `Scanout`-flagged tranche, cached at construction
+    /// time (`DmabufFeedback` exposes no public accessor for this) purely
+    /// for the Deliverable-3 diagnostic below -- lets a missing/empty
+    /// tranche be told apart from a client that just ignored it.
+    scanout_format_count: usize,
+}
+
+/// Builds the render/scanout feedback pair for one CRTC's surface, mirroring
+/// anvil's `get_surface_dmabuf_feedback` (`anvil/src/udev.rs:697-758`).
+///
+/// Anvil threads a separate `render_node: Option<DrmNode>` because it
+/// supports rendering on one GPU and scanning out on another. Rubix has a
+/// single primary GPU (`RubixState`/`UdevData::primary_gpu`), so that branch
+/// collapses: `all_render_formats` is just the primary GPU's dmabuf formats,
+/// and the render-feedback builder needs no secondary preference tranche.
+/// `scanout_node` is kept as its own parameter (rather than reusing
+/// `primary_gpu`) because it's the CRTC's own device node, which is what the
+/// plane-format tranche's fallback-render tranche should be keyed to -- see
+/// anvil's `node` argument at the call site.
+fn get_surface_dmabuf_feedback(
+    primary_gpu: DrmNode,
+    scanout_node: DrmNode,
+    gpus: &mut GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    surface: &DrmSurface,
+) -> Option<SurfaceDmabufFeedback> {
+    let all_render_formats = gpus.single_renderer(&primary_gpu).ok()?.dmabuf_formats();
+
+    let planes = surface.planes().clone();
+
+    // Limit the scan-out tranche to formats we can also render from, so a
+    // render fallback always exists if a given buffer turns out not to be
+    // scannable (mirrors anvil's comment at udev.rs:718-721).
+    let planes_formats = surface
+        .plane_info()
+        .formats
+        .iter()
+        .copied()
+        .chain(planes.overlay.into_iter().flat_map(|p| p.formats))
+        .collect::<FormatSet>()
+        .intersection(&all_render_formats)
+        .copied()
+        .collect::<FormatSet>();
+
+    let scanout_format_count = planes_formats.iter().count();
+
+    let builder = DmabufFeedbackBuilder::new(primary_gpu.dev_id(), all_render_formats.clone());
+    let render_feedback = builder.clone().build().ok()?;
+
+    let scanout_feedback = builder
+        .add_preference_tranche(
+            surface.device_fd().dev_id().ok()?,
+            Some(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout),
+            planes_formats,
+        )
+        .add_preference_tranche(scanout_node.dev_id(), None, all_render_formats)
+        .build()
+        .ok()?;
+
+    Some(SurfaceDmabufFeedback {
+        render_feedback,
+        scanout_feedback,
+        scanout_format_count,
+    })
 }
 
 /// HDR Phase 2's per-output linear intermediate: a 16F `GlesTexture` the
@@ -721,6 +818,29 @@ fn connector_connected(
         }
     };
 
+    // Per-surface dmabuf scanout tranche (Spec B): tells this output's client
+    // how to allocate a buffer the display controller can scan out directly,
+    // as opposed to the render-optimal-only formats the default global
+    // (above, in `device_added`) advertises. Built once here, at bringup,
+    // inside `with_compositor` so `compositor.surface()` (the live
+    // `DrmSurface`, with its negotiated plane formats) is reachable -- same
+    // accessor anvil uses at udev.rs:1035-1045.
+    let dmabuf_feedback = drm_output.with_compositor(|compositor| {
+        get_surface_dmabuf_feedback(
+            udev_data.primary_gpu,
+            node,
+            &mut udev_data.gpus,
+            compositor.surface(),
+        )
+    });
+    if dmabuf_feedback.is_none() {
+        tracing::warn!(
+            "failed to build dmabuf scanout feedback for {}; clients on this output will only see \
+             render-optimal formats",
+            output.name(),
+        );
+    }
+
     // `wl_mode.refresh` is in mHz (60_000 == 60 Hz, matching winit.rs), so the
     // frame period is 1000 / refresh seconds. The guard avoids a `from_secs_f64`
     // panic (inf) on a degenerate mode that reports no refresh.
@@ -764,6 +884,9 @@ fn connector_connected(
             hdr_capable: output_hdr,
             hdr_shaders: None,
             hdr_offscreen: None,
+            applied_connector_hdr: None,
+            last_scanout_promoted: None,
+            dmabuf_feedback,
         },
     );
 
@@ -928,12 +1051,11 @@ pub(crate) fn toggle_hdr(udev: &Rc<RefCell<UdevData>>) -> Vec<Output> {
                 if !surface.hdr_capable {
                     continue;
                 }
+                // `render_surface` is the sole owner of connector color state
+                // (see `SurfaceData::applied_connector_hdr`); this only flips
+                // the logical flag and schedules a render below, which picks
+                // the transition up on the next frame.
                 surface.hdr = !surface.hdr;
-                if surface.hdr {
-                    set_hdr_output_properties(&surface.drm_output);
-                } else {
-                    set_sdr_output_properties(&surface.drm_output);
-                }
                 tracing::info!(
                     "HDR toggle: {} is now {}",
                     surface.output.name(),
@@ -1088,6 +1210,12 @@ fn render_surface(
     // with our own pass below. `Space::render_elements_for_region` gives the
     // space's contribution alone.
     let scale = 1.0_f64;
+
+    // Cheap (no renderer work), computed once and reused for cursor
+    // suppression, chrome clearing, connector color state, and the HDR
+    // composite bypass below.
+    let fullscreen_kind = fullscreen_scanout_target(state, &surface.output);
+
     let mut background: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
     let mut bottom: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
     let mut top: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
@@ -1142,6 +1270,19 @@ fn render_surface(
         ));
     }
 
+    // Exclusive fullscreen: chrome above the game (layer-shell top/overlay,
+    // animation ghosts) must not render, both because it would be incorrect
+    // (waybar etc. shouldn't paint over a fullscreen game) and because
+    // anything above the candidate element in the final list is fatal to
+    // primary-plane promotion. `bottom`/`background` are left as built --
+    // they're culled by `DrmCompositor`'s opaque short-circuit and are the
+    // fallback if promotion fails for some other reason.
+    if fullscreen_kind.is_some() {
+        top.clear();
+        overlay.clear();
+        ghosts.clear();
+    }
+
     // Cursor built last (it also needs `renderer`), same "collect before the
     // combined render call" discipline as the ghost/layer lists above so the
     // mutable borrow is released before `drm_output.render_frame` below.
@@ -1150,35 +1291,20 @@ fn render_surface(
     // otherwise every output redraws the cursor at the raw global coordinate,
     // producing a phantom cursor per extra monitor.
     //
-    // When a fullscreen window is present on this output, suppress cursor elements
-    // to stabilize the element list for scanout promotion. This prevents `try_assign_element`
-    // from flapping between scanout and composite modes as the mouse moves in/out,
-    // which causes rapid CRTC blanks (visible flicker). The hardware cursor plane will
-    // handle the cursor independently in this case.
+    // The cursor is NOT suppressed under exclusive fullscreen. `DrmCompositor`
+    // assigns it to the hardware cursor plane from this element list
+    // (`FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT`), so a cursor element does not
+    // land in `primary_plane_elements` and does not block primary-plane
+    // promotion. There is no separate hw-cursor path to fall back on: dropping
+    // these elements drops the cursor outright, everywhere, for as long as any
+    // fullscreen window covers the output.
     let output_geo = state.space.output_geometry(&surface.output);
-    let has_fullscreen_on_output = state.fullscreen_windows.iter().any(|fullscreen_id| {
-        state.windows
-            .get(fullscreen_id)
-            .and_then(|window| state.space.element_location(window))
-            .and_then(|loc| {
-                output_geo.as_ref().map(|geo| {
-                    geo.to_f64().contains((loc.x as f64, loc.y as f64))
-                })
-            })
-            .unwrap_or(false)
-    });
-
-    let cursor_elements = if has_fullscreen_on_output {
-        // Suppress cursor rendering to stabilize element list during exclusive fullscreen.
-        Vec::new()
-    } else {
-        match output_geo {
-            Some(geo) if geo.to_f64().contains(state.pointer_location) => {
-                let local = state.pointer_location - geo.loc.to_f64();
-                pointer_render_elements(renderer, &state.cursor_status, local, scale)
-            }
-            _ => Vec::new(),
+    let cursor_elements = match output_geo {
+        Some(geo) if geo.to_f64().contains(state.pointer_location) => {
+            let local = state.pointer_location - geo.loc.to_f64();
+            pointer_render_elements(renderer, &state.cursor_status, local, scale)
         }
+        _ => Vec::new(),
     };
 
     // Cursor prepended -- front of the Vec is topmost, and it must draw above
@@ -1191,6 +1317,36 @@ fn render_surface(
     elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
+
+    // Connector color state follows the exclusive-fullscreen window's own
+    // declared transfer function; on the desktop (no exclusive fullscreen) it
+    // follows `surface.hdr` as before. `render_surface` is the sole owner of
+    // connector color state -- see `SurfaceData::applied_connector_hdr` --
+    // so the transition is only staged to DRM when it actually changes.
+    let desired_connector_hdr = match fullscreen_kind {
+        // Exclusive fullscreen: the connector follows the content.
+        Some(DecodeKind::HdrPq) => surface.hdr_capable && surface.hdr,
+        Some(DecodeKind::Sdr) => false,
+        // Desktop: today's behaviour.
+        None => surface.hdr,
+    };
+    if surface.applied_connector_hdr != Some(desired_connector_hdr) {
+        let reason = match fullscreen_kind {
+            Some(DecodeKind::HdrPq) => "fullscreen-hdr",
+            Some(DecodeKind::Sdr) => "fullscreen-sdr",
+            None => "desktop",
+        };
+        if desired_connector_hdr {
+            set_hdr_output_properties(&surface.drm_output);
+        } else {
+            set_sdr_output_properties(&surface.drm_output);
+        }
+        surface.applied_connector_hdr = Some(desired_connector_hdr);
+        tracing::info!(
+            "connector color state on {}: hdr = {desired_connector_hdr} ({reason})",
+            surface.output.name(),
+        );
+    }
 
     // HDR Phase 2/1b: `hdr == true` outputs composite through a linear-light
     // 16F offscreen instead of drawing `elements` straight to scanout
@@ -1210,7 +1366,24 @@ fn render_surface(
     // zero extra cost. Only when it's actually needed is the more expensive
     // per-window gather (`gather_tagged_elements`) done and the z-run decode
     // (`render_surface_hdr_zrun`) used instead.
-    if surface.hdr {
+    // The HDR composite path renders into a 16F offscreen and hands
+    // `render_frame` a single texture element, which makes direct scanout
+    // structurally impossible. Under exclusive fullscreen the connector
+    // color state has already been set above to follow the content directly
+    // (`desired_connector_hdr`), so bypassing this path is correct, not just
+    // an optimization:
+    //   - HDR game on an HDR output: connector stays PQ/BT.2020, the client
+    //     buffer is already PQ/BT.2020, no shader touches it -- an identity
+    //     pass, strictly better than the composite round trip.
+    //   - SDR game on an HDR output: connector drops to SDR default
+    //     (sRGB/BT.709) above, so the 8-bit client buffer is interpreted
+    //     correctly. HDR returns automatically on leaving fullscreen.
+    //   - Non-HDR output: unchanged either way.
+    // Note: `surface_decode_kind` only recognises `St2084Pq`, so HLG content
+    // currently maps to `DecodeKind::Sdr` -- an HLG fullscreen client drives
+    // the connector to SDR. Acceptable for now: it degrades to today's
+    // behaviour rather than misrendering.
+    if surface.hdr && fullscreen_kind.is_none() {
         let hdr_result = if output_has_hdr_window(state, &surface.output) {
             let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
             render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits)
@@ -1243,6 +1416,92 @@ fn render_surface(
             }
         })?;
 
+    // Scanout diagnostic: log whether primary-plane promotion actually
+    // happened, only on change so it's silent in steady state. Runs before
+    // the `is_empty` early return below, or a promotion change on an empty
+    // frame would be missed.
+    let promoted = matches!(frame.primary_element, PrimaryPlaneElement::Element(_));
+    if surface.last_scanout_promoted != Some(promoted) {
+        surface.last_scanout_promoted = Some(promoted);
+        let output_name = surface.output.name();
+        let element_count = elements.len();
+        tracing::info!(
+            "direct-scanout on {output_name}: promoted = {promoted} ({element_count} elements, fullscreen = {fullscreen_kind:?})",
+        );
+        if !promoted && fullscreen_kind.is_some() {
+            for (id, st) in frame.states.states.iter().take(10) {
+                tracing::info!("  element {id:?}: {:?}", st.presentation_state);
+            }
+            // Spec B: distinguish "client never got a scanout tranche to
+            // allocate against" from "client got one and ignored it" --
+            // otherwise a missing/empty tranche and a stubborn client look
+            // identical in the log above.
+            match surface.dmabuf_feedback.as_ref() {
+                Some(fb) => tracing::info!(
+                    "  dmabuf scanout tranche: {} format(s)",
+                    fb.scanout_format_count,
+                ),
+                None => tracing::info!("  dmabuf scanout feedback: none built for this output"),
+            }
+        }
+    }
+
+    // Spec B: keep each surface's primary-scanout-output tracking current
+    // with *this* frame's `RenderElementStates`, then tell it which dmabuf
+    // feedback (render-optimal vs scanout-capable) to allocate against next.
+    // Mirrors anvil's `update_primary_scanout_output` + `post_repaint`
+    // (`state.rs:1079-1110`, `906-962`) in the same two-step order: the
+    // compare fn needs this frame's states, and `select_dmabuf_feedback`
+    // needs the primary-scanout-output write to have already landed.
+    //
+    // Placement: inline here, not threaded out to the `send_frame` loop in
+    // `render()` (udev.rs ~1040-1073) -- `render_surface` already owns `&mut
+    // RubixState` (`state`) and `&mut SurfaceData` (`surface`) as disjoint
+    // parameters, so this needs no new borrow and no change to
+    // `render_surface`'s `Result<bool, _>` return type, which the HDR
+    // early-returns above depend on. Feedback is sent only from this, the
+    // plain `render_frame` path: the HDR composite path
+    // (`render_surface_hdr[_zrun]`) already returned above, and its output is
+    // a single opaque texture element that can never be scanned out, so
+    // there's nothing meaningful to select between there.
+    state.space.elements().for_each(|window| {
+        window.with_surfaces(|wl_surface, states| {
+            update_surface_primary_scanout_output(
+                wl_surface,
+                &surface.output,
+                states,
+                None,
+                &frame.states,
+                default_primary_scanout_output_compare,
+            );
+        });
+        if let Some(fb) = surface.dmabuf_feedback.as_ref() {
+            window.send_dmabuf_feedback(&surface.output, surface_primary_scanout_output, |wl_surface, _| {
+                select_dmabuf_feedback(wl_surface, &frame.states, &fb.render_feedback, &fb.scanout_feedback)
+            });
+        }
+    });
+    {
+        let map = layer_map_for_output(&surface.output);
+        for layer in map.layers() {
+            layer.with_surfaces(|wl_surface, states| {
+                update_surface_primary_scanout_output(
+                    wl_surface,
+                    &surface.output,
+                    states,
+                    None,
+                    &frame.states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+            if let Some(fb) = surface.dmabuf_feedback.as_ref() {
+                layer.send_dmabuf_feedback(&surface.output, surface_primary_scanout_output, |wl_surface, _| {
+                    select_dmabuf_feedback(wl_surface, &frame.states, &fb.render_feedback, &fb.scanout_feedback)
+                });
+            }
+        }
+    }
+
     if frame.is_empty {
         return Ok(false);
     }
@@ -1252,6 +1511,28 @@ fn render_surface(
         .queue_frame(None)
         .map_err(Into::<SwapBuffersError>::into)?;
     Ok(true)
+}
+
+/// The fullscreen window that exclusively covers `output`, plus the decode
+/// kind it declares, if any. Stricter than the old origin-point test: the
+/// window's bbox must actually contain the whole output geometry, which is
+/// the same condition `DrmCompositor` requires for primary-plane promotion.
+/// Cheap -- no renderer work, just `Space`/surface-state lookups.
+fn fullscreen_scanout_target(state: &RubixState, output: &Output) -> Option<DecodeKind> {
+    let output_geo = state.space.output_geometry(output)?;
+    state.fullscreen_windows.iter().find_map(|id| {
+        let window = state.windows.get(id)?;
+        let bbox = state.space.element_bbox(window)?;
+        if !bbox.contains_rect(output_geo) {
+            return None;
+        }
+        Some(
+            window
+                .wl_surface()
+                .map(|s| surface_decode_kind(&s))
+                .unwrap_or(DecodeKind::Sdr),
+        )
+    })
 }
 
 /// Cheap pre-check: does any window contributing to `output` currently
