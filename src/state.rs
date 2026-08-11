@@ -138,6 +138,10 @@ pub struct RubixState {
     // subscriber push (see ipc.rs).
     pub ipc_dirty: bool,
 
+    // wlr-foreign-toplevel-management: bound managers plus what each window's
+    // handles were last told, so `foreign_toplevel::refresh` can send deltas.
+    pub(crate) foreign_toplevel: crate::foreign_toplevel::ForeignToplevelState,
+
     // Last tiling area we laid out into. When a layer surface (bar) changes its
     // exclusive zone, the reserved area shifts; comparing against this lets the
     // layer-commit path reflow existing windows exactly once per change instead
@@ -318,6 +322,7 @@ impl RubixState {
             next_id: 1,
             unmapped: HashMap::new(),
             ipc_dirty: false,
+            foreign_toplevel: Default::default(),
             reserved_bounds: None,
             animations: HashMap::new(),
             pending_transition: None,
@@ -450,6 +455,37 @@ impl RubixState {
     /// paths build. Without the layer hit-test the space's toplevels were the only
     /// thing the pointer could ever land on, so layer clients (mako notifications,
     /// the bar) never received pointer enter/button events and couldn't be clicked.
+    /// `(app_id, title)` for a window, whichever shell it came from.
+    ///
+    /// Wayland reads xdg-toplevel surface state; X11 maps `class` -> app_id and
+    /// `title` -> title, which is the convention every taskbar expects. Empty
+    /// X11 strings become `None` rather than `Some("")` so consumers can treat a
+    /// missing identity uniformly. Shared by the IPC snapshot and the
+    /// foreign-toplevel list so a window is named the same way everywhere.
+    pub(crate) fn window_identity(&self, id: u32) -> (Option<String>, Option<String>) {
+        let Some(window) = self.windows.get(&id) else {
+            return (None, None);
+        };
+        match window.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                    let attrs = states
+                        .data_map
+                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                        .map(|d| d.lock().unwrap());
+                    match attrs {
+                        Some(attrs) => (attrs.app_id.clone(), attrs.title.clone()),
+                        None => (None, None),
+                    }
+                })
+            }
+            WindowSurface::X11(x11) => {
+                let non_empty = |s: String| (!s.is_empty()).then_some(s);
+                (non_empty(x11.class()), non_empty(x11.title()))
+            }
+        }
+    }
+
     /// Global top-left of the mapped window backing `surface`, for turning
     /// surface-local client coordinates back into compositor space.
     pub(crate) fn window_location(&self, surface: &WlSurface) -> Option<Point<f64, Logical>> {
@@ -894,6 +930,21 @@ impl RubixState {
     /// Re-insertion splits the focused window, so a window does not necessarily
     /// return to the slot it left; restoring exactly needs an insert-at-slot API
     /// the model doesn't have yet.
+    /// Ask a window to close, the polite way for each shell.
+    ///
+    /// This is a request, not a teardown: the client decides (it may put up a
+    /// "save changes?" dialog and never close). Rubix's own bookkeeping is
+    /// driven by the resulting unmap, not from here.
+    pub(crate) fn close_window(&mut self, id: u32) {
+        let Some(window) = self.windows.get(&id) else { return };
+        match window.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => toplevel.send_close(),
+            WindowSurface::X11(x11) => {
+                let _ = x11.close();
+            }
+        }
+    }
+
     pub fn set_window_fullscreen(&mut self, id: u32, fullscreen: bool) {
         if fullscreen {
             if !self.fullscreen_windows.insert(id) {

@@ -13,6 +13,7 @@ mod input;
 mod ipc;
 mod model;
 mod portal;
+mod foreign_toplevel;
 mod screencopy;
 mod state;
 mod udev;
@@ -217,6 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     crate::screencopy::init(&data.display_handle);
 
+    crate::foreign_toplevel::init(&data.display_handle);
+
     let ipc_clients = crate::ipc::init_ipc(&event_loop, data.xdisplay);
 
     crate::portal::init_portal(&event_loop);
@@ -246,6 +249,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(clients) = &ipc_clients {
                 crate::ipc::broadcast_snapshot(data, clients);
             }
+            // Same signal, second audience: the status bar over IPC, window
+            // lists (rofi, taskbars) over wlr-foreign-toplevel.
+            crate::foreign_toplevel::refresh(data);
         }
     })?;
 

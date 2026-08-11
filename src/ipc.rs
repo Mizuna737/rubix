@@ -151,23 +151,7 @@ fn build_snapshot(state: &RubixState) -> StateSnapshot {
 }
 
 fn window_view(state: &RubixState, id: u32, focused: Option<u32>) -> WindowView {
-    let (app_id, title) = state
-        .windows
-        .get(&id)
-        .and_then(|window| window.toplevel())
-        .map(|toplevel| {
-            smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
-                let attrs = states
-                    .data_map
-                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-                    .map(|d| d.lock().unwrap());
-                match attrs {
-                    Some(attrs) => (attrs.app_id.clone(), attrs.title.clone()),
-                    None => (None, None),
-                }
-            })
-        })
-        .unwrap_or((None, None));
+    let (app_id, title) = state.window_identity(id);
 
     WindowView {
         id,
