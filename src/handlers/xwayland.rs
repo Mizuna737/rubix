@@ -48,6 +48,7 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
             state.space.unmap_elem(&win);
         }
         state.fullscreen_windows.remove(&id);
+        state.iconified.remove(&id);
         state.apply_layout();
         state.ipc_dirty = true;
     }
@@ -82,20 +83,24 @@ impl XwmHandler for RubixState {
         self.windows.insert(id, win);
 
         if starts_fullscreen {
-            self.fullscreen_windows.insert(id);
+            self.set_window_fullscreen(id, true);
             tracing::info!(
                 "X11 window {id} maps already fullscreen (pre-map _NET_WM_STATE): class={class:?} title={title:?}"
             );
         }
 
         // Mirror `xdg_shell::new_toplevel`: split the currently-focused window.
-        let focused_id = self.focused_window_id();
-        let direction = focused_id
-            .and_then(|fid| self.window_rect(fid))
-            .map(Rect::longer_axis)
-            .unwrap_or(SplitDirection::Horizontal);
-        if let Some(monitor) = self.workspace.active_monitor_mut() {
-            monitor.add_window(direction, id, focused_id.unwrap_or(0));
+        // A window that mapped already fullscreen lives outside the grid, so it
+        // must not be given a tile slot here.
+        if !starts_fullscreen {
+            let focused_id = self.focused_window_id();
+            let direction = focused_id
+                .and_then(|fid| self.window_rect(fid))
+                .map(Rect::longer_axis)
+                .unwrap_or(SplitDirection::Horizontal);
+            if let Some(monitor) = self.workspace.active_monitor_mut() {
+                monitor.add_window(direction, id, focused_id.unwrap_or(0));
+            }
         }
         self.apply_layout();
         // Focus follows spawn (mirrors xdg_shell::new_toplevel): name the new id
@@ -245,7 +250,7 @@ impl XwmHandler for RubixState {
         let target = window.wl_surface();
         if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.wl_surface().as_deref() == target.as_ref()) {
             let id = *id;
-            self.fullscreen_windows.insert(id);
+            self.set_window_fullscreen(id, true);
             self.apply_layout();
             self.ipc_dirty = true;
         }
@@ -255,7 +260,7 @@ impl XwmHandler for RubixState {
         let target = window.wl_surface();
         if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.wl_surface().as_deref() == target.as_ref()) {
             let id = *id;
-            self.fullscreen_windows.remove(&id);
+            self.set_window_fullscreen(id, false);
             self.apply_layout();
             self.ipc_dirty = true;
         }

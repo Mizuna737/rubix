@@ -43,6 +43,8 @@ pub(crate) enum NavAction {
     MoveFocusedWindowDown,
     MoveFocusedWindowLeft,
     MoveFocusedWindowRight,
+    ToggleMaximize,    // focused window fills the monitor work area; releases on focus change
+    FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
     IncreaseSdrWhite,
     DecreaseSdrWhite,
     ToggleHdr,
@@ -293,6 +295,7 @@ impl RubixState {
                             toplevel.send_pending_configure();
                         });
                         keyboard.set_focus(self, target, serial);
+                        self.reconcile_focus_state();
                         // Keyboard focus moved; push a fresh snapshot so the bar
                         // tracks click-to-focus, not just nav chords.
                         self.ipc_dirty = true;
@@ -385,6 +388,27 @@ impl RubixState {
                 | NavAction::NewGroup
         );
 
+        // Maximize is transient: anything that moves through the layout drops it,
+        // without waiting on a focus change to notice. Rotating onto an EMPTY
+        // group is the case that forces this -- there is no new window to take
+        // focus, so a focus-driven release never fires and the maximized window
+        // sits over the top of everything that rotated in.
+        //
+        // Excluded: the toggle itself (it would clear the state it is about to
+        // read, so a second press could never un-maximize) and the display
+        // adjustments, which don't move anything.
+        let keeps_maximize = matches!(
+            action,
+            NavAction::ToggleMaximize
+                | NavAction::IncreaseSdrWhite
+                | NavAction::DecreaseSdrWhite
+                | NavAction::ToggleHdr
+                | NavAction::Quit
+        );
+        if !keeps_maximize {
+            self.maximized = None;
+        }
+
         match action {
             NavAction::RotateColumnsLeft => {
                 self.pending_transition = Some(Transition::Rotate);
@@ -435,6 +459,8 @@ impl RubixState {
             NavAction::DecrementVisibleColumns => {
                 if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.increment_visible_columns(-1); }
             },
+            NavAction::ToggleMaximize => self.toggle_maximize(),
+            NavAction::FocusFullscreen => self.focus_next_fullscreen(),
             NavAction::FlipSplitDirection => self.flip_focused_parent_split_direction(),
             NavAction::MoveFocusedWindowUp => self.move_focused_window_by_direction(Direction::Up),
             NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),
@@ -485,6 +511,7 @@ impl RubixState {
             toplevel.send_pending_configure();
         });
         keyboard.set_focus(self, Some(target), serial);
+        self.reconcile_focus_state();
     }
 
     /// Move keyboard focus to the model's current active window, mirroring the
@@ -505,6 +532,10 @@ impl RubixState {
                     toplevel.send_pending_configure();
                 });
                 keyboard.set_focus(self, Option::<KeyboardFocusTarget>::None, serial);
+                // Focus went nowhere -- rotating onto an empty group takes this
+                // branch, never `focus_by_id`, so this is the only place the
+                // reconcile can happen for it.
+                self.reconcile_focus_state();
             }
         }
     }

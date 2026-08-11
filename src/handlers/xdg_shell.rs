@@ -201,7 +201,7 @@ impl XdgShellHandler for RubixState {
         let wl_surface = surface.wl_surface();
         if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface)) {
             let id = *id;
-            self.fullscreen_windows.insert(id);
+            self.set_window_fullscreen(id, true);
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
             });
@@ -243,7 +243,7 @@ impl XdgShellHandler for RubixState {
         let wl_surface = surface.wl_surface();
         if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface)) {
             let id = *id;
-            self.fullscreen_windows.remove(&id);
+            self.set_window_fullscreen(id, false);
             surface.with_pending_state(|state| {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
             });

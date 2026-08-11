@@ -45,6 +45,7 @@ use crate::{
     model::{
         geometry::Rect,
         grid::Workspace,
+        tiling::SplitDirection,
     },
 };
 
@@ -151,6 +152,16 @@ pub struct RubixState {
 
     // Windows currently in fullscreen state (bypass normal tiling).
     pub(crate) fullscreen_windows: HashSet<u32>,
+
+    // X11 windows last reported to their client as iconified. Only what the
+    // client was told -- `sync_x11_iconic` diffs against it so an unchanged
+    // layout pass sends no property writes.
+    pub(crate) iconified: HashSet<u32>,
+
+    // The window currently maximized, if any. Compositor-only state: unlike
+    // fullscreen it involves no client protocol state, keeps its grid slot, and
+    // releases itself as soon as focus moves elsewhere.
+    pub(crate) maximized: Option<u32>,
 
     // Track the last configured geometry and fullscreen state for each window
     // to avoid redundant configure resends when layout is recomputed but geometry
@@ -307,6 +318,8 @@ impl RubixState {
             pending_transition: None,
             active_ghosts: Vec::new(),
             fullscreen_windows: HashSet::new(),
+            iconified: HashSet::new(),
+            maximized: None,
             last_configured: HashMap::new(),
 
             compositor_state,
@@ -816,6 +829,196 @@ impl RubixState {
         !self.animations.is_empty()
     }
 
+    /// Insert `id` into the active monitor's grid by splitting the focused
+    /// window -- the same rule new windows follow in `xdg_shell::new_toplevel`
+    /// and `xwayland::map_window_request`.
+    fn insert_into_grid(&mut self, id: u32) {
+        let focused_id = self.focused_window_id();
+        let direction = focused_id
+            .and_then(|fid| self.window_rect(fid))
+            .map(Rect::longer_axis)
+            .unwrap_or(SplitDirection::Horizontal);
+        if let Some(monitor) = self.workspace.active_monitor_mut() {
+            monitor.add_window(direction, id, focused_id.unwrap_or(0));
+        }
+    }
+
+    /// Enter or leave exclusive fullscreen for `id`.
+    ///
+    /// A fullscreen window LEAVES the tiling grid rather than keeping a slot
+    /// that `compute_layout` keeps filling. Holding a slot meant the window only
+    /// stopped being drawn once its entire column scrolled off screen, which
+    /// never happens when every column already fits -- navigating away from a
+    /// game did nothing. Out of the grid the remaining windows reflow into the
+    /// whole layout, and `apply_layout` becomes the only thing deciding whether
+    /// the fullscreen window is on screen.
+    ///
+    /// Re-insertion splits the focused window, so a window does not necessarily
+    /// return to the slot it left; restoring exactly needs an insert-at-slot API
+    /// the model doesn't have yet.
+    pub fn set_window_fullscreen(&mut self, id: u32, fullscreen: bool) {
+        if fullscreen {
+            if !self.fullscreen_windows.insert(id) {
+                return;
+            }
+            // A destroyed window may have been on any monitor, and
+            // `remove_window` is id-based and a no-op when absent.
+            for monitor in &mut self.workspace.monitors {
+                let _ = monitor.remove_window(id);
+            }
+        } else {
+            if !self.fullscreen_windows.remove(&id) {
+                return;
+            }
+            self.insert_into_grid(id);
+        }
+    }
+
+    /// Toggle maximize for the focused window, releasing any previous one.
+    ///
+    /// Maximize is deliberately cheap next to fullscreen: no `_NET_WM_STATE`, no
+    /// client negotiation, no connector or scanout involvement. The window keeps
+    /// its grid slot and simply gets the monitor's work area as its rect.
+    pub fn toggle_maximize(&mut self) {
+        let Some(id) = self.focused_window_id() else {
+            return;
+        };
+        // Fullscreen already owns the whole output; maximizing under it would be
+        // a no-op the user can't see, and un-maximizing later would look random.
+        if self.fullscreen_windows.contains(&id) {
+            return;
+        }
+
+        // MODEL SEAM: before maximizing, a window that is not already first in
+        // its group's tree should be promoted there -- restructured so it is the
+        // root's first child and takes half the space, as if it were the first
+        // window spawned and split once. That is tree surgery in `model::grid`,
+        // so it wants a `Monitor::promote_to_first(id) -> bool` (true when it
+        // moved, false when it was already first). Wire it here as:
+        //
+        //     if self.workspace.active_monitor_mut()
+        //         .is_some_and(|m| m.promote_to_first(id)) { .. return early .. }
+        //
+        // Until that exists, every press maximizes directly.
+        self.maximized = if self.maximized == Some(id) { None } else { Some(id) };
+        self.apply_layout();
+        self.ipc_dirty = true;
+    }
+
+    /// Focus a fullscreen window, cycling if there is more than one.
+    ///
+    /// Fullscreen windows are outside the grid, so `focus_active_window` -- which
+    /// walks active_column -> active_row -> first leaf -- can never land on one.
+    /// Without this there is no way back to a game once you navigate off it. The
+    /// real answer is a focus-by-id path the launcher can drive; this is the
+    /// keyboard escape hatch until that exists.
+    pub fn focus_next_fullscreen(&mut self) {
+        let mut ids: Vec<u32> = self
+            .fullscreen_windows
+            .iter()
+            .copied()
+            .filter(|id| self.windows.contains_key(id))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        // Sorted so "next" is stable across calls -- HashSet iteration order is
+        // not, and cycling that would revisit windows at random.
+        ids.sort_unstable();
+
+        let current = self.focused_window_id();
+        let next = current
+            .and_then(|cur| ids.iter().position(|id| *id == cur))
+            .map(|pos| ids[(pos + 1) % ids.len()])
+            .unwrap_or(ids[0]);
+        self.focus_by_id(next);
+    }
+
+    /// Reconcile focus-dependent window state after keyboard focus moves.
+    ///
+    /// Maximize releases on any focus change, mirroring the `unfocus` handler in
+    /// Max's AwesomeWM config. Fullscreen is split by client type: a Wayland
+    /// toplevel accepts the compositor's word and is genuinely un-fullscreened
+    /// back into the grid, while an X11 client keeps its fullscreen state and is
+    /// merely hidden -- telling one it is windowed just invites it to set
+    /// `_NET_WM_STATE_FULLSCREEN` straight back.
+    pub(crate) fn reconcile_focus_state(&mut self) {
+        let focused = self.focused_window_id();
+        let mut dirty = false;
+
+        if self.maximized.is_some() && self.maximized != focused {
+            self.maximized = None;
+            dirty = true;
+        }
+
+        let unfullscreen: Vec<u32> = self
+            .fullscreen_windows
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != focused)
+            .filter(|id| {
+                self.windows.get(id).is_some_and(|w| {
+                    matches!(w.underlying_surface(), WindowSurface::Wayland(_))
+                })
+            })
+            .collect();
+
+        for id in unfullscreen {
+            if let Some(WindowSurface::Wayland(toplevel)) =
+                self.windows.get(&id).map(|w| w.underlying_surface())
+            {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                });
+            }
+            self.set_window_fullscreen(id, false);
+            tracing::info!("window {id} left fullscreen (lost focus)");
+            dirty = true;
+        }
+
+        if dirty {
+            self.apply_layout();
+            self.ipc_dirty = true;
+        }
+    }
+
+    /// Tell X11 clients whether the grid is currently showing them.
+    ///
+    /// An X11 client will not accept being un-fullscreened: drop
+    /// `_NET_WM_STATE_FULLSCREEN` and a game sets it straight back (Against the
+    /// Storm re-asserted ~3s later, taking the output with it). `WM_STATE =
+    /// IconicState` is a state it will respect, because the correct response to
+    /// being minimized is to stop rather than to argue. This leaves the client's
+    /// own idea of being fullscreen intact, so navigating back restores it.
+    ///
+    /// Driven by visibility rather than by the nav paths, since the grid hides
+    /// windows several ways -- scrolling past `visible_columns`, a non-active
+    /// row, a new window displacing one -- and all of them owe the client the
+    /// same notification.
+    fn sync_x11_iconic(&mut self, visible: &HashSet<u32>) {
+        // `self.iconified` tracks what each client was last told, so a layout
+        // pass that changes nothing doesn't spray redundant property writes.
+        let mut changed: Vec<(u32, bool)> = Vec::new();
+        for (id, window) in &self.windows {
+            if let WindowSurface::X11(x11) = window.underlying_surface() {
+                let hidden = !visible.contains(id);
+                if self.iconified.contains(id) != hidden {
+                    let _ = x11.set_hidden(hidden);
+                    changed.push((*id, hidden));
+                }
+            }
+        }
+
+        for (id, hidden) in changed {
+            if hidden {
+                tracing::info!("window {id} iconified (hidden by layout)");
+                self.iconified.insert(id);
+            } else {
+                self.iconified.remove(&id);
+            }
+        }
+    }
+
     pub fn apply_layout(&mut self) {
         let mut targets: Vec<(u32, Rect)> = Vec::new();
         for monitor in &self.workspace.monitors {
@@ -824,9 +1027,40 @@ impl RubixState {
             }
         }
 
-        // Add fullscreen windows to targets with their full output bounds.
+        // Maximize: keep the grid slot, take the monitor work area. Only applies
+        // while the window is actually on screen -- a maximized window scrolled
+        // out of view has no entry to override and stays out of view.
+        if let Some(id) = self.maximized {
+            if let Some(bounds) = self
+                .workspace
+                .active_monitor()
+                .and_then(|m| self.output_bounds_for(m.id))
+            {
+                let gap = self.config.outer_gap;
+                let rect = Rect {
+                    x: bounds.x + gap,
+                    y: bounds.y + gap,
+                    width: bounds.width.saturating_sub(2 * gap),
+                    height: bounds.height.saturating_sub(2 * gap),
+                };
+                if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
+                    entry.1 = rect;
+                }
+            }
+        }
+
+        // Fullscreen windows are OUT of the grid (`set_window_fullscreen`), so
+        // `compute_layout` never emits them and their rect comes from here --
+        // but only for the focused one. That is what makes navigating away
+        // actually leave a fullscreen game, rather than depending on its column
+        // happening to scroll off screen (which never happens when every column
+        // already fits). Anything left out is reported iconic below.
+        let focused = self.focused_window_id();
         let fullscreen_ids: Vec<u32> = self.fullscreen_windows.iter().cloned().collect();
         for id in fullscreen_ids {
+            if Some(id) != focused {
+                continue;
+            }
             if let Some(window) = self.windows.get(&id) {
                 // Find which monitor this window is on by checking its current location
                 let output = self
@@ -843,9 +1077,10 @@ impl RubixState {
                             width: bounds.size.w as u32,
                             height: bounds.size.h as u32,
                         };
-                        // Override the tiled target with the full-output rect: a
-                        // fullscreen window stays in the grid model, so compute_layout
-                        // already produced a tiled entry for it above that must not win.
+                        // Normally there is no entry to override, since the window
+                        // left the grid on going fullscreen. The override still
+                        // covers the transient case where a client requests
+                        // fullscreen in the same pass its tiled entry was built.
                         if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
                             entry.1 = rect;
                         } else {
@@ -856,14 +1091,18 @@ impl RubixState {
             }
         }
 
+        // Whatever `targets` holds now is exactly what the grid intends to show,
+        // on both the snap and the animate path, so this is the one place that
+        // knows which X11 clients just became (in)visible.
+        let visible: HashSet<u32> = targets.iter().map(|(id, _)| *id).collect();
+        self.sync_x11_iconic(&visible);
+
         match self.pending_transition.take() {
             None => {
                 // SNAP PATH — byte-for-byte today's behavior.
                 // Settle in-flight animations first (safety): for each tween,
                 // if Leave -> unmap; else map_element at tween.to. Clear the map.
                 self.settle_tweens();
-
-                let visible: HashSet<u32> = targets.iter().map(|(id, _)| *id).collect();
 
                 let stale: Vec<Window> = self
                     .windows
@@ -1016,6 +1255,17 @@ impl RubixState {
                 }
                 self.animations = plan;
             }
+        }
+
+        // A maximized window overlaps its neighbours' tiles, so stack order is
+        // what decides whether it reads as maximized or as half-buried. Raising
+        // it within `Space` puts it above every other toplevel and no higher:
+        // layer-shell Top/Overlay (the bar, notifications) are composited from
+        // separate lists that always sit in front of space elements, so this
+        // cannot paint over them. Raised before fullscreen so that if both
+        // somehow apply at once, fullscreen still wins the top slot.
+        if let Some(window) = self.maximized.and_then(|id| self.windows.get(&id).cloned()) {
+            self.space.raise_element(&window, false);
         }
 
         // A fullscreen window must be topmost in the Space stack or a tiled

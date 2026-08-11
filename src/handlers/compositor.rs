@@ -63,13 +63,19 @@ impl CompositorHandler for RubixState {
                     let window = self.unmapped.remove(&id).unwrap();
                     self.windows.insert(id, window);
 
-                    let focused_id = self.focused_window_id();
-                    let direction = focused_id
-                        .and_then(|fid| self.window_rect(fid))
-                        .map(Rect::longer_axis)
-                        .unwrap_or(SplitDirection::Horizontal);
-                    if let Some(monitor) = self.workspace.active_monitor_mut() {
-                        monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                    // A window that asked for fullscreen before its first commit
+                    // is already recorded as fullscreen, and fullscreen windows
+                    // live outside the grid -- adding it here would hand it a
+                    // tile slot it must not have.
+                    if !self.fullscreen_windows.contains(&id) {
+                        let focused_id = self.focused_window_id();
+                        let direction = focused_id
+                            .and_then(|fid| self.window_rect(fid))
+                            .map(Rect::longer_axis)
+                            .unwrap_or(SplitDirection::Horizontal);
+                        if let Some(monitor) = self.workspace.active_monitor_mut() {
+                            monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                        }
                     }
                     self.apply_layout();
                     // Focus follows spawn: name the new id directly. The model is
