@@ -11,7 +11,10 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
     },
     utils::SERIAL_COUNTER,
-    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    wayland::{
+        compositor::RegionAttributes,
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    },
 };
 
 use serde::Deserialize;
@@ -127,103 +130,92 @@ impl RubixState {
             // When confined, motion is clamped to the confine region.
             InputEvent::PointerMotion { event, .. } => {
                 let delta = event.delta();
-                let proposed = self.pointer_location + delta;
-
                 let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
-                let focused_surface = pointer.current_focus();
+                let serial = SERIAL_COUNTER.next_serial();
+                let origin = self.pointer_location;
 
-                // Check for pointer constraints on the focused surface
-                let (loc, send_relative) = if let Some(ref surface) = focused_surface {
+                // Constraints belong to the surface the pointer is *over*, not to
+                // whatever holds keyboard focus, so they are evaluated against
+                // `surface_under` -- which also hands back the surface's top-left
+                // in global coords, needed to test the constraint region.
+                let under = self.surface_under(origin);
+
+                // Only an *active* constraint applies. Honouring an inactive one
+                // pins the cursor while the client -- never having been sent
+                // `locked`/`confined` -- still believes it is free, and nothing
+                // ever releases it. That was the frozen-cursor bug.
+                let mut locked = false;
+                let mut confined = false;
+                let mut confine_region: Option<RegionAttributes> = None;
+                if let Some((surface, surface_loc)) = under.as_ref() {
                     with_pointer_constraint(surface, &pointer, |constraint| {
-                        match constraint {
-                            Some(ref constraint_ref) => {
-                                // Pointer is locked or confined
-                                match &**constraint_ref {
-                                    PointerConstraint::Locked(_) => {
-                                        // Locked pointer: position stays frozen, send relative deltas
-                                        // The client expects motion events at the lock position with relative deltas
-                                        (self.pointer_location, true)
-                                    }
-                                    PointerConstraint::Confined(_) => {
-                                        // Confined pointer: clamp to confinement region
-                                        // For now, we'll just clamp to output as before
-                                        // (full region support would require checking constraint.region())
-                                        let current_output = self
-                                            .output_at(self.pointer_location)
-                                            .or_else(|| self.space.outputs().next().cloned());
-                                        let Some(current_output) = current_output else { return (self.pointer_location, false); };
-                                        let Some(output_geo) = self.space.output_geometry(&current_output) else { return (self.pointer_location, false); };
-
-                                        let mut clamped = proposed;
-                                        clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
-                                        clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
-                                        (clamped, false)
-                                    }
-                                }
-                            }
-                            None => {
-                                // No constraint: normal clamping behavior
-                                let loc = if self.output_at(proposed).is_some() {
-                                    proposed
-                                } else {
-                                    let current_output = self
-                                        .output_at(self.pointer_location)
-                                        .or_else(|| self.space.outputs().next().cloned());
-                                    let Some(current_output) = current_output else { return (self.pointer_location, false); };
-                                    let Some(output_geo) = self.space.output_geometry(&current_output) else { return (self.pointer_location, false); };
-
-                                    let mut clamped = proposed;
-                                    clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
-                                    clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
-                                    clamped
-                                };
-                                (loc, false)
+                        let Some(constraint) = constraint else { return };
+                        if !constraint.is_active() {
+                            return;
+                        }
+                        // A constraint carrying a region only binds while the
+                        // pointer is actually inside that region.
+                        let point = (origin - *surface_loc).to_i32_round();
+                        if !constraint.region().is_none_or(|r| r.contains(point)) {
+                            return;
+                        }
+                        match &*constraint {
+                            PointerConstraint::Locked(_) => locked = true,
+                            PointerConstraint::Confined(confine) => {
+                                confined = true;
+                                confine_region = confine.region().cloned();
                             }
                         }
-                    })
-                } else {
-                    // No focused surface: normal clamping
-                    let loc = if self.output_at(proposed).is_some() {
-                        proposed
-                    } else {
-                        let current_output = self
-                            .output_at(self.pointer_location)
-                            .or_else(|| self.space.outputs().next().cloned());
-                        let Some(current_output) = current_output else { return; };
-                        let Some(output_geo) = self.space.output_geometry(&current_output) else { return; };
+                    });
+                }
 
-                        let mut clamped = proposed;
-                        clamped.x = clamped.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w) as f64);
-                        clamped.y = clamped.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h) as f64);
-                        clamped
-                    };
-                    (loc, false)
-                };
+                // Relative motion goes out first and unconditionally: a locked
+                // client (an FPS turning its camera) has nothing else to drive
+                // from. Unaccelerated deltas are passed through as the protocol
+                // intends rather than duplicating the accelerated ones.
+                pointer.relative_motion(
+                    self,
+                    under.clone(),
+                    &RelativeMotionEvent {
+                        delta,
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time(),
+                    },
+                );
 
-                self.pointer_location = loc;
+                // Locked: the cursor does not move at all, and no absolute motion
+                // is sent for the duration of the lock.
+                if locked {
+                    pointer.frame(self);
+                    return;
+                }
 
-                let serial = SERIAL_COUNTER.next_serial();
-                let under = self.surface_under(loc);
+                let loc = self.clamp_to_outputs(origin + delta);
+                let new_under = self.surface_under(loc);
 
-                // If pointer is locked, send relative motion event
-                if send_relative {
-                    if let Some(ref surface) = focused_surface {
-                        pointer.relative_motion(
-                            self,
-                            Some((surface.clone(), loc)),
-                            &RelativeMotionEvent {
-                                delta,
-                                delta_unaccel: delta,
-                                utime: event.time_msec() as u64 * 1_000_000, // Convert ms to us
-                            },
-                        );
+                // Confined: reject outright any motion that would leave the
+                // constraining surface or its region. The previous code clamped
+                // to the whole output here, which confined nothing.
+                if confined {
+                    if let Some((surface, surface_loc)) = under.as_ref() {
+                        if new_under.as_ref().map(|(s, _)| s) != Some(surface) {
+                            pointer.frame(self);
+                            return;
+                        }
+                        if let Some(region) = confine_region {
+                            if !region.contains((loc - *surface_loc).to_i32_round()) {
+                                pointer.frame(self);
+                                return;
+                            }
+                        }
                     }
                 }
 
-                // Always send motion event (even for locked pointers, to maintain protocol compliance)
+                self.pointer_location = loc;
+
                 pointer.motion(
                     self,
-                    under,
+                    new_under.clone(),
                     &MotionEvent {
                         location: loc,
                         serial,
@@ -231,6 +223,22 @@ impl RubixState {
                     },
                 );
                 pointer.frame(self);
+
+                // Moving into a constraint's region arms it: a client may create
+                // the constraint while the pointer sits outside the region, and
+                // `new_constraint` declines to activate in that case.
+                if let Some((surface, surface_loc)) = new_under {
+                    with_pointer_constraint(&surface, &pointer, |constraint| {
+                        let Some(constraint) = constraint else { return };
+                        if constraint.is_active() {
+                            return;
+                        }
+                        let point = (loc - surface_loc).to_i32_round();
+                        if constraint.region().is_none_or(|r| r.contains(point)) {
+                            constraint.activate();
+                        }
+                    });
+                }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 // Absolute devices (touchscreens/tablets) report position

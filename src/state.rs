@@ -27,7 +27,8 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
-        pointer_constraints::PointerConstraintsState,
+        pointer_constraints::{PointerConstraintsState, with_pointer_constraint},
+        seat::WaylandFocus,
         relative_pointer::RelativePointerManagerState,
         selection::{data_device::DataDeviceState, wlr_data_control::DataControlState},
         shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
@@ -208,6 +209,10 @@ pub struct RubixState {
     // The client-requested cursor image (named/surface/hidden), set by the
     // `SeatHandler::cursor_image` callback in handlers/mod.rs.
     pub cursor_status: CursorImageStatus,
+    // Surface-local position a pointer-locking client says it is drawing its own
+    // cursor at. Recorded while the lock is active so the real pointer can be
+    // warped there when the lock ends (handlers/pointer_constraints.rs).
+    pub(crate) cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
 
     // wlr-screencopy captures awaiting the next presented frame. Pushed by the
     // frame `copy` handler (screencopy.rs), drained by each backend's render
@@ -344,6 +349,7 @@ impl RubixState {
 
             pointer_location,
             cursor_status: CursorImageStatus::default_named(),
+            cursor_position_hint: None,
             pending_screencopy: Vec::new(),
 
             color_management_state,
@@ -444,6 +450,38 @@ impl RubixState {
     /// paths build. Without the layer hit-test the space's toplevels were the only
     /// thing the pointer could ever land on, so layer clients (mako notifications,
     /// the bar) never received pointer enter/button events and couldn't be clicked.
+    /// Global top-left of the mapped window backing `surface`, for turning
+    /// surface-local client coordinates back into compositor space.
+    pub(crate) fn window_location(&self, surface: &WlSurface) -> Option<Point<f64, Logical>> {
+        let window = self
+            .space
+            .elements()
+            .find(|window| window.wl_surface().is_some_and(|s| s.as_ref() == surface))?;
+        self.space.element_location(window).map(|loc| loc.to_f64())
+    }
+
+    /// Hold a proposed pointer position inside the output layout.
+    ///
+    /// Any point landing on some output is accepted as-is, so the cursor crosses
+    /// freely between adjacent heads; otherwise it is clamped per-axis to the
+    /// output it is currently on, stopping it at that head's edge where there is
+    /// no neighbour.
+    pub(crate) fn clamp_to_outputs(&self, proposed: Point<f64, Logical>) -> Point<f64, Logical> {
+        if self.output_at(proposed).is_some() {
+            return proposed;
+        }
+        let current = self
+            .output_at(self.pointer_location)
+            .or_else(|| self.space.outputs().next().cloned());
+        let Some(current) = current else { return self.pointer_location };
+        let Some(geo) = self.space.output_geometry(&current) else { return self.pointer_location };
+
+        let mut clamped = proposed;
+        clamped.x = clamped.x.clamp(geo.loc.x as f64, (geo.loc.x + geo.size.w) as f64);
+        clamped.y = clamped.y.clamp(geo.loc.y as f64, (geo.loc.y + geo.size.h) as f64);
+        clamped
+    }
+
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
         // Prefer the output whose geometry actually contains the pointer; fall
         // back to the first known output for a point in a dead zone between
@@ -934,6 +972,33 @@ impl RubixState {
         self.focus_by_id(next);
     }
 
+    /// Deactivate the pointer constraint on every window except `keep`.
+    ///
+    /// The protocol releases a constraint when its surface loses *pointer* focus,
+    /// but a locked pointer cannot move, so pointer focus never changes on its
+    /// own: navigate away from a game that holds a lock and the cursor stays
+    /// frozen on it forever. Keyboard focus moving off the window is the signal
+    /// we actually get, so the release is driven from there.
+    pub(crate) fn release_pointer_constraints(&mut self, keep: Option<u32>) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let surfaces: Vec<WlSurface> = self
+            .windows
+            .iter()
+            .filter(|(id, _)| Some(**id) != keep)
+            .filter_map(|(_, window)| window.wl_surface().map(|s| s.into_owned()))
+            .collect();
+
+        for surface in surfaces {
+            with_pointer_constraint(&surface, &pointer, |constraint| {
+                if let Some(constraint) = constraint {
+                    if constraint.is_active() {
+                        constraint.deactivate();
+                    }
+                }
+            });
+        }
+    }
+
     /// Reconcile focus-dependent window state after keyboard focus moves.
     ///
     /// Maximize releases on any focus change, mirroring the `unfocus` handler in
@@ -945,6 +1010,8 @@ impl RubixState {
     pub(crate) fn reconcile_focus_state(&mut self) {
         let focused = self.focused_window_id();
         let mut dirty = false;
+
+        self.release_pointer_constraints(focused);
 
         if self.maximized.is_some() && self.maximized != focused {
             self.maximized = None;
