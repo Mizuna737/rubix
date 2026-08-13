@@ -39,6 +39,12 @@ pub struct Config {
     /// render path reads -- this field only seeds/reseeds it). Always in
     /// [80, 300], clamped here at resolve time.
     pub sdr_white_nits: f32,
+
+    /// Hovering a window gives it keyboard focus. Live/hot-reloadable, and also
+    /// flippable at runtime via the ToggleFocusFollowsMouse keybind (see
+    /// RubixState::focus_follows_mouse, the live value the input path reads --
+    /// this field only seeds/reseeds it).
+    pub focus_follows_mouse: bool,
 }
 
 /// Resolved placement for one physical output, matched by connector name
@@ -91,6 +97,8 @@ struct RawConfig {
     layout: RawLayout,
     #[serde(default)]
     animation: RawAnimation,
+    #[serde(default)]
+    input: RawInput,
     // Top-level scalar (must sit before the first [table] header in the TOML
     // file -- see config/default.toml). Live/hot-reloadable: HDR Phase 4's
     // SDR-white-nits slider, adjustable via keybind (IncreaseSdrWhite /
@@ -149,6 +157,16 @@ impl Default for RawAnimation {
     fn default() -> Self {
         RawAnimation { duration_ms: default_duration_ms() }
     }
+}
+
+// Optional section: a config omitting `[input]` parses fine, taking the
+// defaults below.
+#[derive(Default, Deserialize)]
+struct RawInput {
+    // Off by default: click-to-focus is the conventional expectation, and
+    // focus-follows-mouse changes what every keystroke does, so it is opt-in.
+    #[serde(default)]
+    focus_follows_mouse: bool,
 }
 
 fn default_duration_ms() -> u64 {
@@ -214,6 +232,7 @@ impl Config {
             startup: raw.startup,
             outputs,
             sdr_white_nits: raw.sdr_white_nits.clamp(80.0, 300.0),
+            focus_follows_mouse: raw.input.focus_follows_mouse,
         }
     }
 

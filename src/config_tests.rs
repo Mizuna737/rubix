@@ -11,7 +11,40 @@
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.visible_columns, 3);
         assert_eq!(cfg.keybinds.len(), bind_count, "a keybind was dropped during resolution");
-        assert_eq!(bind_count, 25);
+        assert_eq!(bind_count, 26);
+    }
+
+    // ---- input ----
+
+    #[test]
+    fn config_omitting_input_section_defaults_focus_follows_mouse_off() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [input] still parses");
+        let cfg = Config::resolve(raw);
+        assert!(!cfg.focus_follows_mouse, "click-to-focus is the default");
+    }
+
+    #[test]
+    fn input_section_enables_focus_follows_mouse() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [input]
+            focus_follows_mouse = true
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config with [input] parses");
+        let cfg = Config::resolve(raw);
+        assert!(cfg.focus_follows_mouse);
     }
 
     // ---- animation duration ----

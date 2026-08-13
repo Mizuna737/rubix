@@ -217,6 +217,10 @@ pub struct RubixState {
     // cursor at. Recorded while the lock is active so the real pointer can be
     // warped there when the lock ends (handlers/pointer_constraints.rs).
     pub(crate) cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
+    // Live focus-follows-mouse flag. Seeded from `config.focus_follows_mouse`
+    // and re-seeded by `reload_config`, but flippable on its own via the
+    // ToggleFocusFollowsMouse keybind -- same seed/live split as sdr_white_nits.
+    pub(crate) focus_follows_mouse: bool,
 
     // wlr-screencopy captures awaiting the next presented frame. Pushed by the
     // frame `copy` handler (screencopy.rs), drained by each backend's render
@@ -304,6 +308,7 @@ impl RubixState {
         let workspace = Workspace::new();
 
         let sdr_white_nits = config.sdr_white_nits.clamp(80.0, 300.0);
+        let focus_follows_mouse = config.focus_follows_mouse;
 
         Self {
             start_time,
@@ -355,6 +360,7 @@ impl RubixState {
             pointer_location,
             cursor_status: CursorImageStatus::default_named(),
             cursor_position_hint: None,
+            focus_follows_mouse,
             pending_screencopy: Vec::new(),
 
             color_management_state,
@@ -645,6 +651,10 @@ impl RubixState {
         // so a plain config-file edit takes effect immediately without
         // needing a keybind nudge -- matches the gaps' live-swap behavior.
         self.sdr_white_nits = self.config.sdr_white_nits;
+        self.config.focus_follows_mouse = new.focus_follows_mouse;
+        // Re-seeded like sdr_white_nits: a config edit wins over a runtime
+        // toggle, so saving the file is always the way back to a known state.
+        self.focus_follows_mouse = self.config.focus_follows_mouse;
         tracing::info!("reloaded config: {count} keybinds active");
         // Force a repaint so an sdr_white_nits edit is visible immediately,
         // same reasoning as the keybind path in dispatch_nav below.
@@ -1021,6 +1031,49 @@ impl RubixState {
             .map(|pos| ids[(pos + 1) % ids.len()])
             .unwrap_or(ids[0]);
         self.focus_by_id(next);
+    }
+
+    /// Give keyboard focus to the window now under the pointer, if
+    /// focus-follows-mouse is on and nothing vetoes it.
+    ///
+    /// Driven from pointer *motion* only, never from a window arriving under a
+    /// stationary cursor -- matching sway, and avoiding focus lurching around
+    /// on its own during a rotate animation.
+    pub(crate) fn focus_follows_pointer(&mut self, pos: Point<f64, Logical>) {
+        if !self.focus_follows_mouse {
+            return;
+        }
+        // A grab owns the pointer for the length of a drag or resize; moving
+        // focus mid-drag pulls the grab out from under itself.
+        if self.seat.get_pointer().is_some_and(|p| p.is_grabbed()) {
+            return;
+        }
+        // Suspended entirely while anything is fullscreen. `reconcile_focus_state`
+        // drops a non-focused window's fullscreen, so a stray hover would kick a
+        // game out of fullscreen -- and a fullscreen window is outside the grid,
+        // making that hard to undo.
+        if !self.fullscreen_windows.is_empty() {
+            return;
+        }
+        // `element_under` only sees space elements, i.e. real toplevels, so
+        // layer-shell surfaces are structurally excluded: hovering the bar or
+        // rofi must never take the keyboard away from them.
+        let Some(id) = self.window_id_at(pos) else { return };
+        if self.focused_window_id() == Some(id) {
+            return;
+        }
+        self.focus_by_id(id);
+        self.ipc_dirty = true;
+    }
+
+    /// The window under a point, as a Rubix id. Resolved through the Space so
+    /// subsurfaces and popups map to their owning toplevel.
+    pub(crate) fn window_id_at(&self, pos: Point<f64, Logical>) -> Option<u32> {
+        let (window, _) = self.space.element_under(pos)?;
+        self.windows
+            .iter()
+            .find(|(_, candidate)| *candidate == window)
+            .map(|(id, _)| *id)
     }
 
     /// Deactivate the pointer constraint on every window except `keep`.

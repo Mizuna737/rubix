@@ -48,6 +48,7 @@ pub(crate) enum NavAction {
     MoveFocusedWindowRight,
     ToggleMaximize,    // focused window fills the monitor work area; releases on focus change
     FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
+    ToggleFocusFollowsMouse, // flip hover-to-focus live; config re-seeds it on save
     IncreaseSdrWhite,
     DecreaseSdrWhite,
     ToggleHdr,
@@ -224,6 +225,8 @@ impl RubixState {
                 );
                 pointer.frame(self);
 
+                self.focus_follows_pointer(loc);
+
                 // Moving into a constraint's region arms it: a client may create
                 // the constraint while the pointer sits outside the region, and
                 // `new_constraint` declines to activate in that case.
@@ -275,6 +278,8 @@ impl RubixState {
                     },
                 );
                 pointer.frame(self);
+
+                self.focus_follows_pointer(pos);
             }
             InputEvent::PointerButton { event, .. } => {
                 let pointer = self.seat.get_pointer().expect("pointer added to seat at startup");
@@ -411,6 +416,7 @@ impl RubixState {
                 | NavAction::IncreaseSdrWhite
                 | NavAction::DecreaseSdrWhite
                 | NavAction::ToggleHdr
+                | NavAction::ToggleFocusFollowsMouse
                 | NavAction::Quit
         );
         if !keeps_maximize {
@@ -434,6 +440,13 @@ impl RubixState {
                 self.pending_transition = Some(Transition::Scroll { down: true });
                 if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.scroll_active_column(1); }
             },
+            NavAction::ToggleFocusFollowsMouse => {
+                self.focus_follows_mouse = !self.focus_follows_mouse;
+                tracing::info!("focus follows mouse: {}", self.focus_follows_mouse);
+                // Takes effect on the next pointer motion rather than adopting
+                // whatever happens to sit under a stationary cursor -- turning it
+                // on should not itself move focus.
+            }
             NavAction::MoveToNewColumn => { self.move_focused_window_to_new_column() },
             NavAction::MoveActiveColumnLeft => {
                 if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.move_active_column(-1); }
