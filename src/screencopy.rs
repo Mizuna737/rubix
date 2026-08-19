@@ -318,6 +318,25 @@ where
     state.pending_screencopy = remaining;
 }
 
+/// One-shot per capture path: what `Mapping::flipped()` actually reports.
+///
+/// `screencopy.rs` and `portal/capture.rs` do byte-identical readbacks -- same
+/// offscreen, same `Transform::Normal`, same `copy_framebuffer`, same
+/// conditional row flip -- and there is no second flip in the PipeWire feed. So
+/// they cannot legitimately differ in orientation, yet grim output is verifiably
+/// upside down while Teams screenshare is reported right way up. One of those
+/// two observations has to be wrong, and guessing which would mean "fixing" one
+/// path by breaking the other.
+pub(crate) fn log_readback_orientation(path: &str, flipped: bool) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static SEEN: AtomicU8 = AtomicU8::new(0);
+    let bit = if path == "screencopy" { 1 } else { 2 };
+    let prev = SEEN.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        tracing::info!("capture readback [{path}]: Mapping::flipped() = {flipped}");
+    }
+}
+
 /// Re-render `output`'s full element list into an offscreen renderbuffer, read
 /// back the requested sub-region, and blit it into the client's SHM buffer.
 /// Returns whether the copied contents are y-inverted (for the `flags` event).
@@ -364,6 +383,7 @@ where
         // honouring the `y_invert` flag (grim does not reliably here on NVIDIA
         // GLES), normalize to top-down ourselves and report no inversion.
         let flip = mapping.flipped();
+        log_readback_orientation("screencopy", flip);
         let src = renderer
             .map_texture(&mapping)
             .map_err(|e| format!("map_texture: {e:?}"))?;

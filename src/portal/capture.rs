@@ -229,6 +229,7 @@ where
         let mapping =
             renderer.copy_framebuffer(&fb, region, Fourcc::Xrgb8888).map_err(|e| format!("copy_framebuffer: {e:?}"))?;
         let flip = mapping.flipped();
+        crate::screencopy::log_readback_orientation("portal", flip);
         let src = renderer.map_texture(&mapping).map_err(|e| format!("map_texture: {e:?}"))?;
         (flip, src.to_vec())
     };
