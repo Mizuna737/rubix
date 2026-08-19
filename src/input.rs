@@ -20,7 +20,7 @@ use smithay::{
 use serde::Deserialize;
 
 use crate::focus::KeyboardFocusTarget;
-use crate::state::{RubixState, Transition};
+use crate::state::{MaximizeState, RubixState, Transition};
 use crate::model::grid::{Direction, RevealKind};
 
 /// A Rubix navigation chord. Bound to a chord in `config.toml`, where the value
@@ -410,7 +410,7 @@ impl RubixState {
                 | NavAction::Quit
         );
         if !keeps_maximize {
-            self.maximized = None;
+            self.maximized = MaximizeState::None;
         }
 
         match action {

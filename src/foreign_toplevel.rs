@@ -40,6 +40,7 @@ use smithay::{
 };
 
 use crate::RubixState;
+use crate::state::MaximizeState;
 
 /// Advertise the manager global. Version 3 (adds `parent`; rofi binds 3).
 pub fn init(dh: &DisplayHandle) {
@@ -164,14 +165,17 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ToplevelHandleData> for RubixState {
                 state.apply_layout();
                 state.ipc_dirty = true;
             }
+            // A client asking to be maximized means the whole work area -- the
+            // Group stage is a Rubix-internal step in the keybind's cycle, not
+            // anything the protocol can express.
             zwlr_foreign_toplevel_handle_v1::Request::SetMaximized => {
-                state.maximized = Some(id);
+                state.maximized = MaximizeState::Monitor(id);
                 state.apply_layout();
                 state.ipc_dirty = true;
             }
             zwlr_foreign_toplevel_handle_v1::Request::UnsetMaximized => {
-                if state.maximized == Some(id) {
-                    state.maximized = None;
+                if state.maximized.window() == Some(id) {
+                    state.maximized = MaximizeState::None;
                     state.apply_layout();
                     state.ipc_dirty = true;
                 }
@@ -210,7 +214,7 @@ fn forget_handle(state: &mut RubixState, id: u32, handle: &ZwlrForeignToplevelHa
 /// them so the comparison against the last-sent set is a plain slice equality.
 fn states_for(state: &RubixState, id: u32, focused: Option<u32>) -> Vec<ToplevelState> {
     let mut states = Vec::new();
-    if state.maximized == Some(id) {
+    if state.maximized.window() == Some(id) {
         states.push(ToplevelState::Maximized);
     }
     // Hidden-by-layout is the closest thing Rubix has to minimized, and it is

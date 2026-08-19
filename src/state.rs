@@ -108,6 +108,37 @@ pub(crate) enum Transition {
     Reveal,
 }
 
+/// How much space the maximized window takes, if any.
+///
+/// Compositor-only state: unlike fullscreen this involves no client protocol
+/// negotiation, no connector or scanout involvement. The window keeps its grid
+/// slot -- only the rect `apply_layout` hands it changes -- and it releases
+/// itself as soon as focus moves elsewhere.
+///
+/// `ToggleMaximize` cycles `Group` -> `Monitor` -> `None`. `Group` covers only
+/// the window's own split tree, hiding its tiling siblings while the rest of
+/// the grid stays visible; `Monitor` takes the whole work area. A window alone
+/// in its group skips `Group`, where its tile already *is* the group rect and
+/// the first press would look dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaximizeState {
+    None,
+    Group(u32),
+    Monitor(u32),
+}
+
+impl MaximizeState {
+    /// The window this applies to, if any. The common question -- every caller
+    /// outside `apply_layout` cares *whether* a window is blown up, not by how
+    /// much.
+    pub(crate) fn window(self) -> Option<u32> {
+        match self {
+            MaximizeState::None => None,
+            MaximizeState::Group(id) | MaximizeState::Monitor(id) => Some(id),
+        }
+    }
+}
+
 pub struct RubixState {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -186,10 +217,9 @@ pub struct RubixState {
     // layout pass sends no property writes.
     pub(crate) iconified: HashSet<u32>,
 
-    // The window currently maximized, if any. Compositor-only state: unlike
-    // fullscreen it involves no client protocol state, keeps its grid slot, and
-    // releases itself as soon as focus moves elsewhere.
-    pub(crate) maximized: Option<u32>,
+    // How far the focused window is currently blown up, if at all. See
+    // [`MaximizeState`].
+    pub(crate) maximized: MaximizeState,
 
     // Track the last configured geometry and fullscreen state for each window
     // to avoid redundant configure resends when layout is recomputed but geometry
@@ -358,7 +388,7 @@ impl RubixState {
             active_scales: Vec::new(),
             fullscreen_windows: HashSet::new(),
             iconified: HashSet::new(),
-            maximized: None,
+            maximized: MaximizeState::None,
             last_configured: HashMap::new(),
 
             compositor_state,
@@ -1027,11 +1057,16 @@ impl RubixState {
         }
     }
 
-    /// Toggle maximize for the focused window, releasing any previous one.
+    /// Advance the focused window through the maximize cycle.
     ///
-    /// Maximize is deliberately cheap next to fullscreen: no `_NET_WM_STATE`, no
-    /// client negotiation, no connector or scanout involvement. The window keeps
-    /// its grid slot and simply gets the monitor's work area as its rect.
+    /// `Group` -> `Monitor` -> `None`, restarting at whichever stage suits the
+    /// window when the cycle is not already on it. See [`MaximizeState`].
+    ///
+    /// Deliberately not tree surgery. An earlier sketch had the first press
+    /// *promote* the window to the front of its group's split tree, but that
+    /// mutates the layout permanently -- un-maximizing would leave the window
+    /// sitting in its new position with nothing to undo it. Covering the group
+    /// is a pure layout override, so releasing it is just clearing this field.
     pub fn toggle_maximize(&mut self) {
         let Some(id) = self.focused_window_id() else {
             return;
@@ -1042,20 +1077,35 @@ impl RubixState {
             return;
         }
 
-        // MODEL SEAM: before maximizing, a window that is not already first in
-        // its group's tree should be promoted there -- restructured so it is the
-        // root's first child and takes half the space, as if it were the first
-        // window spawned and split once. That is tree surgery in `model::grid`,
-        // so it wants a `Monitor::promote_to_first(id) -> bool` (true when it
-        // moved, false when it was already first). Wire it here as:
-        //
-        //     if self.workspace.active_monitor_mut()
-        //         .is_some_and(|m| m.promote_to_first(id)) { .. return early .. }
-        //
-        // Until that exists, every press maximizes directly.
-        self.maximized = if self.maximized == Some(id) { None } else { Some(id) };
+        self.maximized = match self.maximized {
+            MaximizeState::Group(current) if current == id => MaximizeState::Monitor(id),
+            MaximizeState::Monitor(current) if current == id => MaximizeState::None,
+            // Entering the cycle -- either from rest, or from another window
+            // still holding it, which this press takes over.
+            _ if self.group_window_ids(id).len() > 1 => MaximizeState::Group(id),
+            _ => MaximizeState::Monitor(id),
+        };
         self.apply_layout();
         self.ipc_dirty = true;
+    }
+
+    /// Every window sharing the group that holds `id`, including `id` itself.
+    ///
+    /// Empty when the window is not in the grid at all -- fullscreen windows are
+    /// detached from it, so this is also the "not tiled" answer.
+    fn group_window_ids(&self, id: u32) -> Vec<u32> {
+        for monitor in &self.workspace.monitors {
+            let Some((col, row)) = monitor.locate(id) else {
+                continue;
+            };
+            return monitor
+                .columns()
+                .get(col)
+                .and_then(|c| c.groups().get(row))
+                .map(|g| g.window_ids())
+                .unwrap_or_default();
+        }
+        Vec::new()
     }
 
     /// Focus a fullscreen window, cycling if there is more than one.
@@ -1173,8 +1223,8 @@ impl RubixState {
 
         self.release_pointer_constraints(focused);
 
-        if self.maximized.is_some() && self.maximized != focused {
-            self.maximized = None;
+        if self.maximized.window().is_some() && self.maximized.window() != focused {
+            self.maximized = MaximizeState::None;
             dirty = true;
         }
 
@@ -1254,25 +1304,30 @@ impl RubixState {
             }
         }
 
-        // Maximize: keep the grid slot, take the monitor work area. Only applies
-        // while the window is actually on screen -- a maximized window scrolled
-        // out of view has no entry to override and stays out of view.
-        if let Some(id) = self.maximized {
-            if let Some(bounds) = self
+        // Maximize: keep the grid slot, take a bigger rect. Only applies while
+        // the window is actually on screen -- a maximized window scrolled out of
+        // view has no entry to override and stays out of view. Both stages work
+        // by overwriting that one entry, which is why neither disturbs the grid.
+        let maximize_rect = match self.maximized {
+            MaximizeState::None => None,
+            MaximizeState::Group(id) => group_bounds(&targets, &self.group_window_ids(id)),
+            MaximizeState::Monitor(_) => self
                 .workspace
                 .active_monitor()
                 .and_then(|m| self.output_bounds_for(m.id))
-            {
-                let gap = self.config.outer_gap;
-                let rect = Rect {
-                    x: bounds.x + gap,
-                    y: bounds.y + gap,
-                    width: bounds.width.saturating_sub(2 * gap),
-                    height: bounds.height.saturating_sub(2 * gap),
-                };
-                if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
-                    entry.1 = rect;
-                }
+                .map(|bounds| {
+                    let gap = self.config.outer_gap;
+                    Rect {
+                        x: bounds.x + gap,
+                        y: bounds.y + gap,
+                        width: bounds.width.saturating_sub(2 * gap),
+                        height: bounds.height.saturating_sub(2 * gap),
+                    }
+                }),
+        };
+        if let (Some(id), Some(rect)) = (self.maximized.window(), maximize_rect) {
+            if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
+                entry.1 = rect;
             }
         }
 
@@ -1499,7 +1554,7 @@ impl RubixState {
         // separate lists that always sit in front of space elements, so this
         // cannot paint over them. Raised before fullscreen so that if both
         // somehow apply at once, fullscreen still wins the top slot.
-        if let Some(window) = self.maximized.and_then(|id| self.windows.get(&id).cloned()) {
+        if let Some(window) = self.maximized.window().and_then(|id| self.windows.get(&id).cloned()) {
             self.space.raise_element(&window, false);
         }
 
@@ -1577,4 +1632,34 @@ where
         }
     }
     out
+}
+
+/// Bounding box of every on-screen tile belonging to `ids`.
+///
+/// This is how the `Group` maximize stage gets its rect, and it reads the
+/// already-computed `targets` rather than recomputing the column band. The two
+/// are identical by construction: a group's split tree fills its band exactly,
+/// because `inner_gap` only carves seams *between* leaves and never insets the
+/// outer edge -- so the union of the leaves is the band. Deriving it this way
+/// means the stage cannot drift from the gap arithmetic in `compute_layout`,
+/// which is fiddly enough that a second copy would eventually disagree.
+///
+/// `None` when the group has no tiles in `targets`, which is exactly the case
+/// where it is scrolled off screen and must not be blown up.
+pub(crate) fn group_bounds(targets: &[(u32, Rect)], ids: &[u32]) -> Option<Rect> {
+    targets
+        .iter()
+        .filter(|(id, _)| ids.contains(id))
+        .fold(None, |acc: Option<Rect>, (_, rect)| {
+            Some(match acc {
+                None => *rect,
+                Some(union) => {
+                    let x = union.x.min(rect.x);
+                    let y = union.y.min(rect.y);
+                    let right = (union.x + union.width).max(rect.x + rect.width);
+                    let bottom = (union.y + union.height).max(rect.y + rect.height);
+                    Rect { x, y, width: right - x, height: bottom - y }
+                }
+            })
+        })
 }

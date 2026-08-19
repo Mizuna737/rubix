@@ -496,3 +496,98 @@ fn lerp_scale_runs_backwards_for_a_shrink() {
     assert_eq!(RubixState::lerp_scale(track, 0.5), 0.5);
     assert_eq!(RubixState::lerp_scale(track, 1.0), 0.0);
 }
+
+// ---- group_bounds (the Group maximize stage's rect) ----
+
+use crate::state::group_bounds;
+
+#[test]
+fn group_bounds_of_no_matching_tiles_is_none() {
+    // The off-screen case: a scrolled-away group contributes no entries to
+    // `targets`, and must not be blown up.
+    let targets = vec![(1, make_rect(0, 0, 100, 100))];
+    assert_eq!(group_bounds(&targets, &[7, 8]), None);
+}
+
+#[test]
+fn group_bounds_of_empty_id_list_is_none() {
+    let targets = vec![(1, make_rect(0, 0, 100, 100))];
+    assert_eq!(group_bounds(&targets, &[]), None);
+}
+
+#[test]
+fn group_bounds_of_a_lone_tile_is_that_tile() {
+    let tile = make_rect(30, 40, 200, 300);
+    let targets = vec![(1, tile)];
+    assert_eq!(group_bounds(&targets, &[1]), Some(tile));
+}
+
+#[test]
+fn group_bounds_unions_across_a_split_seam() {
+    // Two tiles stacked with a 10px seam between them: the union must span the
+    // seam, not report either half.
+    let targets = vec![
+        (1, make_rect(100, 0, 400, 295)),
+        (2, make_rect(100, 305, 400, 295)),
+    ];
+    assert_eq!(group_bounds(&targets, &[1, 2]), Some(make_rect(100, 0, 400, 600)));
+}
+
+#[test]
+fn group_bounds_ignores_tiles_outside_the_group() {
+    // Neighbouring columns are in `targets` too; including them would blow the
+    // window up across the whole screen instead of its own band.
+    let targets = vec![
+        (1, make_rect(0, 0, 300, 600)),
+        (2, make_rect(310, 0, 300, 600)),
+        (3, make_rect(620, 0, 300, 600)),
+    ];
+    assert_eq!(group_bounds(&targets, &[2]), Some(make_rect(310, 0, 300, 600)));
+}
+
+// The claim the whole approach rests on: the union of a group's tiles IS the
+// column band `compute_layout` laid them into. If this ever fails, the Group
+// stage is misaligned against the grid and the rect must be computed from the
+// band arithmetic directly instead of derived from the tiles.
+#[test]
+fn group_bounds_reproduces_the_column_band_exactly() {
+    use crate::model::grid::{Column, Group, Monitor};
+    use crate::model::tiling::{SplitDirection, TilingNode};
+
+    let bounds = make_rect(0, 0, 1920, 1080);
+    let (outer_gap, inner_gap) = (20, 10);
+
+    // Same grid twice, differing only in how many windows sit in column 1's
+    // group: one window, versus a three-way split.
+    let build = |middle: Group| {
+        let mut mon = Monitor::new(0, 0);
+        for group in [Group::new(TilingNode::Leaf { window_id: 1 }, 1), middle, Group::new(TilingNode::Leaf { window_id: 9 }, 9)] {
+            let mut col = Column::new(0);
+            col.add_group(group);
+            mon.add_column(col);
+        }
+        mon.increment_visible_columns(3);
+        mon
+    };
+
+    let mut split = Group::new(TilingNode::Leaf { window_id: 2 }, 2);
+    split.add_window(SplitDirection::Vertical, 3, 2);
+    split.add_window(SplitDirection::Horizontal, 4, 3);
+
+    let lone = build(Group::new(TilingNode::Leaf { window_id: 2 }, 2));
+    let many = build(split);
+
+    let band = lone
+        .compute_layout(bounds, outer_gap, inner_gap)
+        .into_iter()
+        .find(|(id, _)| *id == 2)
+        .map(|(_, rect)| rect)
+        .expect("the lone window's tile is its whole band");
+
+    let targets = many.compute_layout(bounds, outer_gap, inner_gap);
+    assert_eq!(
+        group_bounds(&targets, &[2, 3, 4]),
+        Some(band),
+        "a split group's tiles must union back to the band a lone window fills"
+    );
+}
