@@ -37,6 +37,9 @@ fi
 printf -- '\n--- fullscreen tracking ---\n'
 grep -inE 'fullscreen' "$log" | grep -viE 'egl|extensions:' | tail -25
 
+printf -- '\n--- X11 geometry negotiation (asked vs granted) ---\n'
+grep -inE 'configure_request|fullscreen_request' "$log" | tail -25
+
 printf -- '\n--- scanout / dmabuf setup ---\n'
 grep -inE 'scanout format|dmabuf scanout|advertised zwp_linux_dmabuf|negotiated' "$log" \
   | grep -viE 'egl|extensions:' | tail -15

@@ -197,6 +197,24 @@ impl XwmHandler for RubixState {
             None
         };
 
+        // A game that "goes fullscreen" by sizing itself to the screen, rather
+        // than by setting _NET_WM_STATE_FULLSCREEN, is indistinguishable from an
+        // ordinary resize unless the request itself is visible. Logging what was
+        // asked for against what tiling granted is what separates "the client
+        // never asked" from "we said no". Clients ask rarely, so this is not a
+        // per-frame path.
+        tracing::info!(
+            "X11 configure_request: class={:?} asked={:?}x{:?} at {:?},{:?} -> granted {:?} (window {:?}, fullscreen={})",
+            window.class(),
+            w,
+            h,
+            x,
+            y,
+            rect,
+            id,
+            id.is_some_and(|i| self.fullscreen_windows.contains(&i)),
+        );
+
         match rect {
             Some(rect) => {
                 let _ = window.configure(Some(rect));
@@ -247,6 +265,17 @@ impl XwmHandler for RubixState {
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Logged because the post-map path was previously silent: a game that
+        // sets _NET_WM_STATE_FULLSCREEN after mapping left no trace at all, so
+        // "the game never went fullscreen" and "the game never asked" were
+        // indistinguishable in a session log. Rare enough not to be noise.
+        tracing::info!(
+            "X11 fullscreen_request: class={:?} title={:?} geometry={:?} -> window {:?}",
+            window.class(),
+            window.title(),
+            window.geometry(),
+            self.window_id_for_x11(&window),
+        );
         if let Some(id) = self.window_id_for_x11(&window) {
             self.set_window_fullscreen(id, true);
             self.apply_layout();
@@ -255,6 +284,12 @@ impl XwmHandler for RubixState {
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        tracing::info!(
+            "X11 unfullscreen_request: class={:?} title={:?} -> window {:?}",
+            window.class(),
+            window.title(),
+            self.window_id_for_x11(&window),
+        );
         if let Some(id) = self.window_id_for_x11(&window) {
             self.set_window_fullscreen(id, false);
             self.apply_layout();
