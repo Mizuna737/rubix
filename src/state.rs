@@ -24,6 +24,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle},
     wayland::{
         color::management::ColorManagementState,
+        presentation::PresentationState,
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
@@ -280,6 +281,19 @@ pub struct RubixState {
     // path via `screencopy::fulfill_pending` right after it presents.
     pub(crate) pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
 
+    // wp_presentation: lets clients learn when a frame actually hit the
+    // display, which is what VK_KHR_present_wait / present_id are built on and
+    // what video players use for frame pacing. Feedback is collected per frame
+    // in `udev::render_surface` and fired from the DRM page-flip handler
+    // (`udev::frame_finish`) -- advertising the global without that would hang
+    // any client that waits on a `presented` event.
+    //
+    // Never read: holding it IS its purpose. `PresentationState` owns the
+    // global's `GlobalId`, so dropping this field would tear `wp_presentation`
+    // back down mid-session.
+    #[allow(dead_code)]
+    pub(crate) presentation_state: PresentationState,
+
     // HDR Phase 1b: wp_color_management_v1 state (advertised TFs/primaries,
     // known image-description identities). See `color_management::init`.
     pub(crate) color_management_state: ColorManagementState,
@@ -300,6 +314,10 @@ impl RubixState {
 
         let compositor_state = CompositorState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
+        // CLOCK_MONOTONIC: matches the clock DRM reports page-flip timestamps
+        // against, so the times we hand clients need no conversion.
+        let presentation_state =
+            PresentationState::new::<RubixState>(&dh, <Monotonic as ClockSource>::ID as u32);
         let color_management_state = crate::color_management::init(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let relative_pointer_manager_state = RelativePointerManagerState::new::<Self>(&dh);
@@ -417,6 +435,7 @@ impl RubixState {
             focus_follows_mouse,
             pending_screencopy: Vec::new(),
 
+            presentation_state,
             color_management_state,
             loop_handle,
         }
@@ -1618,7 +1637,7 @@ use smithay::backend::renderer::{
     element::{surface::WaylandSurfaceRenderElement, utils::RescaleRenderElement, AsRenderElements},
     ImportAll, Renderer,
 };
-use smithay::utils::{Physical, Scale};
+use smithay::utils::{ClockSource, Monotonic, Physical, Scale};
 
 pub(crate) fn reveal_scale_elements<R>(
     state: &RubixState,

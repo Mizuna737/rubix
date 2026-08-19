@@ -46,7 +46,8 @@ use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
 use smithay::backend::drm::compositor::{FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::{
-    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode,
+    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata,
+    DrmEventTime, DrmNode,
     DrmSurface, NodeType,
 };
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -70,6 +71,11 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
 use smithay::backend::SwapBuffersError;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+use smithay::wayland::presentation::Refresh;
+use smithay::desktop::utils::surface_presentation_feedback_flags_from_states;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Clock, Monotonic, Time};
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::{
@@ -1431,12 +1437,21 @@ fn render_surface(
     //                   would misrender badly. It MUST go through decode+encode.
     let fullscreen_needs_conversion = matches!(fullscreen_kind, Some(DecodeKind::WindowsScrgb));
     if surface.hdr && (fullscreen_kind.is_none() || fullscreen_needs_conversion) {
+        // Built up front so a failure inside the HDR pipeline still leaves
+        // something to discard -- see the `.take()` in `encode_pass`.
+        let mut hdr_feedback = Some(take_frame_feedback(state, &surface.output, None));
         let hdr_result = if output_has_hdr_window(state, &surface.output) {
             let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
-            render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits)
+            render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits, &mut hdr_feedback)
         } else {
-            render_surface_hdr(surface, renderer, &elements, state.sdr_white_nits)
+            render_surface_hdr(surface, renderer, &elements, state.sdr_white_nits, &mut hdr_feedback)
         };
+        // Anything still here was never queued. Discard explicitly: the SDR
+        // fallback below builds its own, and a silently dropped callback leaves
+        // the client waiting forever.
+        if let Some(mut leftover) = hdr_feedback.take() {
+            leftover.discarded();
+        }
         match hdr_result {
             Ok(presented) => return Ok(presented),
             Err(err) => {
@@ -1590,9 +1605,13 @@ fn render_surface(
         return Ok(false);
     }
 
+    // Collected AFTER render_frame so the element states describe this frame,
+    // and handed to queue_frame as the flip's user data -- it comes back in
+    // `frame_finish` when the page flip completes.
+    let feedback = take_frame_feedback(state, &surface.output, Some(&frame.states));
     surface
         .drm_output
-        .queue_frame(None)
+        .queue_frame(Some(feedback))
         .map_err(Into::<SwapBuffersError>::into)?;
     Ok(true)
 }
@@ -1602,6 +1621,38 @@ fn render_surface(
 /// window's bbox must actually contain the whole output geometry, which is
 /// the same condition `DrmCompositor` requires for primary-plane promotion.
 /// Cheap -- no renderer work, just `Space`/surface-state lookups.
+/// Gather this frame's presentation-feedback callbacks for `output`.
+///
+/// Every surface that contributed to the frame and whose primary scan-out
+/// output is this one hands over its pending `wp_presentation_feedback`
+/// requests; they are fired later, from the DRM page-flip handler, once the
+/// frame has actually reached the display.
+///
+/// The `ZeroCopy` flag is set per surface from the render-element states, so a
+/// directly-scanned-out buffer is reported as such -- that is real information
+/// for a client doing frame pacing, not decoration.
+fn take_frame_feedback(
+    state: &RubixState,
+    output: &Output,
+    render_states: Option<&RenderElementStates>,
+) -> OutputPresentationFeedback {
+    let mut feedback = OutputPresentationFeedback::new(output);
+    let flags = |surface: &WlSurface, _: &_| match render_states {
+        Some(states) => surface_presentation_feedback_flags_from_states(surface, None, states),
+        // The HDR paths composite everything into the 16F offscreen and
+        // re-encode, so no client buffer is ever scanned out directly --
+        // claiming ZeroCopy there would be a lie.
+        None => wp_presentation_feedback::Kind::empty(),
+    };
+    for window in state.space.elements() {
+        window.take_presentation_feedback(&mut feedback, surface_primary_scanout_output, flags);
+    }
+    for layer in layer_map_for_output(output).layers() {
+        layer.take_presentation_feedback(&mut feedback, surface_primary_scanout_output, flags);
+    }
+    feedback
+}
+
 /// The `WlSurface` of the fullscreen scanout candidate on `output`.
 ///
 /// Companion to [`fullscreen_candidate_id`]; the diagnostic needs the surface
@@ -1907,7 +1958,12 @@ fn ensure_hdr_resources(
 /// `HdrOffscreen`'s doc). `FrameFlags::empty()` forces GL composition so the
 /// encode shader can't be bypassed by direct-scanout promotion (see
 /// `compositor/mod.rs:2880-2911`'s scanout-eligibility check).
-fn encode_pass(surface: &mut SurfaceData, renderer: &mut RubixRenderer<'_>, shaders: &HdrShaders) -> Result<bool, String> {
+fn encode_pass(
+    surface: &mut SurfaceData,
+    renderer: &mut RubixRenderer<'_>,
+    shaders: &HdrShaders,
+    feedback: &mut Option<OutputPresentationFeedback>,
+) -> Result<bool, String> {
     let texture = {
         let offscreen = surface.hdr_offscreen.as_ref().expect("just ensured above");
         offscreen.texture.clone()
@@ -1943,9 +1999,12 @@ fn encode_pass(surface: &mut SurfaceData, renderer: &mut RubixRenderer<'_>, shad
     if frame.is_empty {
         return Ok(false);
     }
+    // `.take()`, so an error before this point leaves the feedback with the
+    // caller to discard. Dropping it silently would destroy the callbacks with
+    // neither a `presented` nor a `discarded` event, leaving the client waiting.
     surface
         .drm_output
-        .queue_frame(None)
+        .queue_frame(feedback.take())
         .map_err(|e| format!("HDR encode queue_frame: {e:?}"))?;
     Ok(true)
 }
@@ -1965,6 +2024,7 @@ fn render_surface_hdr<'a>(
     renderer: &mut RubixRenderer<'a>,
     elements: &[RubixRenderElement<RubixRenderer<'a>>],
     sdr_white_nits: f32,
+    feedback: &mut Option<OutputPresentationFeedback>,
 ) -> Result<bool, String> {
     let shaders = ensure_hdr_resources(surface, renderer)?;
 
@@ -1999,7 +2059,7 @@ fn render_surface_hdr<'a>(
     }
     decode_result?;
 
-    encode_pass(surface, renderer, &shaders)
+    encode_pass(surface, renderer, &shaders, feedback)
 }
 
 /// HDR Phase 1b's slow-path pipeline: used only when [`output_has_hdr_window`]
@@ -2033,6 +2093,7 @@ fn render_surface_hdr_zrun<'a>(
     renderer: &mut RubixRenderer<'a>,
     tagged_elements: &[(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)],
     sdr_white_nits: f32,
+    feedback: &mut Option<OutputPresentationFeedback>,
 ) -> Result<bool, String> {
     let shaders = ensure_hdr_resources(surface, renderer)?;
 
@@ -2103,7 +2164,7 @@ fn render_surface_hdr_zrun<'a>(
     }
     decode_result?;
 
-    encode_pass(surface, renderer, &shaders)
+    encode_pass(surface, renderer, &shaders, feedback)
 }
 
 /// VBlank handler: a queued flip completed. Ack it to the `DrmOutput`, then
@@ -2112,7 +2173,7 @@ fn frame_finish(
     udev: &Rc<RefCell<UdevData>>,
     node: DrmNode,
     crtc: crtc::Handle,
-    _metadata: &mut Option<DrmEventMetadata>,
+    metadata: &mut Option<DrmEventMetadata>,
 ) {
     let frame_duration = {
         let mut guard = udev.borrow_mut();
@@ -2122,11 +2183,43 @@ fn frame_finish(
         let Some(surface) = backend.surfaces.get_mut(&crtc) else {
             return;
         };
+        let frame_duration = surface.frame_duration;
         match surface.drm_output.frame_submitted() {
-            Ok(_feedback) => {}
+            Ok(feedback) => {
+                // wp_presentation: the frame is on screen now, so every callback
+                // collected for it gets its `presented` event.
+                //
+                // Times come from the DRM event where the driver supplied one --
+                // that is the actual scanout timestamp on CLOCK_MONOTONIC, which
+                // is the clock the global was created with, so no conversion. A
+                // driver that reports no time forces the fallback below; using
+                // "now" there is a small lie, but a far smaller one than never
+                // answering, which would hang any client on VK_KHR_present_wait.
+                if let Some(mut feedback) = feedback.flatten() {
+                    let (time, flags, seq) = match metadata.as_ref().map(|m| (m.time, m.sequence)) {
+                        Some((DrmEventTime::Monotonic(time), seq)) => (
+                            Time::<Monotonic>::from(time),
+                            wp_presentation_feedback::Kind::Vsync
+                                | wp_presentation_feedback::Kind::HwClock
+                                | wp_presentation_feedback::Kind::HwCompletion,
+                            seq,
+                        ),
+                        // Realtime, or no metadata at all: the driver's clock is
+                        // not the one this global was created with, so read our
+                        // own instead of converting. The Vsync flag still holds;
+                        // HwClock/HwCompletion do not, and are not claimed.
+                        other => (
+                            Clock::<Monotonic>::new().now(),
+                            wp_presentation_feedback::Kind::Vsync,
+                            other.map(|(_, seq)| seq).unwrap_or(0),
+                        ),
+                    };
+                    feedback.presented(time, Refresh::Fixed(frame_duration), seq as u64, flags);
+                }
+            }
             Err(e) => tracing::warn!("frame_submitted error on {crtc:?}: {e}"),
         }
-        surface.frame_duration
+        frame_duration
     };
 
     // Repaint a touch before the next scanout so the buffer is ready in time.
