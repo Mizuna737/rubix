@@ -241,6 +241,14 @@ pub(crate) struct SurfaceData {
     /// (direct scanout) or fell back to composite. Tracked so the
     /// direct-scanout diagnostic in `render_surface` logs only on change.
     last_scanout_promoted: Option<bool>,
+    /// Which window was the fullscreen scanout candidate on the previous frame.
+    ///
+    /// Paired with `last_scanout_promoted` so the diagnostic fires when the
+    /// *candidate* changes too, not only when promotion flips. Without it a
+    /// second fullscreen client that fails exactly like the first logs nothing
+    /// -- the flag is already `Some(false)` -- and that silence is
+    /// indistinguishable from the diagnostic never running at all.
+    last_scanout_candidate: Option<u32>,
     /// The two dmabuf feedback objects clients on this output should pick
     /// between (see `select_dmabuf_feedback`): `render_feedback` names only
     /// the primary GPU's render-optimal formats/modifiers; `scanout_feedback`
@@ -902,6 +910,7 @@ fn connector_connected(
             hdr_offscreen: None,
             applied_connector_hdr: None,
             last_scanout_promoted: None,
+            last_scanout_candidate: None,
             dmabuf_feedback,
             primary_plane_formats,
         },
@@ -1446,8 +1455,11 @@ fn render_surface(
     // the `is_empty` early return below, or a promotion change on an empty
     // frame would be missed.
     let promoted = matches!(frame.primary_element, PrimaryPlaneElement::Element(_));
-    if surface.last_scanout_promoted != Some(promoted) {
+    let candidate = fullscreen_candidate_id(state, &surface.output);
+    if surface.last_scanout_promoted != Some(promoted) || surface.last_scanout_candidate != candidate
+    {
         surface.last_scanout_promoted = Some(promoted);
+        surface.last_scanout_candidate = candidate;
         let output_name = surface.output.name();
         let element_count = elements.len();
         tracing::info!(
@@ -1544,6 +1556,22 @@ fn render_surface(
 /// window's bbox must actually contain the whole output geometry, which is
 /// the same condition `DrmCompositor` requires for primary-plane promotion.
 /// Cheap -- no renderer work, just `Space`/surface-state lookups.
+/// The window id `fullscreen_scanout_target` would pick for `output`.
+///
+/// Same containment test, returning the identity rather than the decode kind,
+/// so the diagnostic can tell "a different client is the candidate now" from
+/// "the same one is still failing".
+fn fullscreen_candidate_id(state: &RubixState, output: &Output) -> Option<u32> {
+    let output_geo = state.space.output_geometry(output)?;
+    state.fullscreen_windows.iter().copied().find(|id| {
+        state
+            .windows
+            .get(id)
+            .and_then(|window| state.space.element_bbox(window))
+            .is_some_and(|bbox| bbox.contains_rect(output_geo))
+    })
+}
+
 fn fullscreen_scanout_target(state: &RubixState, output: &Output) -> Option<DecodeKind> {
     let output_geo = state.space.output_geometry(output)?;
     state.fullscreen_windows.iter().find_map(|id| {

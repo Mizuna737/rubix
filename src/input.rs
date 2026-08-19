@@ -528,6 +528,10 @@ impl RubixState {
 
     fn focus_by_id_raising(&mut self, id: u32, raise: bool) {
         let Some(window) = self.windows.get(&id).cloned() else { return; };
+        // Captured before focus moves: `apply_layout` hands a fullscreen window
+        // a rect ONLY while it is focused, so focus entering or leaving the
+        // fullscreen set changes the layout even though the grid is untouched.
+        let previous_focus = self.focused_window_id();
         // X11 windows focus as their X11Surface so input focus is actually
         // driven (XSetInputFocus/WM_TAKE_FOCUS); wayland windows as wl_surface.
         let Some(target) = KeyboardFocusTarget::from_window(&window) else { return; };
@@ -578,13 +582,33 @@ impl RubixState {
         keyboard.set_focus(self, Some(target), serial);
         self.reconcile_focus_state();
 
-        // Only re-lay-out when the reveal actually restructured something.
-        // AlreadyVisible and None leave the grid byte-identical, and an
-        // unconditional apply_layout here would take the snap path -- whose
-        // first act is settle_tweens() -- immediately after nav dispatch armed
-        // and started an animation, killing every nav transition on the
+        // Re-lay-out when the reveal restructured something, OR when focus
+        // crossed the fullscreen set in either direction.
+        //
+        // The reveal half: AlreadyVisible and None leave the grid byte-identical,
+        // and an unconditional apply_layout here would take the snap path --
+        // whose first act is settle_tweens() -- immediately after nav dispatch
+        // armed and started an animation, killing every nav transition on the
         // focus_active_window that follows it.
-        if matches!(revealed, Some(RevealKind::Scrolled { .. }) | Some(RevealKind::Swapped)) {
+        //
+        // The fullscreen half: fullscreen windows are out of the grid, so the
+        // reveal is always a no-op for them and the test above never fires. But
+        // `apply_layout` only emits a rect for the *focused* fullscreen window,
+        // so focus arriving at one is precisely when it needs a layout pass. Any
+        // client that requested fullscreen before its first commit hits this: the
+        // map path lays out first and focuses second, so the window is unfocused
+        // at layout time, gets no rect, and never reaches the Space -- invisible
+        // until some unrelated event happens to run a layout. Leaving one matters
+        // for the mirror reason: its rect has to stop being emitted.
+        //
+        // Deliberately narrower than "anything is fullscreen". That version would
+        // settle tweens on every focus change while a game sat unfocused in the
+        // background, killing nav animation for the whole session.
+        let crossed_fullscreen = self.fullscreen_windows.contains(&id)
+            || previous_focus.is_some_and(|prev| self.fullscreen_windows.contains(&prev));
+        if crossed_fullscreen
+            || matches!(revealed, Some(RevealKind::Scrolled { .. }) | Some(RevealKind::Swapped))
+        {
             self.apply_layout();
         }
     }
