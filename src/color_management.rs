@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_info_v1::WpImageDescriptionInfoV1;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::wayland_server::{DisplayHandle, Resource};
 use smithay::wayland::color::management::{
-    get_surface_description, send_image_description_info, ColorManagementHandler,
+    get_surface_description, Chromaticities, ColorManagementHandler,
     ColorManagementState, Feature, ImageDescription, Primaries, PrimariesOption, TransferFunction,
 };
 
@@ -202,6 +202,55 @@ pub fn init(dh: &DisplayHandle) -> ColorManagementState {
     )
 }
 
+/// Send every `wp_image_description_info_v1` data event for `desc`, but NOT
+/// `done`.
+///
+/// Mirrors smithay's `send_image_description_info` with the destructor split
+/// off, so the data can go out synchronously during request dispatch while the
+/// destructor is deferred as its contract requires. See the call site for why
+/// the ordering matters.
+fn send_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
+    if !info.is_alive() {
+        return;
+    }
+    let container = Chromaticities::from_option(desc.primaries);
+    if let Some(p) = container {
+        info.primaries(p.red.0, p.red.1, p.green.0, p.green.1, p.blue.0, p.blue.1, p.white.0, p.white.1);
+    }
+    if let Some(named) = desc.primaries.named {
+        info.primaries_named(named);
+    }
+    info.tf_named(desc.transfer);
+
+    // Always sent: clients read the reference white from here. gamescope's
+    // `m_uReferenceLuminance` is this event's third field.
+    let (min_lum, max_lum, reference_lum) = desc.luminances_or_default();
+    info.luminances(min_lum, max_lum, reference_lum);
+
+    let target = desc
+        .mastering_primaries
+        .unwrap_or(container.unwrap_or(Chromaticities::from_named(Primaries::Srgb)));
+    info.target_primaries(
+        target.red.0, target.red.1, target.green.0, target.green.1,
+        target.blue.0, target.blue.1, target.white.0, target.white.1,
+    );
+
+    // Also always sent: without mastering luminances the target volume takes the
+    // primary volume's range. gamescope's `m_uMaxTargetLuminance` is this
+    // event's second field, and `bExposeHDRSupport` is precisely
+    // `max_target > reference` -- so with (50, 1000) against a reference of 203
+    // this is what flips HDR on for a nested game.
+    let (target_min, target_max) = desc.mastering_luminance.unwrap_or((min_lum, max_lum));
+    info.target_luminance(target_min, target_max);
+
+    if let Some(max_cll) = desc.max_cll {
+        info.target_max_cll(max_cll);
+    }
+    if let Some(max_fall) = desc.max_fall {
+        info.target_max_fall(max_fall);
+    }
+}
+
 impl ColorManagementHandler for RubixState {
     fn color_management_state(&mut self) -> &mut ColorManagementState {
         &mut self.color_management_state
@@ -253,12 +302,31 @@ impl ColorManagementHandler for RubixState {
             desc.windows_scrgb,
             desc.windows_bt2100,
         );
-        // Must be deferred to an event-loop idle callback -- the trait's doc
-        // comment warns that `done` is a destructor event and destroying the
-        // object inside the very dispatch callback that created it corrupts
-        // wayland-backend's bookkeeping (use-after-free on the next flush).
+        // Split deliberately: the DATA events go out now, synchronously, and
+        // only `done` is deferred.
+        //
+        // smithay's `send_image_description_info` sends both, and its contract
+        // requires deferring the whole thing, because `done` is a destructor
+        // event and destroying the object inside the dispatch callback that
+        // created it is a use-after-free. But deferring the data too is wrong
+        // for a client that does get_information followed by a roundtrip: the
+        // reply to `wl_display.sync` is written DURING dispatch, so an idle
+        // callback puts our events after it and the roundtrip returns before
+        // any of them arrive.
+        //
+        // That is exactly what gamescope does. It read its uninitialised
+        // defaults (uMaxLum/uRefLum = 80/80), concluded the display had no HDR
+        // headroom, and refused to expose HDR to the game -- while our log
+        // showed us sending luminances (50, 1000, 203) 135ms later, to nobody.
+        //
+        // Sending the data first is safe: none of these are destructors. The
+        // per-event client callbacks fire as they arrive, so the values land
+        // before the roundtrip completes even though `done` follows it.
+        send_info_events(&info, &desc);
         self.loop_handle.insert_idle(move |_state| {
-            send_image_description_info(&info, &desc);
+            if info.is_alive() {
+                info.done();
+            }
         });
     }
 }
