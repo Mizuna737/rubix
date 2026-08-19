@@ -1750,7 +1750,7 @@ fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
     let Some(region) = state.space.output_geometry(output) else {
         return false;
     };
-    state.space.elements().any(|window| {
+    let window_is_hdr = state.space.elements().any(|window| {
         state
             .space
             .element_bbox(window)
@@ -1758,15 +1758,27 @@ fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
             && window
                 .wl_surface()
                 .is_some_and(|s| surface_decode_kind(&s).is_hdr())
-    })
+    });
+    if window_is_hdr {
+        return true;
+    }
+    // Layer surfaces can declare HDR too. A wallpaper tool on the background
+    // layer is the realistic case -- an HDR wallpaper needs no toolkit support
+    // beyond what mpv-style players already have -- but a bar or overlay that
+    // grows color management gets the same treatment for free. Layers are
+    // per-output by construction, so no region test is needed.
+    let map = layer_map_for_output(output);
+    map.layers()
+        .any(|layer| surface_decode_kind(layer.wl_surface()).is_hdr())
 }
 
 /// Slow-path element gather for HDR Phase 1b: same front-to-back z-order as
 /// `render_surface`'s plain `elements` (cursor, overlay, top, ghosts, space,
 /// bottom, background), but paired with each element's [`DecodeKind`] so
 /// `render_surface_hdr_zrun` can decode each surface through its own
-/// transfer function. Cursor/layer-shell/ghost elements are always `Sdr`
-/// (compositor/shell chrome, never client HDR content) and are rebuilt here
+/// transfer function. Cursor and ghost elements are always `Sdr` (compositor
+/// chrome and animation copies, never client HDR content); layer surfaces are
+/// tagged from their own declaration like any other client. They are rebuilt here
 /// via fresh, independent `render_elements` calls -- cheap (element structs
 /// referencing existing textures, no new GPU work) and avoids needing the
 /// non-`Clone` `WaylandSurfaceRenderElement`/`RubixRenderElement` values
@@ -1791,21 +1803,31 @@ fn gather_tagged_elements<'a>(
     output: &Output,
     scale: f64,
 ) -> Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> {
-    let mut background: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
-    let mut bottom: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
-    let mut top: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
-    let mut overlay: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    // Paired with a DecodeKind like space windows, rather than assumed SDR: a
+    // layer surface that declares a transfer function has made a statement
+    // about its content, and ignoring it means silently misrendering a client
+    // that did everything right. The concrete case today is an HDR wallpaper
+    // on the background layer.
+    type TaggedSurface<'r> = (DecodeKind, WaylandSurfaceRenderElement<RubixRenderer<'r>>);
+    let mut background: Vec<TaggedSurface<'a>> = Vec::new();
+    let mut bottom: Vec<TaggedSurface<'a>> = Vec::new();
+    let mut top: Vec<TaggedSurface<'a>> = Vec::new();
+    let mut overlay: Vec<TaggedSurface<'a>> = Vec::new();
     {
         let map = layer_map_for_output(output);
         for layer in map.layers() {
             let Some(geo) = map.layer_geometry(layer) else { continue };
             let loc = geo.loc.to_physical_precise_round(scale);
-            let elems = layer.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
-                renderer,
-                loc,
-                Scale::from(scale),
-                1.0,
-            );
+            let kind = surface_decode_kind(layer.wl_surface());
+            let elems = layer
+                .render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
+                    renderer,
+                    loc,
+                    Scale::from(scale),
+                    1.0,
+                )
+                .into_iter()
+                .map(|e| (kind, e));
             match layer.layer() {
                 Layer::Background => background.extend(elems),
                 Layer::Bottom => bottom.extend(elems),
@@ -1876,11 +1898,12 @@ fn gather_tagged_elements<'a>(
     tagged.extend(
         overlay
             .into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
     );
     tagged.extend(
-        top.into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+        top
+            .into_iter()
+            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
     );
     tagged.extend(
         ghosts
@@ -1906,12 +1929,12 @@ fn gather_tagged_elements<'a>(
     tagged.extend(
         bottom
             .into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
     );
     tagged.extend(
         background
             .into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
     );
     tagged
 }
