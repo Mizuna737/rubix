@@ -669,8 +669,23 @@ impl RubixState {
             .map(|o| o.primary)
             .unwrap_or(false);
         if is_primary || self.workspace.active_monitor().is_none() {
-            self.workspace.set_active_monitor(id);
+            self.set_active_monitor(id);
         }
+    }
+
+    /// Make `id` the active monitor and tell the bar about it.
+    ///
+    /// Wraps `Workspace::set_active_monitor` purely to pair it with `ipc_dirty`:
+    /// which head is active is part of what the status bar renders, and
+    /// `Workspace` cannot set the flag itself (it has no reach into
+    /// `RubixState`). Every caller was setting it by hand, which worked but put
+    /// the burden on each new call site to remember. Go through this one.
+    pub(crate) fn set_active_monitor(&mut self, id: u32) {
+        if self.workspace.active_monitor_id() == id {
+            return;
+        }
+        self.workspace.set_active_monitor(id);
+        self.ipc_dirty = true;
     }
 
     /// Hot-reload keybinds from the user config file. Only the keybind set is

@@ -28,7 +28,7 @@ use crate::model::grid::{Direction, RevealKind};
 /// so there is no chord-name translation table in code. The direction is baked
 /// into the variant name; the motion sign is derived once at the dispatch site.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) enum NavAction {
+pub enum NavAction {
     ScrollColumnDown,   // scroll rows within the active column
     ScrollColumnUp,     //  "
     RotateColumnsRight, // rotate active groups across columns
@@ -535,7 +535,7 @@ impl RubixState {
         // The window's own head becomes the active one, so nav chords act on
         // what the user just selected rather than wherever the cursor was left.
         if let Some(monitor_id) = self.workspace.get_monitor_id_by_window_id(id) {
-            self.workspace.set_active_monitor(monitor_id);
+            self.set_active_monitor(monitor_id);
         }
 
         // Reveal, THEN move the cursor. Order matters: the Swapped branch

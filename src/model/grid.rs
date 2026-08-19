@@ -431,7 +431,7 @@ impl Monitor {
 
 pub struct Workspace {
     pub(crate) monitors: Vec<Monitor>,
-    pub active_monitor: u32,
+    active_monitor: u32,
 }
 
 impl Workspace {
@@ -460,6 +460,16 @@ impl Workspace {
         }
         None
     }
+    /// Which monitor id nav and layout treat as current.
+    ///
+    /// Note this is an id, not an index -- it is matched against `Monitor::id`,
+    /// and there is no guarantee a monitor with this id exists (an unplugged
+    /// output leaves the id dangling until something sets it again), which is
+    /// why `active_monitor()` returns an Option.
+    pub fn active_monitor_id(&self) -> u32 {
+        self.active_monitor
+    }
+
     pub fn set_active_monitor(&mut self, id: u32) {
         self.active_monitor = id;
     }
@@ -475,7 +485,7 @@ impl Workspace {
         for monitor in self.monitors.iter() {
             for column in monitor.columns.iter() {
                 for group in column.groups.iter() {
-                    if let Some(node) = group.layout.as_ref().and_then(|n| n.find_window(window_id)) {
+                    if group.layout.as_ref().and_then(|n| n.find_window(window_id)).is_some() {
                         return Some(monitor.id);
                     }
                 }
