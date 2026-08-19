@@ -1435,9 +1435,33 @@ fn render_surface(
         }
     }
 
+    // Let the primary plane take a fullscreen buffer whose format differs from
+    // the swapchain's.
+    //
+    // `FrameFlags::DEFAULT` permits primary-plane scanout only for an element
+    // matching the swapchain slot's format exactly (compositor/mod.rs:3019). On
+    // an HDR-capable output we negotiate a 10-bit slot (AB30), so every ordinary
+    // 8-bit client buffer -- XR24, which is what SDR clients overwhelmingly
+    // allocate -- fails that equality and is composited without scanout ever
+    // being attempted. It surfaces as `Rendering { reason: None }`, which reads
+    // like "not a candidate" rather than "rejected", and is how the HDR work
+    // silently made direct scanout unreachable for SDR fullscreen clients.
+    //
+    // Scoped to frames with a fullscreen target on purpose. A fullscreen client
+    // owns the output, and the connector has already been driven to match its
+    // decode kind by this point, so adopting its buffer format on the plane is
+    // the intended outcome. Granting it on ordinary desktop frames would let any
+    // client's format reconfigure the plane -- churn for no gain, since a
+    // multi-window desktop composites regardless.
+    let frame_flags = if fullscreen_kind.is_some() {
+        FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+    } else {
+        FrameFlags::DEFAULT
+    };
+
     let frame = surface
         .drm_output
-        .render_frame(renderer, &elements, [0.1, 0.1, 0.1, 1.0], FrameFlags::DEFAULT)
+        .render_frame(renderer, &elements, [0.1, 0.1, 0.1, 1.0], frame_flags)
         .map_err(|err| match err {
             smithay::backend::drm::compositor::RenderFrameError::PrepareFrame(e) => {
                 SwapBuffersError::from(e)
