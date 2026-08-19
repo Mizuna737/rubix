@@ -46,7 +46,8 @@ pub(crate) enum NavAction {
     MoveFocusedWindowDown,
     MoveFocusedWindowLeft,
     MoveFocusedWindowRight,
-    ToggleMaximize,    // focused window fills the monitor work area; releases on focus change
+    ToggleMaximize,        // cycle the focused window group -> monitor -> none; releases on focus change
+    ToggleMaximizeReverse, // the same cycle walked backwards: straight to monitor, then group, then none
     FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
     ToggleFocusFollowsMouse, // flip hover-to-focus live; config re-seeds it on save
     IncreaseSdrWhite,
@@ -403,6 +404,7 @@ impl RubixState {
         let keeps_maximize = matches!(
             action,
             NavAction::ToggleMaximize
+                | NavAction::ToggleMaximizeReverse
                 | NavAction::IncreaseSdrWhite
                 | NavAction::DecreaseSdrWhite
                 | NavAction::ToggleHdr
@@ -470,7 +472,8 @@ impl RubixState {
             NavAction::DecrementVisibleColumns => {
                 if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.increment_visible_columns(-1); }
             },
-            NavAction::ToggleMaximize => self.toggle_maximize(),
+            NavAction::ToggleMaximize => self.cycle_maximize(true),
+            NavAction::ToggleMaximizeReverse => self.cycle_maximize(false),
             NavAction::FocusFullscreen => self.focus_next_fullscreen(),
             NavAction::FlipSplitDirection => self.flip_focused_parent_split_direction(),
             NavAction::MoveFocusedWindowUp => self.move_focused_window_by_direction(Direction::Up),

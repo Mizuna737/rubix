@@ -1057,17 +1057,25 @@ impl RubixState {
         }
     }
 
-    /// Advance the focused window through the maximize cycle.
+    /// Step the focused window through the maximize cycle.
     ///
-    /// `Group` -> `Monitor` -> `None`, restarting at whichever stage suits the
-    /// window when the cycle is not already on it. See [`MaximizeState`].
+    /// Forward is `Group` -> `Monitor` -> `None`; reverse walks the same ring
+    /// the other way, so it enters straight at `Monitor` and steps back down to
+    /// `Group`. Both directions leave the cycle at `None`. See
+    /// [`MaximizeState`].
+    ///
+    /// The reverse direction exists because the two stages serve different
+    /// intents: filling the group is the incremental "give this window its
+    /// column" move, while filling the monitor is the one you want *now*.
+    /// Binding both directions means neither intent has to press through the
+    /// other to get what it wanted.
     ///
     /// Deliberately not tree surgery. An earlier sketch had the first press
     /// *promote* the window to the front of its group's split tree, but that
     /// mutates the layout permanently -- un-maximizing would leave the window
     /// sitting in its new position with nothing to undo it. Covering the group
     /// is a pure layout override, so releasing it is just clearing this field.
-    pub fn toggle_maximize(&mut self) {
+    pub fn cycle_maximize(&mut self, forward: bool) {
         let Some(id) = self.focused_window_id() else {
             return;
         };
@@ -1077,14 +1085,12 @@ impl RubixState {
             return;
         }
 
-        self.maximized = match self.maximized {
-            MaximizeState::Group(current) if current == id => MaximizeState::Monitor(id),
-            MaximizeState::Monitor(current) if current == id => MaximizeState::None,
-            // Entering the cycle -- either from rest, or from another window
-            // still holding it, which this press takes over.
-            _ if self.group_window_ids(id).len() > 1 => MaximizeState::Group(id),
-            _ => MaximizeState::Monitor(id),
-        };
+        self.maximized = next_maximize(
+            self.maximized,
+            id,
+            forward,
+            self.group_window_ids(id).len() > 1,
+        );
         self.apply_layout();
         self.ipc_dirty = true;
     }
@@ -1662,4 +1668,41 @@ pub(crate) fn group_bounds(targets: &[(u32, Rect)], ids: &[u32]) -> Option<Rect>
                 }
             })
         })
+}
+
+/// The next stage in the maximize ring for `id`.
+///
+/// Split out from [`RubixState::cycle_maximize`] so the ring itself is testable
+/// without a live compositor -- it is the part with the interesting edges.
+///
+/// `has_siblings` gates the `Group` stage in both directions: a window alone in
+/// its group already fills it, so landing there would look like a dead press.
+/// Forward that means entering at `Monitor`; reverse it means stepping from
+/// `Monitor` past `Group` to `None`.
+///
+/// A press whose `current` names a *different* window takes the cycle over from
+/// it rather than continuing its position, which is why those cases fall through
+/// to the same entry arms as starting from rest.
+pub(crate) fn next_maximize(
+    current: MaximizeState,
+    id: u32,
+    forward: bool,
+    has_siblings: bool,
+) -> MaximizeState {
+    let group_or = |fallback| {
+        if has_siblings {
+            MaximizeState::Group(id)
+        } else {
+            fallback
+        }
+    };
+    match (current, forward) {
+        (MaximizeState::Group(c), true) if c == id => MaximizeState::Monitor(id),
+        (MaximizeState::Monitor(c), true) if c == id => MaximizeState::None,
+        (MaximizeState::Group(c), false) if c == id => MaximizeState::None,
+        (MaximizeState::Monitor(c), false) if c == id => group_or(MaximizeState::None),
+        // Entering the ring: from rest, or taking it over from another window.
+        (_, true) => group_or(MaximizeState::Monitor(id)),
+        (_, false) => MaximizeState::Monitor(id),
+    }
 }

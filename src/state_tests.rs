@@ -591,3 +591,71 @@ fn group_bounds_reproduces_the_column_band_exactly() {
         "a split group's tiles must union back to the band a lone window fills"
     );
 }
+
+// ---- the maximize ring ----
+
+use crate::state::{next_maximize, MaximizeState};
+
+const W: u32 = 1;
+
+#[test]
+fn forward_from_rest_enters_at_group_when_the_window_has_siblings() {
+    assert_eq!(next_maximize(MaximizeState::None, W, true, true), MaximizeState::Group(W));
+}
+
+#[test]
+fn forward_runs_group_then_monitor_then_none() {
+    let a = next_maximize(MaximizeState::None, W, true, true);
+    let b = next_maximize(a, W, true, true);
+    let c = next_maximize(b, W, true, true);
+    assert_eq!((a, b, c), (MaximizeState::Group(W), MaximizeState::Monitor(W), MaximizeState::None));
+}
+
+#[test]
+fn reverse_from_rest_goes_straight_to_monitor() {
+    assert_eq!(next_maximize(MaximizeState::None, W, false, true), MaximizeState::Monitor(W));
+}
+
+#[test]
+fn reverse_runs_monitor_then_group_then_none() {
+    let a = next_maximize(MaximizeState::None, W, false, true);
+    let b = next_maximize(a, W, false, true);
+    let c = next_maximize(b, W, false, true);
+    assert_eq!((a, b, c), (MaximizeState::Monitor(W), MaximizeState::Group(W), MaximizeState::None));
+}
+
+// A lone window's tile already IS its group rect, so the Group stage would be a
+// press that visibly does nothing. It has to vanish from the ring in BOTH
+// directions, not just the forward one.
+#[test]
+fn a_lone_window_skips_group_going_forward() {
+    assert_eq!(next_maximize(MaximizeState::None, W, true, false), MaximizeState::Monitor(W));
+}
+
+#[test]
+fn a_lone_window_skips_group_going_backward() {
+    assert_eq!(next_maximize(MaximizeState::Monitor(W), W, false, false), MaximizeState::None);
+}
+
+#[test]
+fn both_directions_leave_the_ring_at_none() {
+    assert_eq!(next_maximize(MaximizeState::Monitor(W), W, true, true), MaximizeState::None);
+    assert_eq!(next_maximize(MaximizeState::Group(W), W, false, true), MaximizeState::None);
+}
+
+// Reversing mid-cycle must retrace, not skip: Group -> Monitor -> Group.
+#[test]
+fn reversing_after_a_forward_press_returns_to_the_previous_stage() {
+    let forward = next_maximize(MaximizeState::Group(W), W, true, true);
+    assert_eq!(forward, MaximizeState::Monitor(W));
+    assert_eq!(next_maximize(forward, W, false, true), MaximizeState::Group(W));
+}
+
+// Another window holding the cycle does not hand over its position -- the new
+// window enters the ring from the start of whichever direction was pressed.
+#[test]
+fn a_press_on_a_different_window_takes_over_the_cycle_from_the_start() {
+    let other = MaximizeState::Monitor(99);
+    assert_eq!(next_maximize(other, W, true, true), MaximizeState::Group(W));
+    assert_eq!(next_maximize(other, W, false, true), MaximizeState::Monitor(W));
+}
