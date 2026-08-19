@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
 use smithay::backend::drm::compositor::{FrameFlags, PrimaryPlaneElement};
@@ -57,6 +57,7 @@ use smithay::backend::renderer::damage::{Error as OutputDamageTrackerError, Outp
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::backend::renderer::element::{
     AsRenderElements, Element, Id, Kind, RenderElement, default_primary_scanout_output_compare,
 };
@@ -68,6 +69,7 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
 use smithay::backend::SwapBuffersError;
+use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::{
     surface_primary_scanout_output, update_surface_primary_scanout_output, OutputPresentationFeedback,
@@ -247,6 +249,15 @@ pub(crate) struct SurfaceData {
     /// renderer for the primary GPU) -- feedback is then simply not sent and
     /// clients fall back to the default global's formats (udev.rs ~495).
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
+    /// The primary plane's raw advertised format set, captured at bringup.
+    ///
+    /// Deliberately NOT the intersection with render formats that
+    /// `get_surface_dmabuf_feedback` builds its tranche from: this exists to
+    /// answer "would KMS accept this buffer on the primary plane at all", and
+    /// narrowing it first would make a format the plane genuinely supports look
+    /// unsupported just because we can't render from it. Diagnostic only --
+    /// nothing in the render path reads it.
+    primary_plane_formats: FormatSet,
 }
 
 /// The pair of dmabuf feedback objects sent to a surface depending on whether
@@ -841,6 +852,10 @@ fn connector_connected(
         );
     }
 
+    // Same accessor, kept separately and unintersected -- see the field's doc.
+    let primary_plane_formats = drm_output
+        .with_compositor(|compositor| compositor.surface().plane_info().formats.clone());
+
     // `wl_mode.refresh` is in mHz (60_000 == 60 Hz, matching winit.rs), so the
     // frame period is 1000 / refresh seconds. The guard avoids a `from_secs_f64`
     // panic (inf) on a degenerate mode that reports no refresh.
@@ -887,6 +902,7 @@ fn connector_connected(
             applied_connector_hdr: None,
             last_scanout_promoted: None,
             dmabuf_feedback,
+            primary_plane_formats,
         },
     );
 
@@ -1451,6 +1467,7 @@ fn render_surface(
                 ),
                 None => tracing::info!("  dmabuf scanout feedback: none built for this output"),
             }
+            log_scanout_format_mismatch(state, surface);
         }
     }
 
@@ -2052,3 +2069,89 @@ fn schedule_render(udev: &Rc<RefCell<UdevData>>, node: DrmNode, crtc: crtc::Hand
     }
 }
 
+/// Why the primary plane refused the fullscreen buffer, as far as its format
+/// can explain it.
+///
+/// The `presentation_state` lines above say promotion *failed*; they don't say
+/// whether KMS could ever have accepted the buffer. That splits into two very
+/// different bugs and this is what tells them apart:
+///
+/// - **format/modifier not in the plane's set** -- the client allocated
+///   something this plane cannot scan out. The fix is upstream of KMS, in what
+///   the dmabuf tranche advertised or what the client chose to ignore.
+/// - **format/modifier IS in the set** -- KMS refused the atomic test for some
+///   other reason (buffer size vs mode, position, scaling, an overlapping
+///   element forcing composite, a plane property mismatch). Nothing about the
+///   format needs changing and the search should move elsewhere.
+///
+/// A linear-modifier buffer is called out specially: `Linear` on a GPU that
+/// wants a tiled/compressed modifier is the single most common way a client
+/// lands a format that is technically listed but practically never promoted.
+///
+/// Diagnostic only, and only on a promotion *change* under a fullscreen target,
+/// so it cannot spam a steady-state frame loop.
+fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData) {
+    let Some(output_geo) = state.space.output_geometry(&surface.output) else {
+        return;
+    };
+    for id in state.fullscreen_windows.iter() {
+        let Some(window) = state.windows.get(id) else { continue };
+        // Same containment test `fullscreen_scanout_target` uses, so this
+        // reports on exactly the surface that was the promotion candidate.
+        if !state.space.element_bbox(window).is_some_and(|bbox| bbox.contains_rect(output_geo)) {
+            continue;
+        }
+        let Some(wl_surface) = window.wl_surface() else { continue };
+
+        let dmabuf = with_renderer_surface_state(&wl_surface, |st| {
+            st.buffer()
+                .and_then(|buffer| get_dmabuf(buffer).ok().cloned())
+        })
+        .flatten();
+
+        let Some(dmabuf) = dmabuf else {
+            tracing::info!("  window {id}: no dmabuf attached (shm buffer -- never scannable)");
+            continue;
+        };
+
+        let format = dmabuf.format();
+        let supported = surface.primary_plane_formats.contains(&format);
+        tracing::info!(
+            "  window {id} buffer: {:?} / {:?} ({}x{}) -- primary plane supports this pair: {supported}",
+            format.code,
+            format.modifier,
+            dmabuf.width(),
+            dmabuf.height(),
+        );
+
+        if !supported {
+            // Narrow it further: a listed fourcc with the wrong modifier is a
+            // different (and much more likely) failure than an unlistable fourcc.
+            let code_listed = surface
+                .primary_plane_formats
+                .iter()
+                .any(|f| f.code == format.code);
+            if code_listed {
+                let mods: Vec<_> = surface
+                    .primary_plane_formats
+                    .iter()
+                    .filter(|f| f.code == format.code)
+                    .map(|f| f.modifier)
+                    .collect();
+                tracing::info!(
+                    "    fourcc IS supported; the modifier is not. Plane accepts {:?} for {:?}",
+                    mods,
+                    format.code,
+                );
+            } else {
+                tracing::info!("    fourcc {:?} is not on the primary plane at all", format.code);
+            }
+        } else if format.modifier == Modifier::Linear {
+            tracing::info!(
+                "    NOTE: linear modifier. Listed, but rarely promotable in practice -- \
+                 if the atomic test is refusing this, the client wanting a tiled modifier \
+                 is the likelier fix than anything in KMS.",
+            );
+        }
+    }
+}
