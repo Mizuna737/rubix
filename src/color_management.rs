@@ -193,11 +193,31 @@ pub fn init(dh: &DisplayHandle) -> ColorManagementState {
         // set_primaries_named, which is core and ungated), SetTfPower,
         // ExtendedTargetVolume, IccV2V4. Parametric is added by smithay
         // regardless.
+        //
+        // The exact set gamescope 3.16.25 requires before it will use wp color
+        // management at all (WaylandBackend.cpp, the
+        // bSupportsGamescopeColorManagement lambda): Parametric, SetPrimaries,
+        // SetMasteringDisplayPrimaries, ExtendedTargetVolume, SetLuminances,
+        // WindowsScrgb, plus TF St2084Pq and primaries Srgb + Bt2020. Any one
+        // missing and SupportsColorManagement() is false, which skips the
+        // assignment to bExposeHDRSupport entirely -- so correct luminances
+        // reach it and are simply never acted on. That is not a graceful
+        // degradation path; it is all or nothing.
+        //
+        // SetPrimaries (custom chromaticities instead of a named set) and
+        // ExtendedTargetVolume (target volume exceeding the primary volume) are
+        // accepted on the same terms as the mastering metadata above: Rubix does
+        // not tone-map, so content passes through and the panel clips.
+        // `surface_decode_kind` keys off the transfer function and the Windows
+        // flags, so custom primaries on PQ content decode through the BT.2020
+        // path -- a small inaccuracy, against no HDR at all.
         [
             Feature::WindowsScrgb,
             Feature::WindowsBt2100,
             Feature::SetLuminances,
+            Feature::SetPrimaries,
             Feature::SetMasteringDisplayPrimaries,
+            Feature::ExtendedTargetVolume,
         ],
         [],
         |_client| true,
