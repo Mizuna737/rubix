@@ -1358,16 +1358,19 @@ fn render_surface(
     // connector color state -- see `SurfaceData::applied_connector_hdr` --
     // so the transition is only staged to DRM when it actually changes.
     let desired_connector_hdr = match fullscreen_kind {
-        // Exclusive fullscreen: the connector follows the content.
-        Some(DecodeKind::HdrPq) => surface.hdr_capable && surface.hdr,
+        // Exclusive fullscreen: the connector follows the content. Matched on
+        // Sdr explicitly and everything else via the catch-all, rather than a
+        // guard on is_hdr() -- guard arms do not count toward exhaustiveness,
+        // so a future DecodeKind would compile silently into the wrong branch.
         Some(DecodeKind::Sdr) => false,
+        Some(_) => surface.hdr_capable && surface.hdr,
         // Desktop: today's behaviour.
         None => surface.hdr,
     };
     if surface.applied_connector_hdr != Some(desired_connector_hdr) {
         let reason = match fullscreen_kind {
-            Some(DecodeKind::HdrPq) => "fullscreen-hdr",
             Some(DecodeKind::Sdr) => "fullscreen-sdr",
+            Some(_) => "fullscreen-hdr",
             None => "desktop",
         };
         if desired_connector_hdr {
@@ -1413,11 +1416,21 @@ fn render_surface(
     //     (sRGB/BT.709) above, so the 8-bit client buffer is interpreted
     //     correctly. HDR returns automatically on leaving fullscreen.
     //   - Non-HDR output: unchanged either way.
-    // Note: `surface_decode_kind` only recognises `St2084Pq`, so HLG content
-    // currently maps to `DecodeKind::Sdr` -- an HLG fullscreen client drives
-    // the connector to SDR. Acceptable for now: it degrades to today's
-    // behaviour rather than misrendering.
-    if surface.hdr && fullscreen_kind.is_none() {
+    // Note: `surface_decode_kind` does not recognise HLG, so HLG content maps to
+    // `DecodeKind::Sdr` -- an HLG fullscreen client drives the connector to SDR.
+    // Acceptable: it degrades to today's behaviour rather than misrendering.
+    //
+    // Which fullscreen kinds may SKIP the HDR composite pass is a correctness
+    // question, not an optimisation: bypassing means the client's buffer is
+    // scanned out as-is, which is only right when it is ALREADY in the
+    // connector's encoding.
+    //   - Sdr        -> connector was just driven to SDR; sRGB buffer matches. Skip.
+    //   - HdrPq      -> connector is BT.2020/PQ; the buffer already is BT.2020/PQ. Skip.
+    //   - WindowsScrgb -> connector is BT.2020/PQ but the buffer is LINEAR BT.709
+    //                   extended-range. Handing that to a PQ connector unconverted
+    //                   would misrender badly. It MUST go through decode+encode.
+    let fullscreen_needs_conversion = matches!(fullscreen_kind, Some(DecodeKind::WindowsScrgb));
+    if surface.hdr && (fullscreen_kind.is_none() || fullscreen_needs_conversion) {
         let hdr_result = if output_has_hdr_window(state, &surface.output) {
             let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
             render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits)
@@ -1612,7 +1625,7 @@ fn fullscreen_scanout_target(state: &RubixState, output: &Output, hdr_capable: b
         // explaining: it is either genuinely SDR content, or an HDR client that
         // was never given a way to tag itself. Only the latter is a bug, and
         // they are identical from here without asking.
-        if hdr_capable && kind == DecodeKind::Sdr {
+        if hdr_capable && !kind.is_hdr() {
             if let Some(surface) = window.wl_surface() {
                 crate::color_management::note_untagged_fullscreen(&surface, &output.name());
             }
@@ -1641,7 +1654,7 @@ fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
             .is_some_and(|bbox| region.overlaps(bbox))
             && window
                 .wl_surface()
-                .is_some_and(|s| surface_decode_kind(&s) == DecodeKind::HdrPq)
+                .is_some_and(|s| surface_decode_kind(&s).is_hdr())
     })
 }
 
@@ -2031,6 +2044,10 @@ fn render_surface_hdr_zrun<'a>(
                         vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
                     ),
                     DecodeKind::HdrPq => (shaders.decode_hdr_pq.clone(), Vec::new()),
+                    // No sdr_white_nits uniform: Windows-scRGB pins 1.0 to
+                    // 80 cd/m² by protocol, so the SDR brightness slider must
+                    // not move HDR content.
+                    DecodeKind::WindowsScrgb => (shaders.decode_windows_scrgb.clone(), Vec::new()),
                 };
                 gles.set_default_tex_program_override(Some(prog));
             }

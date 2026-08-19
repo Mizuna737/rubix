@@ -22,7 +22,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::wayland::color::management::{
     get_surface_description, send_image_description_info, ColorManagementHandler,
-    ColorManagementState, ImageDescription, Primaries, PrimariesOption, TransferFunction,
+    ColorManagementState, Feature, ImageDescription, Primaries, PrimariesOption, TransferFunction,
 };
 
 use crate::RubixState;
@@ -37,6 +37,23 @@ pub enum DecodeKind {
     Sdr,
     /// ST 2084 (PQ) inverse EOTF, BT.2020 passthrough (`DECODE_HDR_PQ`).
     HdrPq,
+    /// Windows-scRGB: already-linear BT.709, extended range, 1.0 == 80 cd/m²
+    /// (`DECODE_WINDOWS_SCRGB`). What DXGI titles produce via
+    /// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`.
+    WindowsScrgb,
+}
+
+impl DecodeKind {
+    /// Whether this decode kind carries HDR-range content, and so should drive
+    /// an HDR-capable connector into HDR rather than out of it.
+    ///
+    /// `HdrPq` and `WindowsScrgb` differ in encoding but not in intent -- both
+    /// are asking for more range than SDR can carry, so every connector /
+    /// pipeline decision keys off this rather than matching variants
+    /// individually and forgetting one.
+    pub fn is_hdr(self) -> bool {
+        matches!(self, DecodeKind::HdrPq | DecodeKind::WindowsScrgb)
+    }
 }
 
 /// Latches once so the "client declared an unsupported transfer function"
@@ -55,6 +72,12 @@ static WARNED_UNTAGGED_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 pub fn surface_decode_kind(surface: &WlSurface) -> DecodeKind {
     let (description, _intent) = get_surface_description(surface);
     match description {
+        // Checked before the transfer function: the Windows pre-defined
+        // descriptions are identified by flag, not by a TF the client chose.
+        // Windows-BT.2100 *is* PQ/BT.2020, so it reuses the PQ decode exactly;
+        // Windows-scRGB is linear BT.709 and needs its own.
+        Some(desc) if desc.windows_scrgb => DecodeKind::WindowsScrgb,
+        Some(desc) if desc.windows_bt2100 => DecodeKind::HdrPq,
         Some(desc) if desc.transfer == TransferFunction::St2084Pq => DecodeKind::HdrPq,
         Some(desc) if desc.transfer == TransferFunction::Srgb => DecodeKind::Sdr,
         Some(desc) => {
@@ -143,7 +166,19 @@ pub fn init(dh: &DisplayHandle) -> ColorManagementState {
         dh,
         [TransferFunction::Srgb, TransferFunction::St2084Pq],
         [Primaries::Srgb, Primaries::Bt2020],
-        [],
+        // Only features we actually honour end-to-end. WindowsScrgb and
+        // WindowsBt2100 are the two pre-defined descriptions DXGI titles reach
+        // for -- without them a Proton/wine-wayland client reads our HDR output
+        // description, enables its HDR setting, then has no way to tag its own
+        // surface and submits HDR-range content untagged, which we then treat
+        // as SDR and display wrong. Both now map to a real decode path
+        // (`DecodeKind::WindowsScrgb` / `HdrPq`).
+        //
+        // Deliberately NOT advertised: SetLuminances, SetMasteringDisplayPrimaries,
+        // ExtendedTargetVolume, IccV2V4. Accepting metadata we then ignore is
+        // worse than not offering it -- the client would tone-map for a target
+        // volume we never honour. Parametric is added by smithay regardless.
+        [Feature::WindowsScrgb, Feature::WindowsBt2100],
         [],
         |_client| true,
     )

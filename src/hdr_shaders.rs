@@ -136,6 +136,72 @@ void main() {
 }
 "#;
 
+/// Windows-scRGB decode pass: BT.709 primaries, **already linear**, extended
+/// range, into the shared linear BT.2020 / 10000-nit working space.
+///
+/// This is the encoding Windows 10 defines for an HDR screen driven in
+/// BT.2100/PQ mode, and it is what DXGI titles produce through
+/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`. Three things make it unlike
+/// [`DECODE_SDR`] despite sharing its primaries:
+///
+///  - **No EOTF.** The transfer characteristic is extended *linear*. Running
+///    `srgb_to_linear` here would darken everything by roughly a 2.2 power.
+///  - **1.0 is 80 cd/m², not the SDR white level.** Fixed by the protocol, so
+///    unlike `DECODE_SDR` this takes no `sdr_white_nits` uniform -- the slider
+///    must not move HDR content. 125.0 is the maximum and lands exactly on
+///    10000 cd/m², which is why the scale below saturates the working space at
+///    precisely the right place.
+///  - **Values may be negative**, deliberately: that is how the encoding
+///    escapes the sRGB gamut boundary. Negatives survive the matrix (it is
+///    linear), and are clipped only after it, in BT.2020 -- a much wider gamut,
+///    so most sRGB-negative colors land positive and are preserved rather than
+///    crushed. The clip matters because the PQ OETF downstream raises its input
+///    to a fractional power and would produce NaN on a negative.
+pub const DECODE_WINDOWS_SCRGB: &str = r#"
+#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+precision highp float;
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+varying vec2 v_coords;
+
+// Identical column-major BT.709 -> BT.2020 matrix as DECODE_SDR.
+const mat3 BT709_TO_BT2020 = mat3(
+    0.627403896, 0.069097289, 0.016391439,   // column 0
+    0.329283038, 0.919540395, 0.088013308,   // column 1
+    0.043313066, 0.011362316, 0.895595253);  // column 2
+
+// Windows-scRGB: nominal 1.0 == 80 cd/m^2, 125.0 == 10000 cd/m^2. The working
+// space is normalized so 1.0 == 10000 cd/m^2.
+const float SCRGB_WHITE_NITS = 80.0;
+
+void main() {
+    vec4 c = texture2D(tex, v_coords);
+    // NO EOTF: the input is already linear light.
+    vec3 lin2020 = BT709_TO_BT2020 * c.rgb;
+    // Clip out-of-BT.2020 negatives; the PQ OETF cannot take them.
+    vec3 clipped = max(lin2020, 0.0);
+    vec3 abs10k = min(clipped * (SCRGB_WHITE_NITS / 10000.0), 1.0);
+
+#if defined(NO_ALPHA)
+    gl_FragColor = vec4(abs10k, 1.0) * alpha;
+#else
+    gl_FragColor = vec4(abs10k, c.a) * alpha;
+#endif
+}
+"#;
+
 /// Encode pass: samples the linear BT.2020, absolute-luminance (normalized to
 /// 10000 nits) 16F offscreen and applies the bare SMPTE ST 2084 (PQ) OETF --
 /// the real HDR output encode. The BT.709->BT.2020 matrix and
@@ -188,10 +254,13 @@ void main() {
 pub struct HdrShaders {
     pub decode_sdr: GlesTexProgram,
     pub decode_hdr_pq: GlesTexProgram,
+    /// Windows-scRGB (linear BT.709, 1.0 == 80 nits). See
+    /// [`DECODE_WINDOWS_SCRGB`].
+    pub decode_windows_scrgb: GlesTexProgram,
     pub encode: GlesTexProgram,
 }
 
-/// Compile all three HDR shaders against the given `GlesRenderer`. Call once
+/// Compile all HDR shaders against the given `GlesRenderer`. Call once
 /// per output (on that output's first HDR frame) and cache the result on
 /// `SurfaceData::hdr_shaders` -- never per frame.
 pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, GlesError> {
@@ -200,10 +269,13 @@ pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, Gl
         &[UniformName::new("sdr_white_nits", UniformType::_1f)],
     )?;
     let decode_hdr_pq = renderer.compile_custom_texture_shader(DECODE_HDR_PQ, &[])?;
+    let decode_windows_scrgb =
+        renderer.compile_custom_texture_shader(DECODE_WINDOWS_SCRGB, &[])?;
     let encode = renderer.compile_custom_texture_shader(ENCODE_LINEAR_TO_PQ, &[])?;
     Ok(HdrShaders {
         decode_sdr,
         decode_hdr_pq,
+        decode_windows_scrgb,
         encode,
     })
 }
@@ -249,6 +321,63 @@ fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Color32F {
 /// out of the encode shader and into here + `DECODE_SDR`).
 pub fn sdr_solid_transform(sdr_white_nits: f32) -> impl Fn(Color32F) -> Color32F + 'static {
     move |color| srgb_to_bt2020_abs10k(color, sdr_white_nits)
+}
+
+#[cfg(test)]
+mod scrgb_tests {
+    use super::*;
+
+    // The whole point of this shader is that Windows-scRGB is ALREADY LINEAR.
+    // It shares primaries with DECODE_SDR, so the obvious way to write it is to
+    // copy that shader and change the scale -- which silently leaves the sRGB
+    // EOTF in and darkens everything by roughly a 2.2 power. Nothing downstream
+    // would error; the picture would just be wrong, which is exactly the class
+    // of bug that cost us this whole investigation.
+    #[test]
+    fn scrgb_decode_applies_no_eotf() {
+        assert!(
+            !DECODE_WINDOWS_SCRGB.contains("srgb_to_linear"),
+            "Windows-scRGB is extended LINEAR; applying an EOTF darkens all HDR content"
+        );
+        assert!(
+            !DECODE_WINDOWS_SCRGB.contains("pq_eotf"),
+            "Windows-scRGB is not PQ"
+        );
+    }
+
+    // Protocol-fixed anchors: 1.0 -> 80 cd/m², 125.0 -> 10000 cd/m². The
+    // working space normalizes 1.0 to 10000 cd/m², so the scale must be
+    // 80/10000 and 125.0 must land exactly at the top of the range.
+    #[test]
+    fn scrgb_white_level_is_the_protocol_fixed_80_nits() {
+        assert!(
+            DECODE_WINDOWS_SCRGB.contains("SCRGB_WHITE_NITS = 80.0"),
+            "Windows-scRGB pins 1.0 to 80 cd/m² by protocol"
+        );
+        let scale = 80.0f32 / 10000.0;
+        assert!((125.0f32 * scale - 1.0).abs() < 1e-6, "125.0 must map to 10000 nits");
+        assert!((1.0f32 * scale - 0.008).abs() < 1e-6, "1.0 must map to 80 nits");
+    }
+
+    // The SDR brightness slider must not move HDR content: scRGB's white level
+    // is fixed by the protocol, so this shader takes no sdr_white_nits uniform.
+    #[test]
+    fn scrgb_decode_takes_no_sdr_white_uniform() {
+        assert!(
+            !DECODE_WINDOWS_SCRGB.contains("sdr_white_nits"),
+            "the SDR slider must not scale protocol-fixed HDR content"
+        );
+        assert!(DECODE_SDR.contains("sdr_white_nits"), "but SDR content still follows it");
+    }
+
+    // Negatives are how scRGB escapes the sRGB gamut, so they must survive the
+    // matrix and be clipped only afterwards, in the much wider BT.2020 space.
+    #[test]
+    fn scrgb_decode_clips_after_the_matrix_not_before() {
+        let matrix = DECODE_WINDOWS_SCRGB.find("BT709_TO_BT2020 * c.rgb").expect("matrix applied");
+        let clip = DECODE_WINDOWS_SCRGB.find("max(lin2020, 0.0)").expect("negatives clipped");
+        assert!(clip > matrix, "clipping before the matrix crushes in-BT.2020 colors");
+    }
 }
 
 #[cfg(test)]
