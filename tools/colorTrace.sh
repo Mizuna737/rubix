@@ -29,6 +29,13 @@ grep -aE "set_image_description|unset_image_description" "$log" | head -20
 printf -- '\n--- 6. protocol errors of any kind ---\n'
 grep -aiE "error|unsupported_feature|invalid" "$log" | grep -avE "wl_pointer|wl_keyboard|frame" | head -25
 
+printf -- '\n--- 7. timeline of colour-management calls ---\n'
+printf '    Toggling HDR in-game should produce an isolated BURST here, well after\n'
+printf '    the startup cluster. No burst on toggle = the setting is not wired to\n'
+printf '    the protocol at all, which is a wine-side answer, not ours.\n'
+grep -anE "wp_color_manag|wp_image_description|create_windows_|create_parametric" "$log" \
+  | awk -F: '{ print NR". line "$1 }' | head -60
+
 printf -- '\n--- summary ---\n'
 for pat in create_windows_scrgb create_windows_bt2100 create_parametric_creator set_image_description "image_description_v1.*failed" "image_description_v1.*ready"; do
   printf '  %-40s %s\n' "$pat" "$(grep -acE "$pat" "$log")"
