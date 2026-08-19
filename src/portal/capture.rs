@@ -218,7 +218,7 @@ where
     let height = phys.h.max(0) as u32;
     let stride = width * 4;
 
-    let (flip, mapped): (bool, Vec<u8>) = {
+    let (mapping_flipped, mapped): (bool, Vec<u8>) = {
         let mut fb = renderer.bind(&mut target).map_err(|e| format!("bind: {e:?}"))?;
         let mut damage_tracker = OutputDamageTracker::new(phys, scale, Transform::Normal);
         damage_tracker
@@ -228,17 +228,17 @@ where
         let region = Rectangle::<i32, BufferCoord>::new(Point::from((0, 0)), (phys.w, phys.h).into());
         let mapping =
             renderer.copy_framebuffer(&fb, region, Fourcc::Xrgb8888).map_err(|e| format!("copy_framebuffer: {e:?}"))?;
-        let flip = mapping.flipped();
-        crate::screencopy::log_readback_orientation("portal", flip);
+        let mapping_flipped = mapping.flipped();
+        crate::screencopy::log_readback_orientation("portal", mapping_flipped);
         let src = renderer.map_texture(&mapping).map_err(|e| format!("map_texture: {e:?}"))?;
-        (flip, src.to_vec())
+        (mapping_flipped, src.to_vec())
     };
 
     let mut data = vec![0u8; (stride as usize) * (height as usize)];
     let src_stride = stride as usize;
     let rows = height as usize;
     for y in 0..rows {
-        let src_row = if flip { rows - 1 - y } else { y };
+        let src_row = crate::screencopy::source_row(y, rows, mapping_flipped);
         let s = src_row * src_stride;
         let d = y * src_stride;
         if s + src_stride <= mapped.len() && d + src_stride <= data.len() {

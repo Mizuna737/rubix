@@ -337,6 +337,28 @@ pub(crate) fn log_readback_orientation(path: &str, flipped: bool) {
     }
 }
 
+/// Which source row feeds destination row `y`, given what `Mapping::flipped()`
+/// reported.
+///
+/// The subtle part, and the reason this is a named, tested function rather than
+/// an inline conditional: smithay documents `flipped()` as "whether the mapped
+/// buffer is flipped on the y-axis **compared to the lower left being (0, 0)**".
+/// The reference frame is GL's lower-left origin, so `flipped() == true` means
+/// the buffer is ALREADY top-down -- upper-left origin, exactly what SHM buffers
+/// and PNG want -- and must be copied straight through. `false` means it is
+/// bottom-up and needs reversing.
+///
+/// Both capture paths had this backwards, flipping precisely when they should
+/// not have. Screenshots came out upside down (verified: waybar along the bottom
+/// edge, text vertically mirrored) and so did Teams screenshare.
+pub(crate) fn source_row(y: usize, rows: usize, mapping_flipped: bool) -> usize {
+    if mapping_flipped {
+        y
+    } else {
+        rows - 1 - y
+    }
+}
+
 /// Re-render `output`'s full element list into an offscreen renderbuffer, read
 /// back the requested sub-region, and blit it into the client's SHM buffer.
 /// Returns whether the copied contents are y-inverted (for the `flags` event).
@@ -379,16 +401,16 @@ where
         let mapping = renderer
             .copy_framebuffer(&fb, region, Fourcc::Xrgb8888)
             .map_err(|e| format!("copy_framebuffer: {e:?}"))?;
-        // GL framebuffer readback is bottom-up. Rather than depend on the client
-        // honouring the `y_invert` flag (grim does not reliably here on NVIDIA
-        // GLES), normalize to top-down ourselves and report no inversion.
-        let flip = mapping.flipped();
-        log_readback_orientation("screencopy", flip);
+        // Normalize to top-down ourselves and report no inversion, rather than
+        // depend on the client honouring the `y_invert` flag (grim does not
+        // reliably here). See `source_row` for the orientation semantics.
+        let mapping_flipped = mapping.flipped();
+        log_readback_orientation("screencopy", mapping_flipped);
         let src = renderer
             .map_texture(&mapping)
             .map_err(|e| format!("map_texture: {e:?}"))?;
 
-        write_shm(&pending.buffer, src, pending.region.size.w, pending.region.size.h, flip)?;
+        write_shm(&pending.buffer, src, pending.region.size.w, pending.region.size.h, mapping_flipped)?;
         // Always false: we already delivered top-down pixels above.
         Ok(false)
     }
@@ -402,7 +424,8 @@ fn write_shm(
     src: &[u8],
     width: i32,
     height: i32,
-    flip: bool,
+    // Straight from `Mapping::flipped()`; see `source_row` for what it means.
+    mapping_flipped: bool,
 ) -> Result<(), String> {
     let src_stride = (width * 4) as usize;
     let rows = height as usize;
@@ -411,7 +434,7 @@ fn write_shm(
         let offset = bd.offset as usize;
         let row_bytes = src_stride.min(dst_stride);
         for y in 0..rows {
-            let src_row = if flip { rows - 1 - y } else { y };
+            let src_row = source_row(y, rows, mapping_flipped);
             let s = src_row * src_stride;
             let d = offset + y * dst_stride;
             if s + row_bytes > src.len() || d + row_bytes > len {
@@ -488,4 +511,47 @@ where
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
     elements
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::source_row;
+
+    // smithay: flipped() is "flipped on the y-axis compared to the LOWER LEFT
+    // being (0, 0)". So true == already top-down == copy straight through.
+    // Getting this backwards is what shipped upside-down screenshots and an
+    // upside-down Teams screenshare, and it reads equally plausible either way,
+    // which is why it is pinned here rather than left to a comment.
+    #[test]
+    fn flipped_true_means_already_top_down_so_rows_pass_through() {
+        let rows = 4;
+        let mapped: Vec<usize> = (0..rows).map(|y| source_row(y, rows, true)).collect();
+        assert_eq!(mapped, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn flipped_false_means_bottom_up_so_rows_reverse() {
+        let rows = 4;
+        let mapped: Vec<usize> = (0..rows).map(|y| source_row(y, rows, false)).collect();
+        assert_eq!(mapped, vec![3, 2, 1, 0]);
+    }
+
+    // Every destination row must draw from a distinct source row in range --
+    // catches an off-by-one in the reversing branch, which would silently
+    // duplicate one row and drop another.
+    #[test]
+    fn both_directions_are_a_permutation_of_the_rows() {
+        for flipped in [true, false] {
+            let rows = 7;
+            let mut seen: Vec<usize> = (0..rows).map(|y| source_row(y, rows, flipped)).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..rows).collect::<Vec<_>>(), "flipped = {flipped}");
+        }
+    }
+
+    #[test]
+    fn single_row_is_identity_either_way() {
+        assert_eq!(source_row(0, 1, true), 0);
+        assert_eq!(source_row(0, 1, false), 0);
+    }
 }
