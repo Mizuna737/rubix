@@ -247,9 +247,7 @@ impl XwmHandler for RubixState {
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let target = window.wl_surface();
-        if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.wl_surface().as_deref() == target.as_ref()) {
-            let id = *id;
+        if let Some(id) = self.window_id_for_x11(&window) {
             self.set_window_fullscreen(id, true);
             self.apply_layout();
             self.ipc_dirty = true;
@@ -257,13 +255,59 @@ impl XwmHandler for RubixState {
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let target = window.wl_surface();
-        if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.wl_surface().as_deref() == target.as_ref()) {
-            let id = *id;
+        if let Some(id) = self.window_id_for_x11(&window) {
             self.set_window_fullscreen(id, false);
             self.apply_layout();
             self.ipc_dirty = true;
         }
+    }
+
+    /// `_NET_ACTIVE_WINDOW` -- the X11 half of the reveal seam.
+    ///
+    /// This is what `wmctrl -a`, a taskbar click, and an app raising its own
+    /// existing window all send, and it is the exact counterpart to
+    /// wlr-foreign-toplevel's `Activate` (see `foreign_toplevel.rs`). Both route
+    /// to `focus_by_id`, which is what makes the request meaningful rather than
+    /// merely accepted: an X11 window can be off-screen in two ways the grid
+    /// won't fix on its own -- scrolled to a non-active row, or in a column past
+    /// `visible_columns` -- and `focus_by_id` reveals it, syncs the active
+    /// monitor, and arms the matching transition before handing over the
+    /// keyboard.
+    ///
+    /// Honoured unconditionally, matching the Wayland path. Neither seam gates
+    /// on focus-stealing heuristics today; if one ever grows them, both should,
+    /// or the two protocols disagree about what a window is allowed to do.
+    ///
+    /// `timestamp` and `currently_active_window` are unused: Rubix has no
+    /// focus-stealing-prevention window to compare the timestamp against, and
+    /// the source window only matters for same-client focus handoff, which ends
+    /// at the same place regardless of where it came from.
+    fn active_window_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _timestamp: u32,
+        _currently_active_window: Option<X11Surface>,
+    ) {
+        if let Some(id) = self.window_id_for_x11(&window) {
+            self.focus_by_id(id);
+            self.ipc_dirty = true;
+        }
+    }
+}
+
+impl RubixState {
+    /// Rubix's window id for an `X11Surface`, matched through its `WlSurface`.
+    ///
+    /// XWayland hands the handlers an `X11Surface`, but every Rubix-side map is
+    /// keyed by the compositor's own u32, so each entry point has to cross that
+    /// boundary before it can do anything.
+    fn window_id_for_x11(&self, window: &X11Surface) -> Option<u32> {
+        let target = window.wl_surface();
+        self.windows
+            .iter()
+            .find(|(_, w)| w.wl_surface().as_deref() == target.as_ref())
+            .map(|(id, _)| *id)
     }
 }
 
