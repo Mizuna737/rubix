@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use crate::focus::KeyboardFocusTarget;
 use crate::state::{RubixState, Transition};
-use crate::model::grid::Direction;
+use crate::model::grid::{Direction, RevealKind};
 
 /// A Rubix navigation chord. Bound to a chord in `config.toml`, where the value
 /// is this variant's exact name -- serde deserializes it straight into the enum,
@@ -292,23 +292,13 @@ impl RubixState {
                 let button_state = event.state();
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    if let Some((window, _loc)) = self
-                        .space
-                        .element_under(pointer.current_location())
-                        .map(|(w, l)| (w.clone(), l))
-                    {
-                        self.space.raise_element(&window, true);
-                        // from_window keeps X11 clicks working -- window.toplevel()
-                        // is None for X11, so the old early-return dropped focus
-                        // entirely on click.
-                        let target = KeyboardFocusTarget::from_window(&window);
-                        self.space.elements().for_each(|w| {
-                            w.set_activated(w == &window);
-                            let Some(toplevel) = w.toplevel() else { return; };
-                            toplevel.send_pending_configure();
-                        });
-                        keyboard.set_focus(self, target, serial);
-                        self.reconcile_focus_state();
+                    if let Some(id) = self.window_id_at(pointer.current_location()) {
+                        // Routed through focus_by_id rather than setting seat
+                        // focus inline: clicking has to sync active_monitor and
+                        // move the model cursor exactly the way every other
+                        // focus route does, or clicking a window on the second
+                        // head leaves nav chords driving the first.
+                        self.focus_by_id(id);
                         // Keyboard focus moved; push a fresh snapshot so the bar
                         // tracks click-to-focus, not just nav chords.
                         self.ipc_dirty = true;
@@ -519,13 +509,55 @@ impl RubixState {
     /// handlers pass the freshly-created id, and directional-move chords will
     /// pass the destination id.
     pub(crate) fn focus_by_id(&mut self, id: u32) {
+        self.focus_by_id_raising(id, true);
+    }
+
+    /// As `focus_by_id`, but leaves the stacking order alone.
+    ///
+    /// Focus and raise are independent: focus decides who gets keys, raise
+    /// decides who paints on top. Click-to-focus and explicit activation raise
+    /// because the user gestured at the window; hover must not, or sweeping the
+    /// pointer across the screen reshuffles z-order with no gesture behind it.
+    /// Matches sway, whose focus-follows-mouse likewise does not raise.
+    pub(crate) fn focus_by_id_without_raising(&mut self, id: u32) {
+        self.focus_by_id_raising(id, false);
+    }
+
+    fn focus_by_id_raising(&mut self, id: u32, raise: bool) {
         let Some(window) = self.windows.get(&id).cloned() else { return; };
         // X11 windows focus as their X11Surface so input focus is actually
         // driven (XSetInputFocus/WM_TAKE_FOCUS); wayland windows as wl_surface.
         let Some(target) = KeyboardFocusTarget::from_window(&window) else { return; };
+
+        // The window's own head becomes the active one, so nav chords act on
+        // what the user just selected rather than wherever the cursor was left.
+        if let Some(monitor_id) = self.workspace.get_monitor_id_by_window_id(id) {
+            self.workspace.set_active_monitor(monitor_id);
+        }
+
+        // Reveal, THEN move the cursor. Order matters: the Swapped branch
+        // relocates the group, and focus_window resolves coordinates through
+        // locate, so running it second is what makes it read the post-swap
+        // position. Fullscreen windows sit outside the grid, so both calls find
+        // nothing and no-op -- focus still lands, which is how a hidden X11
+        // fullscreen client gets restored.
+        let revealed = self.workspace.active_monitor_mut().and_then(|monitor| {
+            let kind = monitor.reveal_window(id);
+            monitor.focus_window(id);
+            kind
+        });
+
+        // Arm the transition BEFORE any apply_layout -- that call consumes
+        // pending_transition via take(), so arming afterwards animates nothing.
+        if let Some(RevealKind::Scrolled { down }) = revealed {
+            self.pending_transition = Some(Transition::Scroll { down });
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
-        self.space.raise_element(&window, true);
+        if raise {
+            self.space.raise_element(&window, true);
+        }
         self.space.elements().for_each(|w| {
             w.set_activated(w == &window);
             let Some(toplevel) = w.toplevel() else { return; };
@@ -533,6 +565,16 @@ impl RubixState {
         });
         keyboard.set_focus(self, Some(target), serial);
         self.reconcile_focus_state();
+
+        // Only re-lay-out when the reveal actually restructured something.
+        // AlreadyVisible and None leave the grid byte-identical, and an
+        // unconditional apply_layout here would take the snap path -- whose
+        // first act is settle_tweens() -- immediately after nav dispatch armed
+        // and started an animation, killing every nav transition on the
+        // focus_active_window that follows it.
+        if matches!(revealed, Some(RevealKind::Scrolled { .. }) | Some(RevealKind::Swapped)) {
+            self.apply_layout();
+        }
     }
 
     /// Move keyboard focus to the model's current active window, mirroring the

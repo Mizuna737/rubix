@@ -1062,7 +1062,9 @@ impl RubixState {
         if self.focused_window_id() == Some(id) {
             return;
         }
-        self.focus_by_id(id);
+        // Focus without raising: hover is not a gesture at the window, so it
+        // must not reorder the stack. See focus_by_id_without_raising.
+        self.focus_by_id_without_raising(id);
         self.ipc_dirty = true;
     }
 

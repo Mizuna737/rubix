@@ -136,17 +136,17 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ToplevelHandleData> for RubixState {
 
         match request {
             // The point of the protocol for us: the only route back to a window
-            // the grid cannot reach. Focusing a hidden X11 fullscreen client is
-            // enough to restore it -- `apply_layout` admits a fullscreen window
-            // to the visible set exactly when it holds focus, and
-            // `sync_x11_iconic` un-hides whatever is visible.
+            // the grid cannot reach. Two distinct cases, both handled inside
+            // focus_by_id:
             //
-            // MODEL SEAM: a window that is merely tiled in an off-screen column
-            // is focused but not revealed -- bringing its column on screen means
-            // making it the active one, which is grid logic. It wants a
-            // `Monitor::reveal(id) -> bool` alongside `promote_to_first`, wired
-            // here before the `focus_by_id` call. Until then, activating an
-            // off-screen tiled window moves focus without scrolling to it.
+            //   fullscreen -- outside the grid entirely. Focusing a hidden X11
+            //   fullscreen client is enough to restore it: `apply_layout` admits
+            //   a fullscreen window to the visible set exactly when it holds
+            //   focus, and `sync_x11_iconic` un-hides whatever is visible.
+            //
+            //   tiled but off-screen -- `Monitor::reveal_window` scrolls its
+            //   column to the right row, or trades its group into the active
+            //   slot when the column itself is past visible_columns.
             zwlr_foreign_toplevel_handle_v1::Request::Activate { .. } => {
                 state.focus_by_id(id);
                 state.ipc_dirty = true;
