@@ -166,19 +166,37 @@ pub fn init(dh: &DisplayHandle) -> ColorManagementState {
         dh,
         [TransferFunction::Srgb, TransferFunction::St2084Pq],
         [Primaries::Srgb, Primaries::Bt2020],
-        // Only features we actually honour end-to-end. WindowsScrgb and
-        // WindowsBt2100 are the two pre-defined descriptions DXGI titles reach
-        // for -- without them a Proton/wine-wayland client reads our HDR output
-        // description, enables its HDR setting, then has no way to tag its own
-        // surface and submits HDR-range content untagged, which we then treat
-        // as SDR and display wrong. Both now map to a real decode path
+        // WindowsScrgb / WindowsBt2100 are the two pre-defined descriptions DXGI
+        // titles reach for, and map to real decode paths
         // (`DecodeKind::WindowsScrgb` / `HdrPq`).
         //
-        // Deliberately NOT advertised: SetLuminances, SetMasteringDisplayPrimaries,
-        // ExtendedTargetVolume, IccV2V4. Accepting metadata we then ignore is
-        // worse than not offering it -- the client would tone-map for a target
-        // volume we never honour. Parametric is added by smithay regardless.
-        [Feature::WindowsScrgb, Feature::WindowsBt2100],
+        // SetLuminances and SetMasteringDisplayPrimaries are advertised even
+        // though nothing downstream reads the values yet, because withholding
+        // them costs more than accepting them. wine-wayland's driver calls
+        // set_luminances / set_mastering_display_primaries / set_max_cll /
+        // set_max_fall when building a parametric HDR description; with those
+        // features absent it cannot describe HDR the way it wants and declines
+        // to tag the surface AT ALL -- observed with KCD2, which then submitted
+        // HDR-range content untagged and got displayed as SDR.
+        //
+        // What ignoring them actually means: mastering primaries and max CLL /
+        // max FALL are tone-mapping hints for a display less capable than the
+        // mastering display. Rubix does not tone-map -- content passes through
+        // and the panel clips -- which is a legitimate choice, and the same one
+        // any non-tone-mapping compositor makes. Reference white from
+        // set_luminances does not affect PQ decode either, PQ being absolute.
+        // So we accept the metadata honestly and act on what we can.
+        //
+        // Still NOT advertised: SetPrimaries (custom primaries -- wine uses
+        // set_primaries_named, which is core and ungated), SetTfPower,
+        // ExtendedTargetVolume, IccV2V4. Parametric is added by smithay
+        // regardless.
+        [
+            Feature::WindowsScrgb,
+            Feature::WindowsBt2100,
+            Feature::SetLuminances,
+            Feature::SetMasteringDisplayPrimaries,
+        ],
         [],
         |_client| true,
     )
