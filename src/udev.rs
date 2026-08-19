@@ -59,7 +59,8 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
 use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::backend::renderer::element::{
-    AsRenderElements, Element, Id, Kind, RenderElement, default_primary_scanout_output_compare,
+    AsRenderElements, Element, Id, Kind, RenderElement, RenderElementPresentationState,
+    RenderElementStates, RenderingReason, default_primary_scanout_output_compare,
 };
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
@@ -1453,7 +1454,7 @@ fn render_surface(
             "direct-scanout on {output_name}: promoted = {promoted} ({element_count} elements, fullscreen = {fullscreen_kind:?})",
         );
         if !promoted && fullscreen_kind.is_some() {
-            for (id, st) in frame.states.states.iter().take(10) {
+            for (id, st) in frame.states.states.iter() {
                 tracing::info!("  element {id:?}: {:?}", st.presentation_state);
             }
             // Spec B: distinguish "client never got a scanout tranche to
@@ -1467,7 +1468,7 @@ fn render_surface(
                 ),
                 None => tracing::info!("  dmabuf scanout feedback: none built for this output"),
             }
-            log_scanout_format_mismatch(state, surface);
+            log_scanout_format_mismatch(state, surface, &frame.states);
         }
     }
 
@@ -2090,7 +2091,7 @@ fn schedule_render(udev: &Rc<RefCell<UdevData>>, node: DrmNode, crtc: crtc::Hand
 ///
 /// Diagnostic only, and only on a promotion *change* under a fullscreen target,
 /// so it cannot spam a steady-state frame loop.
-fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData) {
+fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData, states: &RenderElementStates) {
     let Some(output_geo) = state.space.output_geometry(&surface.output) else {
         return;
     };
@@ -2102,6 +2103,48 @@ fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData) {
             continue;
         }
         let Some(wl_surface) = window.wl_surface() else { continue };
+
+        // Which dmabuf feedback this surface is being handed, and why.
+        //
+        // This is the bootstrap question. `select_dmabuf_feedback` only serves
+        // the *scanout* tranche when the element is already `ZeroCopy`, or is
+        // `Rendering` with reason `ScanoutFailed`/`FormatUnsupported`. Any other
+        // state -- notably `Skipped`, and `Rendering { reason: None }` -- gets
+        // the render-optimal feedback naming every format the GPU can draw into,
+        // compressed modifiers included.
+        //
+        // If the fullscreen candidate is in one of those states, it is never
+        // told the scanout formats, so it keeps allocating a buffer KMS cannot
+        // take, so it is never promoted, so it is never told. That deadlock is
+        // invisible in the format lines below -- they show the wrong buffer
+        // without showing why the client had no way to know better.
+        match states.element_render_state(Id::from(&*wl_surface)) {
+            Some(st) => {
+                let (tranche, why) = match st.presentation_state {
+                    RenderElementPresentationState::ZeroCopy => ("scanout", "already promoted"),
+                    RenderElementPresentationState::Rendering {
+                        reason: Some(RenderingReason::ScanoutFailed),
+                    } => ("scanout", "scanout was attempted and refused"),
+                    RenderElementPresentationState::Rendering {
+                        reason: Some(RenderingReason::FormatUnsupported),
+                    } => ("scanout", "format rejected up front"),
+                    RenderElementPresentationState::Rendering { reason: None } => {
+                        ("render (DEADLOCK)", "composited without ever attempting scanout")
+                    }
+                    RenderElementPresentationState::Skipped => {
+                        ("render (DEADLOCK)", "element skipped this frame")
+                    }
+                };
+                tracing::info!(
+                    "  window {id} element state: {:?} -> served the {tranche} tranche ({why})",
+                    st.presentation_state,
+                );
+            }
+            None => tracing::info!(
+                "  window {id}: NO element render state -- surface contributed no element this \
+                 frame, so it receives the default (render) feedback",
+            ),
+        }
 
         let dmabuf = with_renderer_surface_state(&wl_surface, |st| {
             st.buffer()

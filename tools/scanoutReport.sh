@@ -25,10 +25,12 @@ below to see whether the compositor ever considered the window fullscreen.
 MSG
 else
   printf -- '--- %s direct-scanout block(s) ---\n' "$blocks"
+  # tracing prefixes every line with a timestamp, so detail lines are NOT
+  # indented at line start -- their indentation sits after "rubix::udev: ".
   awk '
-    /direct-scanout on/ { inblock=1; print; next }
-    inblock && /^[[:space:]]+[^[:space:]]/ { print; next }
-    inblock { inblock=0 }
+    /direct-scanout on/            { inblock=1; print; next }
+    inblock && /rubix::udev:   +/  { print; next }
+    inblock                        { inblock=0 }
   ' "$log"
 fi
 
