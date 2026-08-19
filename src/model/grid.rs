@@ -8,29 +8,46 @@ pub enum Direction {
     Left,
     Right,
 }
-
+pub enum RevealKind {
+    AlreadyVisible,
+    Scrolled { down: bool },
+    Swapped,
+}
 pub struct Group {
     pub layout: Option<TilingNode>,
+    pub active_window: Option<u32>,
 }
 
 impl Group {
-    pub fn new( layout: TilingNode ) -> Self {
+    pub fn new( layout: TilingNode, window_id: u32 ) -> Self {
         Group {
-            layout: Some(layout)
+            layout: Some(layout),
+            active_window: Some(window_id),
         }
     }
-    pub fn remove_window(&mut self, window_id: u32) -> RemoveResult {
+    pub fn empty() -> Self {
+        Group {
+            layout: None, active_window: None
+        }
+    }
+    pub fn remove_window(&mut self, window_id: u32) -> bool {
         let result = match &mut self.layout {
             Some(node) => node.remove_window(window_id),
-            None => return RemoveResult::NotFound,
+            None => return false,
         };
 
         match result {
-            RemoveResult::Removed => RemoveResult::Removed,
-            RemoveResult::NotFound => RemoveResult::NotFound,
+            RemoveResult::Removed { survivor_id } => {
+                if self.active_window == Some(window_id) {
+                    self.active_window = Some(survivor_id);
+                }
+                true
+            }
+            RemoveResult::NotFound => false,
             RemoveResult::RemoveMe => {
                 self.layout = None;
-                RemoveResult::Removed
+                self.active_window = None;
+                true
             }
         }
     }
@@ -60,6 +77,7 @@ impl Group {
                 self.layout = Some(TilingNode::new(window_id));
             },
         };
+        self.active_window = Some(window_id);
     }
     pub fn try_add_window(&mut self, direction: SplitDirection, window_id: u32, focused_id: u32) -> bool {
         match &mut self.layout {
@@ -68,6 +86,7 @@ impl Group {
                 match focused_node {
                     Some(focused_node) => {
                         TilingNode::split_window(focused_node,direction,window_id);
+                        self.active_window = Some(window_id);
                         true
                     },
                     None => false
@@ -142,7 +161,7 @@ impl Monitor {
         };
         for _ in 0..visible_columns {
             let mut column = Column::new(0);
-            column.add_group(Group { layout: None });
+            column.add_group(Group::empty());
             monitor.columns.push(column);
         }
         monitor
@@ -156,8 +175,11 @@ impl Monitor {
     pub fn active_window(&self) -> Option<u32> {
         let column = self.columns.get(self.active_column)?;
         let group = column.groups.get(column.active_row)?;
+        let node = group.layout.as_ref()?;   // empty group: no active window, done
 
-        group.layout.as_ref().map(|node| node.find_first_leaf_id())
+        Some(group.active_window
+            .filter(|id| node.find_window(*id).is_some())
+            .unwrap_or_else(|| node.find_first_leaf_id()))
     }
 
     pub fn add_column(&mut self, column: Column) {
@@ -178,7 +200,7 @@ impl Monitor {
 
     pub fn grow_columns(&mut self) -> &mut Column {
         let mut column = Column::new(0);
-        column.add_group(Group { layout: None });
+        column.add_group(Group::empty());
         let index = self.active_column + 1;
         self.columns.insert(index, column);
         &mut self.columns[index]
@@ -187,7 +209,7 @@ impl Monitor {
     fn detach_window(&mut self, window_id: u32) -> bool {
         for column in &mut self.columns {
             for group in &mut column.groups {
-                if matches!(group.remove_window(window_id), RemoveResult::Removed) {
+                if matches!(group.remove_window(window_id), true) {
                     return true;
                 }
             }
@@ -207,6 +229,45 @@ impl Monitor {
         }
         None
     }
+
+    pub fn locate(&self, window_id: u32) -> Option<(usize,usize)> {
+        self.find_column_and_row_by_window_id(window_id)
+    }
+
+    pub fn focus_window(&mut self, window_id: u32) -> bool {
+        let Some((col,row)) = self.locate(window_id) else { return false };
+        self.active_column = col;
+        self.columns[col].active_row = row;
+        self.columns[col].groups[row].active_window = Some(window_id);
+        true
+    }
+
+
+
+    pub fn reveal_window(&mut self, window_id: u32) -> Option<RevealKind> {
+        let (col, row) = self.locate(window_id)?;
+        if col < self.visible_columns {
+            let column = &mut self.columns[col];
+            if column.active_row == row {
+                return Some(RevealKind::AlreadyVisible);
+            }
+            let down = row > column.active_row;
+            column.active_row = row;
+            return Some(RevealKind::Scrolled { down });
+        }
+
+        let _ = self.active_group_mut(); // seed an empty group in the active column if it's empty.
+                                         // Needed to end the borrow of &mut self here.
+        let active_col = self.active_column;
+        let active_row = self.columns[active_col].active_row;
+        let (left, right) = self.columns.split_at_mut(col);
+        std::mem::swap(
+            &mut left[active_col].groups[active_row],
+            &mut right[0].groups[row],
+            );
+        Some(RevealKind::Swapped)
+    }
+
     pub fn find_group_by_direction(&self, window_id: u32, direction: Direction) -> Option<(usize,usize)> {
         let Some((c,g)) = self.find_column_and_row_by_window_id(window_id) else {
             return None;
@@ -272,7 +333,7 @@ impl Monitor {
     }
     pub fn grow_active_column(&mut self) {
         let column = &mut self.columns[self.active_column];
-        column.groups.insert(column.active_row + 1, Group { layout: None });
+        column.groups.insert(column.active_row + 1, Group::empty());
         column.scroll_column(1);
     }
     /// The group new windows land in: the active column's active group. Seeds one
@@ -282,7 +343,7 @@ impl Monitor {
     pub fn active_group_mut(&mut self) -> &mut Group {
         let column = &mut self.columns[self.active_column];
         if column.groups.is_empty() {
-            column.groups.push(Group { layout: None });
+            column.groups.push(Group::empty());
             column.active_row = 0;
         }
         &mut column.groups[column.active_row]
@@ -292,15 +353,15 @@ impl Monitor {
     /// Returns Removed on the first hit, NotFound if the id isn't present anywhere.
     /// TODO(max): does NOT prune a group that becomes empty -- empty-row pruning is
     /// a row-policy call that belongs to the scroll/row model.
-    pub fn remove_window(&mut self, window_id: u32) -> RemoveResult {
+    pub fn remove_window(&mut self, window_id: u32) -> bool {
         for column in &mut self.columns {
             for group in &mut column.groups {
-                if matches!(group.remove_window(window_id), RemoveResult::Removed) {
-                    return RemoveResult::Removed;
+                if matches!(group.remove_window(window_id), true) {
+                    return true;
                 }
             }
         }
-        RemoveResult::NotFound
+        false
     }
 
     pub fn add_window(&mut self, direction: SplitDirection, id: u32, focused_id: u32) {
@@ -392,6 +453,18 @@ impl Workspace {
             self.monitors.push(Monitor::new(id, visible_columns));
             self.monitors.last_mut().unwrap()
         }
+    }
+    pub fn get_monitor_id_by_window_id(&self, window_id: u32) -> Option<u32> {
+        for monitor in self.monitors.iter() {
+            for column in monitor.columns.iter() {
+                for group in column.groups.iter() {
+                    if let Some(node) = group.layout.as_ref().and_then(|n| n.find_window(window_id)) {
+                        return Some(monitor.id);
+                    }
+                }
+            }
+        }
+        return None;
     }
 }
 

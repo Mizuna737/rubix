@@ -20,7 +20,7 @@ Leaf    { window_id: u32 },
 }
 pub enum RemoveResult {
     RemoveMe,
-    Removed,
+    Removed     { survivor_id: u32 },
     NotFound,
 }
 impl TilingNode {
@@ -134,18 +134,18 @@ impl TilingNode {
             }
             TilingNode::Split { left_child, right_child, .. } => {
                 match left_child.remove_window(target_id) {
-                    RemoveResult::Removed => RemoveResult::Removed,
+                    RemoveResult::Removed { survivor_id }=> RemoveResult::Removed { survivor_id },
                     RemoveResult::RemoveMe => {
                         let surviving = std::mem::replace(right_child, Box::new(TilingNode::Leaf {window_id: 0}));
                         *self = *surviving;
-                        RemoveResult::Removed
+                        RemoveResult::Removed { survivor_id: self.find_first_leaf_id() }
                     },
                     RemoveResult::NotFound => match right_child.remove_window(target_id) {
-                        RemoveResult::Removed => RemoveResult::Removed,
+                        RemoveResult::Removed { survivor_id } => RemoveResult::Removed { survivor_id },
                         RemoveResult::RemoveMe => {
                             let surviving = std::mem::replace(left_child, Box::new(TilingNode::Leaf {window_id: 0}));
                             *self = *surviving;
-                            RemoveResult::Removed
+                            RemoveResult::Removed { survivor_id: self.find_first_leaf_id() }
                         },
                         RemoveResult::NotFound => RemoveResult::NotFound
                     }

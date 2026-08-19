@@ -146,12 +146,20 @@
         TilingNode::split_window(&mut node, SplitDirection::Vertical, 3);
     }
 
+    // The survivor id carried by Removed; None for RemoveMe / NotFound.
+    fn survivor(result: RemoveResult) -> Option<u32> {
+        match result {
+            RemoveResult::Removed { survivor_id } => Some(survivor_id),
+            _ => None,
+        }
+    }
+
     // ---- remove_window ----
     #[test]
     fn remove_collapses_parent_into_the_surviving_left_sibling() {
         // split(1, 2), remove 2 -> node becomes bare leaf(1)
         let mut tree = split(leaf(1), leaf(2));
-        assert!(matches!(tree.remove_window(2), RemoveResult::Removed));
+        assert_eq!(survivor(tree.remove_window(2)), Some(1));
         assert_eq!(leaf_id(&tree), Some(1));
         assert_eq!(count(&tree), 1);
     }
@@ -160,7 +168,7 @@
     fn remove_collapses_parent_into_the_surviving_right_sibling() {
         // split(1, 2), remove 1 -> node becomes bare leaf(2)
         let mut tree = split(leaf(1), leaf(2));
-        assert!(matches!(tree.remove_window(1), RemoveResult::Removed));
+        assert_eq!(survivor(tree.remove_window(1)), Some(2));
         assert_eq!(leaf_id(&tree), Some(2));
         assert_eq!(count(&tree), 1);
     }
@@ -169,7 +177,7 @@
     fn remove_deep_leaf_collapses_only_its_own_parent() {
         // split(1, split(2, 3)), remove 2 -> split(1, 3); everything above is untouched
         let mut tree = split(leaf(1), split(leaf(2), leaf(3)));
-        assert!(matches!(tree.remove_window(2), RemoveResult::Removed));
+        assert_eq!(survivor(tree.remove_window(2)), Some(3));
         assert_eq!(count(&tree), 2);
         assert!(tree.find_window(2).is_none());
         assert_eq!(split_leaf_ids(&tree), Some((1, 3)));
@@ -179,7 +187,7 @@
     fn remove_from_a_left_subtree_collapses_correctly() {
         // split(split(1, 2), 3), remove 1 -> split(2, 3)
         let mut tree = split(split(leaf(1), leaf(2)), leaf(3));
-        assert!(matches!(tree.remove_window(1), RemoveResult::Removed));
+        assert_eq!(survivor(tree.remove_window(1)), Some(2));
         assert_eq!(count(&tree), 2);
         assert_eq!(split_leaf_ids(&tree), Some((2, 3)));
     }
@@ -191,6 +199,27 @@
         let mut tree = leaf(1);
         assert!(matches!(tree.remove_window(1), RemoveResult::RemoveMe));
         assert_eq!(leaf_id(&tree), Some(1));
+    }
+
+    #[test]
+    fn remove_reports_the_local_survivor_not_the_trees_first_leaf() {
+        // split(split(1, 2), split(3, 4)); removing 3 collapses only the right
+        // pair, so the survivor is its sibling, 4. This is the case that makes
+        // threading the id up the recursion worth doing at all -- answering with
+        // the whole tree's first leaf would say 1, on the far side of the group.
+        let mut tree = split(split(leaf(1), leaf(2)), split(leaf(3), leaf(4)));
+        assert_eq!(survivor(tree.remove_window(3)), Some(4));
+        assert_eq!(count(&tree), 3);
+        assert!(tree.find_window(3).is_none());
+    }
+
+    #[test]
+    fn remove_reports_the_promoted_subtrees_first_leaf() {
+        // split(1, split(2, 3)); removing 1 promotes the entire right subtree,
+        // which has no single surviving window -- its first leaf, 2, is the answer.
+        let mut tree = split(leaf(1), split(leaf(2), leaf(3)));
+        assert_eq!(survivor(tree.remove_window(1)), Some(2));
+        assert_eq!(count(&tree), 2);
     }
 
     #[test]
