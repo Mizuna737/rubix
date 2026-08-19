@@ -1,4 +1,6 @@
 mod compositor;
+mod decoration;
+pub(crate) use decoration::RUBIX_KDE_DEFAULT_MODE;
 mod dmabuf;
 mod layer_shell;
 mod pointer_constraints;

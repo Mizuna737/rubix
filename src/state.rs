@@ -32,7 +32,9 @@ use smithay::{
         seat::WaylandFocus,
         relative_pointer::RelativePointerManagerState,
         selection::{data_device::DataDeviceState, wlr_data_control::DataControlState},
+        shell::kde::decoration::KdeDecorationState,
         shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState},
+        shell::xdg::decoration::XdgDecorationState,
         shell::xdg::XdgShellState,
         shm::ShmState,
         socket::ListeningSocketSource,
@@ -230,6 +232,15 @@ pub struct RubixState {
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    // Server-side decoration negotiation (see handlers/decoration.rs). Both
+    // protocols are advertised because toolkits are split between them; both
+    // answer `ServerSide` unconditionally. `xdg_decoration_state` is never
+    // read after construction -- the global lives as long as the state does,
+    // and the handler works off the toplevel, not the state -- but dropping it
+    // would destroy the global.
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
+    pub kde_decoration_state: KdeDecorationState,
     pub layer_shell_state: WlrLayerShellState,
     pub xwayland_shell_state: XWaylandShellState,
     // None until XWaylandEvent::Ready fires and X11Wm::start_wm succeeds.
@@ -334,6 +345,9 @@ impl RubixState {
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let relative_pointer_manager_state = RelativePointerManagerState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        let kde_decoration_state =
+            KdeDecorationState::new::<Self>(&dh, crate::handlers::RUBIX_KDE_DEFAULT_MODE);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
@@ -424,6 +438,8 @@ impl RubixState {
             compositor_state,
             viewporter_state,
             xdg_shell_state,
+            xdg_decoration_state,
+            kde_decoration_state,
             layer_shell_state,
             xwayland_shell_state,
             xwm: None,
