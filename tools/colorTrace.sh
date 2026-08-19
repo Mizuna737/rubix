@@ -14,10 +14,14 @@ printf -- '--- 1. did the client bind the manager, and what did we advertise? --
 grep -aE "wp_color_manager_v1" "$log" | grep -aE "bind|supported_(feature|tf_named|primaries_named|intent)|done" | head -40
 
 printf -- '\n--- 2. what did it try to CREATE? (the decisive question) ---\n'
-grep -aE "create_(parametric_creator|windows_scrgb|windows_bt2100|icc_creator)|get_output|get_surface" "$log" | head -20
+# NOT a bare `get_surface`: that also matches zwp_linux_dmabuf get_surface_feedback,
+# which fires per frame and floods this section past any head limit -- it hid the
+# create_parametric_creator calls entirely on the first real capture.
+grep -aE "create_(parametric_creator|windows_scrgb|windows_bt2100|icc_creator)|wp_color_manager_v1#[0-9]+\.get_(output|surface)\(" "$log" | head -30
 
-printf -- '\n--- 3. what did it set on a parametric description? ---\n'
-grep -aE "set_(tf_named|tf_power|primaries_named|primaries|luminances|mastering_display_primaries|max_cll|max_fall)" "$log" | head -30
+printf -- '\n--- 3. the negotiation in order: what was set, and did it stick? ---\n'
+printf '    tf_named: 9=srgb 11=st2084_pq 13=hlg | primaries_named: 1=srgb 6=bt2020\n'
+grep -aE "create_parametric_creator|set_(tf_named|tf_power|primaries_named|luminances|mastering_display_primaries|max_cll|max_fall)|wp_image_description_v1#[0-9]+\.(ready|failed)|set_image_description" "$log" | head -50
 
 printf -- '\n--- 4. did the description succeed or fail? ---\n'
 printf '    (wp_image_description_v1.ready = success; .failed = rejected, with a cause)\n'
