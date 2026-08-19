@@ -1240,7 +1240,7 @@ fn render_surface(
     // Cheap (no renderer work), computed once and reused for cursor
     // suppression, chrome clearing, connector color state, and the HDR
     // composite bypass below.
-    let fullscreen_kind = fullscreen_scanout_target(state, &surface.output);
+    let fullscreen_kind = fullscreen_scanout_target(state, &surface.output, surface.hdr_capable);
 
     let mut background: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
     let mut bottom: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
@@ -1596,7 +1596,7 @@ fn fullscreen_candidate_id(state: &RubixState, output: &Output) -> Option<u32> {
     })
 }
 
-fn fullscreen_scanout_target(state: &RubixState, output: &Output) -> Option<DecodeKind> {
+fn fullscreen_scanout_target(state: &RubixState, output: &Output, hdr_capable: bool) -> Option<DecodeKind> {
     let output_geo = state.space.output_geometry(output)?;
     state.fullscreen_windows.iter().find_map(|id| {
         let window = state.windows.get(id)?;
@@ -1604,12 +1604,20 @@ fn fullscreen_scanout_target(state: &RubixState, output: &Output) -> Option<Deco
         if !bbox.contains_rect(output_geo) {
             return None;
         }
-        Some(
-            window
-                .wl_surface()
-                .map(|s| surface_decode_kind(&s))
-                .unwrap_or(DecodeKind::Sdr),
-        )
+        let kind = window
+            .wl_surface()
+            .map(|s| surface_decode_kind(&s))
+            .unwrap_or(DecodeKind::Sdr);
+        // An HDR-capable output landing on the SDR path is the case worth
+        // explaining: it is either genuinely SDR content, or an HDR client that
+        // was never given a way to tag itself. Only the latter is a bug, and
+        // they are identical from here without asking.
+        if hdr_capable && kind == DecodeKind::Sdr {
+            if let Some(surface) = window.wl_surface() {
+                crate::color_management::note_untagged_fullscreen(&surface, &output.name());
+            }
+        }
+        Some(kind)
     })
 }
 

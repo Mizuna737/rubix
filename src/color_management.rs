@@ -44,6 +44,9 @@ pub enum DecodeKind {
 /// the journal, not per-frame diagnostics.
 static WARNED_UNSUPPORTED_TF: AtomicBool = AtomicBool::new(false);
 
+/// Same latch for the untagged-fullscreen-surface notice below.
+static WARNED_UNTAGGED_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
 /// Maps a surface's committed color-management state to a decode kind.
 /// `St2084Pq` -> `HdrPq`; no description, `Srgb`, or any other (unsupported
 /// this phase) transfer function -> `Sdr`, with a one-time `warn!` for the
@@ -66,6 +69,42 @@ pub fn surface_decode_kind(surface: &WlSurface) -> DecodeKind {
         }
         None => DecodeKind::Sdr,
     }
+}
+
+/// Whether `surface` has committed any color-management image description.
+///
+/// Distinguishes the two ways a surface ends up on the SDR decode path, which
+/// [`surface_decode_kind`] deliberately collapses: a client that declared sRGB
+/// (genuinely SDR, nothing to see) versus a client that declared nothing at all.
+/// The second is the interesting one on an HDR output -- it is what an HDR-aware
+/// client does when the feature it wanted to tag with was never advertised, and
+/// it is indistinguishable from ordinary SDR content until you ask.
+pub fn surface_description_present(surface: &WlSurface) -> bool {
+    get_surface_description(surface).0.is_some()
+}
+
+/// One-shot notice that a fullscreen surface on an HDR-capable output carries no
+/// image description, so it is being treated as SDR.
+///
+/// This is the shape of the KCD2 failure: the game reads our HDR output
+/// description, enables its HDR setting, then has no advertised way to tag its
+/// own surface -- `create_windows_scrgb` is the request DXGI titles reach for
+/// and we do not advertise `Feature::WindowsScrgb` -- so it submits HDR-range
+/// content untagged. We then drive the connector to SDR underneath it. Nothing
+/// errors; the picture is simply wrong, and the log said nothing at all.
+pub fn note_untagged_fullscreen(surface: &WlSurface, output_name: &str) {
+    if surface_description_present(surface) {
+        return;
+    }
+    if WARNED_UNTAGGED_FULLSCREEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        "fullscreen surface on HDR-capable output {output_name} committed NO color-management \
+         image description -- treating as SDR and dropping the connector out of HDR. If this \
+         client believes it is producing HDR, it had no advertised way to say so (see \
+         color_management::init: no Feature::WindowsScrgb / WindowsBt2100)."
+    );
 }
 
 /// PQ/BT.2020 image description advertised on HDR-enabled outputs so HDR-aware
