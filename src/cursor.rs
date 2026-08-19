@@ -18,6 +18,7 @@ use smithay::{
         renderer::{
             element::{
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                solid::SolidColorRenderElement,
                 surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
                 texture::TextureRenderElement,
                 utils::RescaleRenderElement,
@@ -77,6 +78,9 @@ render_elements! {
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
     Texture = TextureRenderElement<<R as RendererSuper>::TextureId>,
+    // Compositor-authored chrome: window borders (see decoration.rs). Solid
+    // colors, so no import bound beyond what the other variants already need.
+    Solid = SolidColorRenderElement,
     Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
 }
 

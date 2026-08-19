@@ -68,6 +68,54 @@ duration_ms = 250
 # such as the bar or rofi, which are not windows and must keep their keyboard.
 focus_follows_mouse = false
 
+# Window borders. Drawn OUTSIDE the client rect, over the surrounding gap, so a
+# window's tile keeps its full size -- the trade is that borders eat into
+# `inner_gap`/`outer_gap`. At `inner_gap = 0` adjacent borders overlap; at
+# `outer_gap = 0` the outermost ring clips at the screen edge. Raise the gaps to
+# give borders room.
+#
+# Fullscreen windows never get a border: an element stacked above a fullscreen
+# window disqualifies it from direct primary-plane scanout, which is the path
+# HDR gaming depends on.
+[decoration]
+# Logical pixels. 0 disables borders entirely and skips all decoration work.
+border_width = 2
+
+# Colors accept #RGB, #RRGGBB, or #RRGGBBAA (the leading '#' is optional). An
+# alpha of 0 skips the border for that window without disabling the feature.
+# Defaults are Catppuccin Mocha blue / surface1.
+active_color = "#89b4fa"
+inactive_color = "#45475a"
+
+# Absolute border luminance in nits, applied ONLY on an output actually
+# compositing in HDR (`hdr = true` on an HDR-capable display). Everywhere else
+# -- SDR output, SDR hardware, HDR disabled, screenshots, screencasts -- it is
+# ignored entirely and the border is simply `active_color`. Nobody without an
+# HDR monitor is affected by anything in this block.
+#
+# The point is chrome brighter than SDR white: with sdr_white_nits at its 203
+# default, a 350-nit focus ring is a focus indication that SDR chrome
+# physically cannot express. Omit (or set 0) for "no opinion" -- the border
+# then sits at SDR white like every other SDR element.
+# Commented out so this file matches the built-in defaults exactly: a config
+# omitting [decoration] entirely gets no luminance opinion. Uncomment to opt in.
+# active_luminance_nits = 350.0
+# inactive_luminance_nits = 0
+
+# Per-window overrides, consulted in file order; the first rule that matches AND
+# supplies a color for the relevant focus state wins, otherwise the defaults
+# above apply. `app_id` and `title` are case-insensitive SUBSTRING matches; when
+# both are given both must match, and a rule with neither matches every window
+# (useful as a catch-all placed last).
+#
+# A rule that sets only `active_color` does not also take over the inactive
+# appearance -- it falls through, so a rule can restyle just the focused case.
+#
+# [[decoration.rule]]
+# app_id = "signal"
+# active_color = "#f38ba8"
+# active_luminance_nits = 600.0
+
 # Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
 # variant name -- serde deserializes it straight into the enum, so there is no
 # translation table in code. Chord syntax: modifier tokens (Super/Alt/Ctrl/Shift,

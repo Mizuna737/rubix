@@ -7,6 +7,7 @@ use smithay::input::keyboard::{
     xkb::{keysym_from_name, KEYSYM_NO_FLAGS},
     ModifiersState,
 };
+use smithay::backend::renderer::Color32F;
 use smithay::utils::Transform;
 
 use crate::input::NavAction;
@@ -45,6 +46,10 @@ pub struct Config {
     /// RubixState::focus_follows_mouse, the live value the input path reads --
     /// this field only seeds/reseeds it).
     pub focus_follows_mouse: bool,
+
+    /// Border appearance. Live/hot-reloadable like the rest of the config;
+    /// the render path reads it fresh every frame.
+    pub decoration: DecorationConfig,
 }
 
 /// Resolved placement for one physical output, matched by connector name
@@ -99,6 +104,10 @@ struct RawConfig {
     animation: RawAnimation,
     #[serde(default)]
     input: RawInput,
+    // Optional section: a config omitting `[decoration]` gets the built-in
+    // border defaults (2px, Catppuccin blue/surface1, no HDR luminance).
+    #[serde(default)]
+    decoration: RawDecoration,
     // Top-level scalar (must sit before the first [table] header in the TOML
     // file -- see config/default.toml). Live/hot-reloadable: HDR Phase 4's
     // SDR-white-nits slider, adjustable via keybind (IncreaseSdrWhite /
@@ -233,6 +242,7 @@ impl Config {
             outputs,
             sdr_white_nits: raw.sdr_white_nits.clamp(80.0, 300.0),
             focus_follows_mouse: raw.input.focus_follows_mouse,
+            decoration: resolve_decoration(raw.decoration),
         }
     }
 
@@ -374,6 +384,218 @@ fn parse_chord(chord: &str, action: NavAction) -> Option<Keybind> {
         keysym: keysym?,
         action,
     })
+}
+
+
+// ---- decoration (HDR Phase 5b) ----
+
+/// One border appearance: the color as authored, plus an optional absolute
+/// luminance for HDR outputs. `luminance_nits: None` means "no opinion" --
+/// the border sits at SDR white like every other SDR element, which is also
+/// what happens on any non-HDR output regardless of what this says.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BorderStyle {
+    pub color: Color32F,
+    pub luminance_nits: Option<f32>,
+}
+
+/// Resolved `[decoration]`. `active`/`inactive` are the fallbacks; `rules` are
+/// consulted first, in config order.
+pub struct DecorationConfig {
+    /// Logical pixels, drawn outside the client rect. `0` disables borders
+    /// entirely and short-circuits all decoration work in the render path.
+    pub border_width: u32,
+    pub active: BorderStyle,
+    pub inactive: BorderStyle,
+    pub rules: Vec<BorderRule>,
+}
+
+/// A conditional override. Both matchers are case-insensitive substring tests,
+/// and a rule with neither matcher set matches every window (useful as a
+/// catch-all placed last). When both are set, both must match.
+pub struct BorderRule {
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+    pub active: Option<BorderStyle>,
+    pub inactive: Option<BorderStyle>,
+}
+
+impl BorderRule {
+    fn matches(&self, app_id: Option<&str>, title: Option<&str>) -> bool {
+        fn contains_ignore_case(haystack: Option<&str>, needle: &str) -> bool {
+            haystack.is_some_and(|h| h.to_lowercase().contains(&needle.to_lowercase()))
+        }
+        // A matcher that is set but does not match rejects the rule; a matcher
+        // that is unset is simply not a constraint.
+        self.app_id.as_ref().is_none_or(|n| contains_ignore_case(app_id, n))
+            && self.title.as_ref().is_none_or(|n| contains_ignore_case(title, n))
+    }
+}
+
+impl DecorationConfig {
+    /// The style for one window. First matching rule that actually supplies a
+    /// style for this focus state wins; otherwise the section default.
+    ///
+    /// A rule that sets only `active_color` deliberately does NOT also take
+    /// over the inactive appearance -- it falls through to the next rule and
+    /// ultimately to the default, so a rule can restyle just the focused case
+    /// without silently owning both.
+    pub fn style_for(&self, app_id: Option<&str>, title: Option<&str>, focused: bool) -> BorderStyle {
+        for rule in &self.rules {
+            if !rule.matches(app_id, title) {
+                continue;
+            }
+            let candidate = if focused { &rule.active } else { &rule.inactive };
+            if let Some(style) = candidate {
+                return style.clone();
+            }
+        }
+        if focused { self.active.clone() } else { self.inactive.clone() }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawDecoration {
+    #[serde(default = "default_border_width")]
+    border_width: u32,
+    #[serde(default = "default_active_color")]
+    active_color: String,
+    #[serde(default = "default_inactive_color")]
+    inactive_color: String,
+    #[serde(default)]
+    active_luminance_nits: Option<f32>,
+    #[serde(default)]
+    inactive_luminance_nits: Option<f32>,
+    // Singular to match the `[[decoration.rule]]` array-of-tables header
+    // exactly, same convention as `[[output]]`.
+    #[serde(default)]
+    rule: Vec<RawBorderRule>,
+}
+
+impl Default for RawDecoration {
+    fn default() -> Self {
+        RawDecoration {
+            border_width: default_border_width(),
+            active_color: default_active_color(),
+            inactive_color: default_inactive_color(),
+            active_luminance_nits: None,
+            inactive_luminance_nits: None,
+            rule: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawBorderRule {
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    active_color: Option<String>,
+    #[serde(default)]
+    inactive_color: Option<String>,
+    #[serde(default)]
+    active_luminance_nits: Option<f32>,
+    #[serde(default)]
+    inactive_luminance_nits: Option<f32>,
+}
+
+fn default_border_width() -> u32 {
+    2
+}
+
+fn default_active_color() -> String {
+    "#89b4fa".to_string()
+}
+
+fn default_inactive_color() -> String {
+    "#45475a".to_string()
+}
+
+/// Parse `#RGB`, `#RRGGBB`, or `#RRGGBBAA` (the leading `#` optional) into a
+/// straight-alpha sRGB color. Returns `None` on anything else so the caller
+/// can warn and fall back rather than taking a malformed color as authoritative.
+///
+/// Note the components stay sRGB-*encoded* here. Linearization happens in the
+/// render path, where it can be paired with the luminance scaling -- doing it
+/// at parse time would make `BorderStyle::color` mean something different from
+/// what the user typed.
+pub(crate) fn parse_color(text: &str) -> Option<Color32F> {
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    let component = |i: usize, len: usize| -> Option<f32> {
+        let slice = &hex.get(i * len..(i + 1) * len)?;
+        let value = u8::from_str_radix(&slice.repeat(2 / len), 16).ok()?;
+        Some(value as f32 / 255.0)
+    };
+    match hex.len() {
+        3 => Some(Color32F::new(component(0, 1)?, component(1, 1)?, component(2, 1)?, 1.0)),
+        6 => Some(Color32F::new(component(0, 2)?, component(1, 2)?, component(2, 2)?, 1.0)),
+        8 => Some(Color32F::new(
+            component(0, 2)?,
+            component(1, 2)?,
+            component(2, 2)?,
+            component(3, 2)?,
+        )),
+        _ => None,
+    }
+}
+
+/// Luminance is only meaningful as a positive absolute value. A zero or
+/// negative entry is read as "no opinion" rather than as a request to make the
+/// border black, which is almost certainly not what someone typing `0` meant.
+fn resolve_luminance(nits: Option<f32>) -> Option<f32> {
+    nits.filter(|n| *n > 0.0)
+}
+
+fn resolve_color(text: &str, fallback: Color32F) -> Color32F {
+    match parse_color(text) {
+        Some(color) => color,
+        None => {
+            tracing::warn!("unparseable border color {text:?}; falling back");
+            fallback
+        }
+    }
+}
+
+fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
+    let active_fallback = parse_color(&default_active_color()).expect("built-in color parses");
+    let inactive_fallback = parse_color(&default_inactive_color()).expect("built-in color parses");
+
+    let rules = raw
+        .rule
+        .into_iter()
+        .map(|r| {
+            // A rule supplies a style for a focus state only if it named a
+            // color for it; a bare luminance with no color would otherwise
+            // silently restyle windows the user never mentioned a color for.
+            let style = |color: Option<String>, nits: Option<f32>, fallback: Color32F| {
+                color.map(|c| BorderStyle {
+                    color: resolve_color(&c, fallback),
+                    luminance_nits: resolve_luminance(nits),
+                })
+            };
+            BorderRule {
+                active: style(r.active_color, r.active_luminance_nits, active_fallback),
+                inactive: style(r.inactive_color, r.inactive_luminance_nits, inactive_fallback),
+                app_id: r.app_id,
+                title: r.title,
+            }
+        })
+        .collect();
+
+    DecorationConfig {
+        border_width: raw.border_width,
+        active: BorderStyle {
+            color: resolve_color(&raw.active_color, active_fallback),
+            luminance_nits: resolve_luminance(raw.active_luminance_nits),
+        },
+        inactive: BorderStyle {
+            color: resolve_color(&raw.inactive_color, inactive_fallback),
+            luminance_nits: resolve_luminance(raw.inactive_luminance_nits),
+        },
+        rules,
+    }
 }
 
 #[cfg(test)]

@@ -184,6 +184,13 @@ pub fn init_winit(
                     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(ghost_elements.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(scaled_elements.into_iter().map(RubixRenderElement::Rescaled));
+                    // The winit backend has no HDR output, so borders always take their plain
+                    // configured color -- `hdr = false` makes the whole luminance mechanism inert.
+                    elements.extend(
+                        crate::decoration::border_elements(data, &output, scale, false)
+                            .into_iter()
+                            .map(RubixRenderElement::Solid),
+                    );
                     elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(background.into_iter().map(RubixRenderElement::Surface));

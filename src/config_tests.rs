@@ -312,3 +312,172 @@
         let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/other.toml");
         assert!(!should_reload(&e, OsStr::new("config.toml")));
     }
+
+    // ---- decoration ----
+
+    fn decoration_from(toml_body: &str) -> DecorationConfig {
+        let raw: RawDecoration = toml::from_str(toml_body).expect("decoration section parses");
+        resolve_decoration(raw)
+    }
+
+    #[test]
+    fn config_omitting_decoration_section_gets_the_built_in_border_defaults() {
+        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.decoration.border_width, 2);
+        assert!(cfg.decoration.active.color != cfg.decoration.inactive.color);
+    }
+
+    #[test]
+    fn hex_colors_parse_in_all_three_lengths() {
+        let long = parse_color("#8040c0").expect("6-digit parses");
+        assert!((long.r() - 0x80 as f32 / 255.0).abs() < 1e-6);
+        assert!((long.b() - 0xc0 as f32 / 255.0).abs() < 1e-6);
+        assert_eq!(long.a(), 1.0, "6 digits means fully opaque");
+
+        // Each digit doubles: #84c is #8844cc, not a truncation of #8040c0.
+        assert_eq!(parse_color("#84c"), parse_color("#8844cc"));
+
+        let with_alpha = parse_color("#8040c080").expect("8-digit parses");
+        assert!(with_alpha.a() < 1.0, "the 8th digit pair is alpha");
+    }
+
+    #[test]
+    fn the_leading_hash_is_optional() {
+        assert_eq!(parse_color("89b4fa"), parse_color("#89b4fa"));
+    }
+
+    #[test]
+    fn malformed_colors_are_rejected_rather_than_silently_accepted() {
+        assert!(parse_color("#12345").is_none(), "5 digits is not a color");
+        assert!(parse_color("#gggggg").is_none(), "non-hex digits");
+        assert!(parse_color("").is_none());
+    }
+
+    #[test]
+    fn an_unparseable_color_falls_back_instead_of_failing_the_whole_config() {
+        let deco = decoration_from(r##"active_color = "not-a-color""##);
+        assert_eq!(deco.active.color, parse_color("#89b4fa").unwrap());
+    }
+
+    // Zero means "no opinion", not "make the border black" -- see resolve_luminance.
+    #[test]
+    fn non_positive_luminance_is_read_as_no_opinion() {
+        let deco = decoration_from("active_luminance_nits = 0.0\ninactive_luminance_nits = -5.0");
+        assert_eq!(deco.active.luminance_nits, None);
+        assert_eq!(deco.inactive.luminance_nits, None);
+    }
+
+    #[test]
+    fn a_window_matching_no_rule_takes_the_section_defaults() {
+        let deco = decoration_from(r##"
+            active_color = "#111111"
+            inactive_color = "#222222"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#333333"
+        "##);
+        let style = deco.style_for(Some("firefox"), None, true);
+        assert_eq!(style.color, parse_color("#111111").unwrap());
+    }
+
+    #[test]
+    fn app_id_matching_is_case_insensitive_and_substring() {
+        let deco = decoration_from(r##"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#333333"
+        "##);
+        let style = deco.style_for(Some("org.SIGNAL.Desktop"), None, true);
+        assert_eq!(style.color, parse_color("#333333").unwrap());
+    }
+
+    #[test]
+    fn a_rule_setting_only_active_does_not_take_over_the_inactive_style() {
+        let deco = decoration_from(r##"
+            inactive_color = "#222222"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#333333"
+        "##);
+        let inactive = deco.style_for(Some("signal"), None, false);
+        assert_eq!(
+            inactive.color,
+            parse_color("#222222").unwrap(),
+            "an active-only rule must fall through for the unfocused case"
+        );
+    }
+
+    #[test]
+    fn the_first_matching_rule_wins() {
+        let deco = decoration_from(r##"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#333333"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#444444"
+        "##);
+        assert_eq!(
+            deco.style_for(Some("signal"), None, true).color,
+            parse_color("#333333").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rule_with_both_matchers_requires_both_to_match() {
+        let deco = decoration_from(r##"
+            active_color = "#111111"
+            [[rule]]
+            app_id = "firefox"
+            title = "youtube"
+            active_color = "#333333"
+        "##);
+        assert_eq!(
+            deco.style_for(Some("firefox"), Some("YouTube - Home"), true).color,
+            parse_color("#333333").unwrap()
+        );
+        assert_eq!(
+            deco.style_for(Some("firefox"), Some("Hacker News"), true).color,
+            parse_color("#111111").unwrap(),
+            "title must also match"
+        );
+    }
+
+    #[test]
+    fn a_rule_with_no_matchers_acts_as_a_catch_all() {
+        let deco = decoration_from(r##"
+            active_color = "#111111"
+            [[rule]]
+            active_color = "#333333"
+        "##);
+        assert_eq!(
+            deco.style_for(None, None, true).color,
+            parse_color("#333333").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rule_matcher_does_not_match_a_window_with_no_app_id() {
+        let deco = decoration_from(r##"
+            active_color = "#111111"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#333333"
+        "##);
+        assert_eq!(
+            deco.style_for(None, None, true).color,
+            parse_color("#111111").unwrap()
+        );
+    }
+
+    #[test]
+    fn per_rule_luminance_is_carried_through_to_the_resolved_style() {
+        let deco = decoration_from(r##"
+            [[rule]]
+            app_id = "signal"
+            active_color = "#333333"
+            active_luminance_nits = 600.0
+        "##);
+        assert_eq!(deco.style_for(Some("signal"), None, true).luminance_nits, Some(600.0));
+    }

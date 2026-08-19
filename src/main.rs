@@ -5,6 +5,7 @@ mod handlers;
 mod color_management;
 mod config;
 mod cursor;
+mod decoration;
 mod focus;
 mod grabs;
 mod hdr;

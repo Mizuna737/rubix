@@ -1364,6 +1364,23 @@ fn render_surface(
     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
     elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
     elements.extend(scaled.into_iter().map(RubixRenderElement::Rescaled));
+    // Window borders sit directly above the space and below every layer
+    // surface, so a bar or overlay still covers them. `surface.hdr` selects
+    // whether the configured per-rule luminance is applied: it is the same
+    // condition the HDR composite branch below tests, so the colors match the
+    // pass that will actually draw them.
+    //
+    // One seam, accepted knowingly: if the HDR pipeline *fails* and this frame
+    // falls through to the SDR path below, these colors were pre-compensated
+    // for a solid-color transform that will not run, so a boosted border draws
+    // too bright. That only happens on a frame that already logged an HDR
+    // failure warning, and a persistent failure means HDR is broken on this
+    // output entirely -- a bright border is a symptom, not the disease.
+    elements.extend(
+        crate::decoration::border_elements(state, &surface.output, scale, surface.hdr)
+            .into_iter()
+            .map(RubixRenderElement::Solid),
+    );
     elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
@@ -1874,6 +1891,16 @@ fn gather_tagged_elements<'a>(
         scaled
             .into_iter()
             .map(|e| (DecodeKind::Sdr, RubixRenderElement::Rescaled(e))),
+    );
+    // Same z-slot as the fast path. Always `Sdr`-tagged: borders are
+    // compositor-authored chrome, never client HDR content, so they take the
+    // SDR decode. Their per-rule luminance rides on the color itself (see
+    // `decoration::scale_srgb_luminance`), pre-compensated for exactly the
+    // solid-color transform this decode installs.
+    tagged.extend(
+        crate::decoration::border_elements(state, output, scale, true)
+            .into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Solid(e))),
     );
     tagged.extend(space_tagged.into_iter().map(|(k, e)| (k, RubixRenderElement::Surface(e))));
     tagged.extend(
