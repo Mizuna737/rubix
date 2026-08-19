@@ -401,3 +401,98 @@ fn plan_rotate_short_adjacent_move_is_not_a_wrap() {
     assert_eq!(tween.from, orig_from);
     assert_eq!(tween.to, pos(500, 0));
 }
+
+// ---- reveal: shrink/grow in place ----
+//
+// The reveal swap trades two NON-adjacent groups: the displaced one is headed
+// for a column that is off-screen by definition, so there is no edge to travel
+// toward. Both endpoints of every reveal tween are therefore the same point,
+// and all the motion lives in the scale channel.
+
+fn plan_reveal(
+    current: HashMap<u32, Pos>,
+    targets: &[(u32, Rect)],
+) -> HashMap<u32, crate::state::Tween> {
+    let bounds = make_rect(0, 0, 1920, 1080);
+    RubixState::plan_transition(
+        &current,
+        targets,
+        crate::state::Transition::Reveal,
+        bounds,
+        Instant::now(),
+    )
+}
+
+#[test]
+fn plan_reveal_enter_grows_from_nothing_in_place() {
+    let current: HashMap<u32, Pos> = HashMap::new();
+    let target = make_rect(300, 200, 400, 500);
+    let tweens = plan_reveal(current, &vec![(1, target)]);
+    let tween = tweens[&1];
+    assert_eq!(tween.kind, crate::state::TweenKind::Enter);
+    // No slide: unlike Scroll/Rotate, `from` is not offset off-screen.
+    assert_eq!(tween.from, pos(300, 200));
+    assert_eq!(tween.to, pos(300, 200));
+    assert_eq!(tween.scale, Some(crate::state::ScaleTrack { from: 0.0, to: 1.0 }));
+}
+
+#[test]
+fn plan_reveal_leave_shrinks_to_nothing_in_place() {
+    let mut current: HashMap<u32, Pos> = HashMap::new();
+    let cur = pos(300, 200);
+    current.insert(1, cur);
+    let tweens = plan_reveal(current, &vec![]);
+    let tween = tweens[&1];
+    assert_eq!(tween.kind, crate::state::TweenKind::Leave);
+    assert_eq!(tween.from, cur);
+    assert_eq!(tween.to, cur, "a shrinking window must not also travel off-screen");
+    assert_eq!(tween.scale, Some(crate::state::ScaleTrack { from: 1.0, to: 0.0 }));
+}
+
+#[test]
+fn plan_reveal_leaves_untouched_columns_unscaled() {
+    // Only two groups swap; every other visible column holds still. Those
+    // windows must stay on the cheap Space-mapped path -- a scale channel here
+    // would unmap them and hand them to the hand-rolled render list for no
+    // reason.
+    let mut current: HashMap<u32, Pos> = HashMap::new();
+    current.insert(7, pos(900, 0));
+    let tweens = plan_reveal(current, &vec![(7, make_rect(900, 0, 300, 600))]);
+    let tween = tweens[&7];
+    assert_eq!(tween.kind, crate::state::TweenKind::Move);
+    assert_eq!(tween.scale, None);
+    assert_eq!(tween.from, tween.to);
+}
+
+#[test]
+fn plan_reveal_swaps_both_directions_at_once() {
+    // The real shape of a swap: the revealed group enters while the displaced
+    // group leaves, in the same plan, at the same slot.
+    let mut current: HashMap<u32, Pos> = HashMap::new();
+    current.insert(1, pos(0, 0));                       // displaced
+    let targets = vec![(10, make_rect(0, 0, 300, 600))]; // revealed
+    let tweens = plan_reveal(current, &targets);
+    assert_eq!(tweens[&1].kind, crate::state::TweenKind::Leave);
+    assert_eq!(tweens[&1].scale.unwrap().to, 0.0);
+    assert_eq!(tweens[&10].kind, crate::state::TweenKind::Enter);
+    assert_eq!(tweens[&10].scale.unwrap().from, 0.0);
+    // Both animate over the same rect, which is what reads as a trade.
+    assert_eq!(tweens[&1].from, tweens[&10].to);
+}
+
+// ---- lerp_scale ----
+
+#[test]
+fn lerp_scale_hits_both_endpoints() {
+    let track = crate::state::ScaleTrack { from: 0.0, to: 1.0 };
+    assert_eq!(RubixState::lerp_scale(track, 0.0), 0.0);
+    assert_eq!(RubixState::lerp_scale(track, 1.0), 1.0);
+}
+
+#[test]
+fn lerp_scale_runs_backwards_for_a_shrink() {
+    let track = crate::state::ScaleTrack { from: 1.0, to: 0.0 };
+    assert_eq!(RubixState::lerp_scale(track, 0.0), 1.0);
+    assert_eq!(RubixState::lerp_scale(track, 0.5), 0.5);
+    assert_eq!(RubixState::lerp_scale(track, 1.0), 0.0);
+}

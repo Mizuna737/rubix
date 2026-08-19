@@ -1270,6 +1270,12 @@ fn render_surface(
         ));
     }
 
+    // Windows mid-Reveal, drawn scaled about their own centre. They are
+    // unmapped from the Space for the tween's duration, so this list is their
+    // only draw -- dropping it makes them vanish for the animation rather than
+    // merely render unscaled. Same z-slot as the ghosts, for the same reason.
+    let mut scaled = crate::state::reveal_scale_elements(state, renderer);
+
     // Exclusive fullscreen: chrome above the game (layer-shell top/overlay,
     // animation ghosts) must not render, both because it would be incorrect
     // (waybar etc. shouldn't paint over a fullscreen game) and because
@@ -1281,6 +1287,7 @@ fn render_surface(
         top.clear();
         overlay.clear();
         ghosts.clear();
+        scaled.clear();
     }
 
     // Cursor built last (it also needs `renderer`), same "collect before the
@@ -1314,6 +1321,7 @@ fn render_surface(
     elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
     elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(scaled.into_iter().map(RubixRenderElement::Rescaled));
     elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
@@ -1661,6 +1669,12 @@ fn gather_tagged_elements<'a>(
         _ => Vec::new(),
     };
 
+    // Windows mid-Reveal, drawn scaled about their own centre. They are
+    // unmapped from the Space for the tween's duration, so this list is their
+    // only draw -- dropping it makes them vanish for the animation rather than
+    // merely render unscaled. Same z-slot as the ghosts, for the same reason.
+    let scaled = crate::state::reveal_scale_elements(state, renderer);
+
     // Same front-to-back order as `render_surface`'s `elements`: cursor,
     // overlay, top, ghosts, space, bottom, background.
     let mut tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
@@ -1678,6 +1692,11 @@ fn gather_tagged_elements<'a>(
         ghosts
             .into_iter()
             .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
+    );
+    tagged.extend(
+        scaled
+            .into_iter()
+            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Rescaled(e))),
     );
     tagged.extend(space_tagged.into_iter().map(|(k, e)| (k, RubixRenderElement::Surface(e))));
     tagged.extend(

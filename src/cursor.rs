@@ -20,6 +20,7 @@ use smithay::{
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
                 texture::TextureRenderElement,
+                utils::RescaleRenderElement,
                 Kind,
             },
             ImportAll, ImportMem, Renderer, RendererSuper, Texture,
@@ -65,11 +66,18 @@ use smithay::{
 // .render_frame` with `renderer.as_mut(): &mut GlesRenderer`, not the outer
 // `MultiRenderer` -- see udev.rs's HDR branch comment for why), so in
 // practice this variant only ever holds `TextureRenderElement<GlesTexture>`.
+//
+// `Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>`: the
+// shrink/grow reveal transition. The Space renders in a single
+// region-wide call that cannot scale individual elements, so a window
+// mid-scale is unmapped and drawn by hand -- the same treatment rotation
+// ghosts already get -- with each of its surface elements wrapped here.
 render_elements! {
     pub RubixRenderElement<R> where R: ImportAll + ImportMem;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
     Texture = TextureRenderElement<<R as RendererSuper>::TextureId>,
+    Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
 }
 
 struct LoadedCursor {

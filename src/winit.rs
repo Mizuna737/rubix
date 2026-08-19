@@ -156,6 +156,12 @@ pub fn init_winit(
                         })
                         .collect();
 
+                    // Windows mid-Reveal, drawn scaled about their own centre. They are
+                    // unmapped from the Space for the tween's duration, so this list is their
+                    // only draw -- dropping it makes them vanish for the animation rather than
+                    // merely render unscaled. Same z-slot as the ghosts, for the same reason.
+                    let scaled_elements = crate::state::reveal_scale_elements(data, renderer);
+
                     // Cursor built last (it needs `renderer` too) so it stays
                     // in the same "collect before the combined render call"
                     // discipline as the ghost/layer lists above -- the
@@ -177,6 +183,7 @@ pub fn init_winit(
                     elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(ghost_elements.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(scaled_elements.into_iter().map(RubixRenderElement::Rescaled));
                     elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(background.into_iter().map(RubixRenderElement::Surface));

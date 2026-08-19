@@ -74,6 +74,16 @@ pub(crate) struct GhostTrack {
     to: Pos,
 }
 
+// The scale channel of a tween, used only by Reveal. `None` means "draw at
+// native size", which is every tween the slide transitions produce -- keeping
+// it optional is what lets Scroll/Rotate stay on the cheap Space-mapped path
+// while Reveal alone takes the render-time rescale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScaleTrack {
+    from: f32,
+    to: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tween {
     kind: TweenKind,
@@ -81,6 +91,7 @@ pub(crate) struct Tween {
     to: Pos,
     start: Instant,
     ghost: Option<GhostTrack>,
+    scale: Option<ScaleTrack>,
 }
 
 // The kind of spatial-nav transition that just happened. Carries the slide
@@ -89,6 +100,12 @@ pub(crate) struct Tween {
 pub(crate) enum Transition {
     Scroll { down: bool },
     Rotate,
+    // A reveal swap: the group traded into the active slot grows from nothing
+    // while the displaced group shrinks away, both in place. Nothing slides,
+    // because the two groups are not adjacent -- the displaced one is going to
+    // a column that is off-screen by definition, so there is no edge to travel
+    // toward that would read as motion rather than a glitch.
+    Reveal,
 }
 
 pub struct RubixState {
@@ -154,6 +171,12 @@ pub struct RubixState {
     // by `step_animations` each call. Consumed by the backends right after, to
     // inject a second draw of the wrapping surface. Not Space state.
     pub(crate) active_ghosts: Vec<(u32, Pos)>,
+    // Windows mid-Reveal: (id, top-left position, current scale). Rendered
+    // outside the Space, wrapped in RescaleRenderElement -- the Space renders
+    // in one region-wide call that cannot scale individual elements, so a
+    // scaling window has to be unmapped and drawn by hand, the same way
+    // rotation ghosts are.
+    pub(crate) active_scales: Vec<(u32, Pos, f32)>,
 
     // Windows currently in fullscreen state (bypass normal tiling).
     pub(crate) fullscreen_windows: HashSet<u32>,
@@ -332,6 +355,7 @@ impl RubixState {
             animations: HashMap::new(),
             pending_transition: None,
             active_ghosts: Vec::new(),
+            active_scales: Vec::new(),
             fullscreen_windows: HashSet::new(),
             iconified: HashSet::new(),
             maximized: None,
@@ -720,6 +744,10 @@ impl RubixState {
 
     // Position-only interpolation, signed -- no clamp, no size (tweens carry
     // only a top-left position; size is configured once, up front).
+    fn lerp_scale(track: ScaleTrack, t: f32) -> f32 {
+        track.from + (track.to - track.from) * t
+    }
+
     fn lerp_pos(from: Pos, to: Pos, t: f32) -> Pos {
         let lerp = |a: i32, b: i32| (a as f32 + (b - a) as f32 * t).round() as i32;
         Pos { x: lerp(from.x, to.x), y: lerp(from.y, to.y) }
@@ -748,7 +776,9 @@ impl RubixState {
             if !current.contains_key(&id) {
                 let target = Pos { x: rect.x as i32, y: rect.y as i32 };
                 let from = Self::enter_from(transition, target, bounds);
-                tweens.insert(id, Tween { kind: TweenKind::Enter, from, to: target, start: now, ghost: None });
+                let scale = matches!(transition, Transition::Reveal)
+                    .then_some(ScaleTrack { from: 0.0, to: 1.0 });
+                tweens.insert(id, Tween { kind: TweenKind::Enter, from, to: target, start: now, ghost: None, scale });
             }
         }
 
@@ -756,7 +786,9 @@ impl RubixState {
         for (&id, &cur) in current {
             if !targets_map.contains_key(&id) {
                 let to = Self::leave_to(transition, cur, bounds);
-                tweens.insert(id, Tween { kind: TweenKind::Leave, from: cur, to, start: now, ghost: None });
+                let scale = matches!(transition, Transition::Reveal)
+                    .then_some(ScaleTrack { from: 1.0, to: 0.0 });
+                tweens.insert(id, Tween { kind: TweenKind::Leave, from: cur, to, start: now, ghost: None, scale });
             }
         }
 
@@ -766,8 +798,11 @@ impl RubixState {
             if let Some(&target) = targets_map.get(&id) {
                 let tween = match transition {
                     Transition::Rotate => Self::plan_rotate_move(cur, target, bounds, now),
-                    Transition::Scroll { .. } => {
-                        Tween { kind: TweenKind::Move, from: cur, to: target, start: now, ghost: None }
+                    // Reveal only swaps two groups; every other visible column
+                    // holds still, so its windows get a degenerate Move rather
+                    // than a scale.
+                    Transition::Scroll { .. } | Transition::Reveal => {
+                        Tween { kind: TweenKind::Move, from: cur, to: target, start: now, ghost: None, scale: None }
                     }
                 };
                 tweens.insert(id, tween);
@@ -802,9 +837,9 @@ impl RubixState {
                 from: orig_from,
                 to: Pos { x: orig_from.x + wrap_delta, y: orig_from.y },
             });
-            Tween { kind: TweenKind::Move, from, to, start: now, ghost }
+            Tween { kind: TweenKind::Move, from, to, start: now, ghost, scale: None }
         } else {
-            Tween { kind: TweenKind::Move, from: orig_from, to: orig_to, start: now, ghost: None }
+            Tween { kind: TweenKind::Move, from: orig_from, to: orig_to, start: now, ghost: None, scale: None }
         }
     }
 
@@ -828,6 +863,8 @@ impl RubixState {
                     Pos { x: target.x + dx, y: target.y }
                 }
             }
+            // Grows in place: start and end are the same point.
+            Transition::Reveal => target,
         }
     }
 
@@ -851,6 +888,8 @@ impl RubixState {
                     Pos { x: cur.x + dx, y: cur.y }
                 }
             }
+            // Shrinks in place: start and end are the same point.
+            Transition::Reveal => cur,
         }
     }
 
@@ -883,6 +922,7 @@ impl RubixState {
         // last wrap's ghost would leak forever, since the guard returns early
         // on every subsequent idle frame and the list never gets rebuilt.
         self.active_ghosts.clear();
+        self.active_scales.clear();
         if self.animations.is_empty() { return false; }
         let duration_secs = self.config.animation_duration.as_secs_f32();
         let now = Instant::now();
@@ -891,8 +931,22 @@ impl RubixState {
             let t = (now - tween.start).as_secs_f32() / duration_secs;
             let e = Self::ease(t);
             let pos = Self::lerp_pos(tween.from, tween.to, e);
-            if let Some(window) = self.windows.get(id) {
-                self.space.map_element(window.clone(), (pos.x, pos.y), false);
+            match tween.scale {
+                // Scaling window: kept OUT of the Space for the duration, or
+                // render_elements_for_region would draw a second copy at full
+                // size underneath the scaled one. Re-mapped on completion below
+                // (Enter) or left unmapped for good (Leave).
+                Some(track) => {
+                    if let Some(window) = self.windows.get(id) {
+                        self.space.unmap_elem(window);
+                    }
+                    self.active_scales.push((*id, pos, Self::lerp_scale(track, e)));
+                }
+                None => {
+                    if let Some(window) = self.windows.get(id) {
+                        self.space.map_element(window.clone(), (pos.x, pos.y), false);
+                    }
+                }
             }
             if let Some(g) = tween.ghost {
                 let gpos = Self::lerp_pos(g.from, g.to, e);
@@ -1416,6 +1470,14 @@ impl RubixState {
                 let plan = Self::plan_transition(&current, &targets, transition, bounds, Instant::now());
                 for (id, tween) in &plan {
                     if let Some(window) = self.windows.get(id).cloned() {
+                        // Scaling tweens are drawn outside the Space for their
+                        // whole run, so they must not be mapped here either --
+                        // otherwise the window paints once at full size in the
+                        // frame between planning and the first step_animations.
+                        if tween.scale.is_some() {
+                            self.space.unmap_elem(&window);
+                            continue;
+                        }
                         match tween.kind {
                             TweenKind::Enter | TweenKind::Move => {
                                 self.space.map_element(window, (tween.from.x, tween.from.y), false);
@@ -1464,4 +1526,55 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Surface elements for every window mid-Reveal, each wrapped in a
+/// `RescaleRenderElement` about the window's own centre so it grows or shrinks
+/// in place rather than toward a corner.
+///
+/// These windows are unmapped from the `Space` for the whole tween (see
+/// `step_animations`), because `render_elements_for_region` draws the space in
+/// one call and cannot scale individual elements. So this is their ONLY draw --
+/// omitting this list from a render path makes revealing windows invisible for
+/// the length of the animation rather than merely unscaled. Mirrors the ghost
+/// path, including its 1.0 output scale assumption.
+use smithay::backend::renderer::{
+    element::{surface::WaylandSurfaceRenderElement, utils::RescaleRenderElement, AsRenderElements},
+    ImportAll, Renderer,
+};
+use smithay::utils::{Physical, Scale};
+
+pub(crate) fn reveal_scale_elements<R>(
+    state: &RubixState,
+    renderer: &mut R,
+) -> Vec<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let scaled: Vec<(Window, Pos, f32)> = state
+        .active_scales
+        .iter()
+        .filter_map(|(id, pos, factor)| state.windows.get(id).map(|w| (w.clone(), *pos, *factor)))
+        .collect();
+
+    let mut out = Vec::new();
+    for (window, pos, factor) in scaled {
+        // Fully collapsed: nothing worth drawing, and a zero scale degenerates
+        // the element geometry.
+        if factor <= 0.01 {
+            continue;
+        }
+        let size = window.geometry().size;
+        let origin = Point::<i32, Physical>::from((pos.x + size.w / 2, pos.y + size.h / 2));
+        for element in window.render_elements::<WaylandSurfaceRenderElement<R>>(
+            renderer,
+            Point::<i32, Physical>::from((pos.x, pos.y)),
+            Scale::from(1.0),
+            1.0,
+        ) {
+            out.push(RescaleRenderElement::from_element(element, origin, factor as f64));
+        }
+    }
+    out
 }

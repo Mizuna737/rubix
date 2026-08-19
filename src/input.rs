@@ -549,8 +549,17 @@ impl RubixState {
 
         // Arm the transition BEFORE any apply_layout -- that call consumes
         // pending_transition via take(), so arming afterwards animates nothing.
-        if let Some(RevealKind::Scrolled { down }) = revealed {
-            self.pending_transition = Some(Transition::Scroll { down });
+        match revealed {
+            Some(RevealKind::Scrolled { down }) => {
+                self.pending_transition = Some(Transition::Scroll { down });
+            }
+            // The swap trades two non-adjacent groups, so there is no edge to
+            // slide toward: the revealed group grows in place while the
+            // displaced one shrinks away.
+            Some(RevealKind::Swapped) => {
+                self.pending_transition = Some(Transition::Reveal);
+            }
+            Some(RevealKind::AlreadyVisible) | None => {}
         }
 
         let serial = SERIAL_COUNTER.next_serial();
