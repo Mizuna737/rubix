@@ -281,6 +281,18 @@ pub struct RubixState {
     // path via `screencopy::fulfill_pending` right after it presents.
     pub(crate) pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
 
+    // Names of outputs currently running the HDR pipeline, mirrored from
+    // `SurfaceData::hdr`.
+    //
+    // Exists because `ColorManagementHandler::description_for_output` runs
+    // during protocol dispatch and must not block on the udev RefCell -- it used
+    // to `try_borrow` and report SDR on failure, which silently handed clients
+    // an sRGB description for an HDR output. gamescope read that as
+    // uMaxLum/uRefLum = 80 (sRGB's reference white), concluded there was no
+    // headroom, and refused to expose HDR to the game. A cache cannot fail that
+    // way: it is either current or it is a bug with a visible cause.
+    pub(crate) hdr_outputs: HashSet<String>,
+
     // wp_presentation: lets clients learn when a frame actually hit the
     // display, which is what VK_KHR_present_wait / present_id are built on and
     // what video players use for frame pacing. Feedback is collected per frame
@@ -435,6 +447,7 @@ impl RubixState {
             focus_follows_mouse,
             pending_screencopy: Vec::new(),
 
+            hdr_outputs: HashSet::new(),
             presentation_state,
             color_management_state,
             loop_handle,
@@ -465,9 +478,17 @@ impl RubixState {
         let Some(udev) = self.udev_handle.clone() else {
             return;
         };
-        let outputs = crate::udev::toggle_hdr(&udev);
-        for output in &outputs {
-            self.color_management_state.output_description_changed(output);
+        // The new per-output state comes back with the outputs so `hdr_outputs`
+        // stays in step without a second udev borrow. That cache is what
+        // `description_for_output` reads, so letting it drift would hand clients
+        // the wrong description for the rest of the session.
+        for (output, is_hdr) in crate::udev::toggle_hdr(&udev) {
+            if is_hdr {
+                self.hdr_outputs.insert(output.name());
+            } else {
+                self.hdr_outputs.remove(&output.name());
+            }
+            self.color_management_state.output_description_changed(&output);
         }
     }
 

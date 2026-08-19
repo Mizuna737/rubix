@@ -217,21 +217,14 @@ impl ColorManagementHandler for RubixState {
     /// Advertises PQ/BT.2020 on outputs currently running the HDR pipeline
     /// (`SurfaceData::hdr`, flipped live by `udev::toggle_hdr`), sRGB
     /// otherwise. This runs during protocol dispatch (`GetImageDescription`),
-    /// so the `udev_handle` borrow MUST be non-blocking: `try_borrow`, fall
-    /// back to SRGB if the state is already borrowed elsewhere rather than
-    /// panicking.
+    /// so it must not touch the udev `RefCell` at all -- it reads the
+    /// `hdr_outputs` cache instead.
     fn description_for_output(&mut self, output: &Output) -> ImageDescription {
-        let is_hdr = self
-            .udev_handle
-            .as_ref()
-            .and_then(|udev| {
-                udev.try_borrow().ok().map(|u| {
-                    u.backends
-                        .values()
-                        .any(|b| b.surfaces.values().any(|s| &s.output == output && s.hdr))
-                })
-            })
-            .unwrap_or(false);
+        // Reads the `hdr_outputs` cache rather than the udev RefCell. The
+        // previous version did `try_borrow(...).unwrap_or(false)`, so a
+        // transient borrow conflict during dispatch silently downgraded an HDR
+        // output to sRGB -- see `RubixState::hdr_outputs`.
+        let is_hdr = self.hdr_outputs.contains(output.name().as_str());
         if is_hdr {
             hdr_output_description(self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32)
         } else {

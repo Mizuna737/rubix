@@ -903,6 +903,7 @@ fn connector_connected(
         set_hdr_output_properties(&drm_output);
     }
 
+    let cached_output_name = output.name();
     backend.surfaces.insert(
         crtc,
         SurfaceData {
@@ -921,6 +922,14 @@ fn connector_connected(
             primary_plane_formats,
         },
     );
+
+    // Keep the description cache in step from the moment the output exists --
+    // a client can query `description_for_output` before the first frame.
+    if output_hdr {
+        data.hdr_outputs.insert(cached_output_name.clone());
+    } else {
+        data.hdr_outputs.remove(&cached_output_name);
+    }
 
     drop(guard);
     // First frame on the next loop turn (also does the initial tiling pass).
@@ -1073,8 +1082,8 @@ fn set_sdr_output_properties(drm_output: &RubixDrmOutput) {
 /// (`ColorManagementState::output_description_changed`) to re-query
 /// `description_for_output` -- without needing a second borrow of `udev`
 /// alongside `self.color_management_state`.
-pub(crate) fn toggle_hdr(udev: &Rc<RefCell<UdevData>>) -> Vec<Output> {
-    let (targets, outputs): (Vec<(DrmNode, crtc::Handle)>, Vec<Output>) = {
+pub(crate) fn toggle_hdr(udev: &Rc<RefCell<UdevData>>) -> Vec<(Output, bool)> {
+    let (targets, outputs): (Vec<(DrmNode, crtc::Handle)>, Vec<(Output, bool)>) = {
         let mut guard = udev.borrow_mut();
         let mut targets = Vec::new();
         let mut outputs = Vec::new();
@@ -1093,8 +1102,9 @@ pub(crate) fn toggle_hdr(udev: &Rc<RefCell<UdevData>>) -> Vec<Output> {
                     surface.output.name(),
                     if surface.hdr { "HDR" } else { "SDR" }
                 );
+
                 targets.push((*node, *crtc));
-                outputs.push(surface.output.clone());
+                outputs.push((surface.output.clone(), surface.hdr));
             }
         }
         (targets, outputs)
