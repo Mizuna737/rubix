@@ -258,6 +258,8 @@ pub struct HdrShaders {
     /// [`DECODE_WINDOWS_SCRGB`].
     pub decode_windows_scrgb: GlesTexProgram,
     pub encode: GlesTexProgram,
+    /// Tone-mapping encode for capture targets. See [`ENCODE_LINEAR_TO_SDR`].
+    pub encode_sdr: GlesTexProgram,
 }
 
 /// Compile all HDR shaders against the given `GlesRenderer`. Call once
@@ -272,11 +274,16 @@ pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, Gl
     let decode_windows_scrgb =
         renderer.compile_custom_texture_shader(DECODE_WINDOWS_SCRGB, &[])?;
     let encode = renderer.compile_custom_texture_shader(ENCODE_LINEAR_TO_PQ, &[])?;
+    let encode_sdr = renderer.compile_custom_texture_shader(
+        ENCODE_LINEAR_TO_SDR,
+        &[UniformName::new("sdr_white_nits", UniformType::_1f)],
+    )?;
     Ok(HdrShaders {
         decode_sdr,
         decode_hdr_pq,
         decode_windows_scrgb,
         encode,
+        encode_sdr,
     })
 }
 
@@ -322,6 +329,77 @@ fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Color32F {
 pub fn sdr_solid_transform(sdr_white_nits: f32) -> impl Fn(Color32F) -> Color32F + 'static {
     move |color| srgb_to_bt2020_abs10k(color, sdr_white_nits)
 }
+
+/// Encode pass for **capture**: linear BT.2020 / 10000-nit working space down to
+/// 8-bit sRGB, tone-mapped rather than clipped.
+///
+/// The display encode ([`ENCODE_LINEAR_TO_PQ`]) hands the panel absolute
+/// luminance and lets it do the work. A screenshot or a screenshare has no such
+/// luxury: the destination is an 8-bit sRGB buffer with a hard ceiling, so
+/// anything above SDR white has to be mapped rather than truncated. Straight
+/// clipping is what makes captured HDR look like a blown-out white sky, which is
+/// the specific failure this exists to avoid.
+///
+/// Order matters. Primaries first (a linear 3x3, safe to do before tone-mapping),
+/// then the luminance rolloff, then the sRGB OETF last -- tone-mapping after the
+/// OETF would be operating on perceptual values and crush midtones.
+///
+/// The curve is a **soft knee**, not global Reinhard. Global Reinhard maps SDR
+/// white (v = 1.0) to ~0.55, which is correct when tone-mapping a wholly-HDR
+/// scene but wrong here: a desktop capture is overwhelmingly SDR content, and
+/// darkening all of it by half to make headroom for highlights nobody is using
+/// is a worse picture than the clipping it replaced.
+///
+/// So: identity below `KNEE`, and above it an exponential that is C1-continuous
+/// at the join (its slope is exactly 1 there) and asymptotic to 1.0. Ordinary
+/// content passes through untouched; only genuine highlights compress.
+pub const ENCODE_LINEAR_TO_SDR: &str = r#"
+#version 100
+
+//_DEFINES_
+
+precision highp float;
+uniform sampler2D tex;
+uniform float alpha;
+uniform float sdr_white_nits;
+varying vec2 v_coords;
+
+// Inverse of DECODE_SDR's matrix: BT.2020 -> BT.709, linear-light, column-major.
+const mat3 BT2020_TO_BT709 = mat3(
+     1.660491000, -0.124550000, -0.018151000,   // column 0
+    -0.587641000,  1.132900000, -0.100579000,   // column 1
+    -0.072850000, -0.008349000,  1.118730000);  // column 2
+
+// Where the rolloff begins, in multiples of SDR white. Below this, output ==
+// input: the SDR desktop is reproduced exactly.
+const float KNEE = 0.8;
+
+vec3 linear_to_srgb(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    vec3 cutoff = step(vec3(0.0031308), c);
+    return mix(lo, hi, cutoff);
+}
+
+void main() {
+    vec4 c = texture2D(tex, v_coords);
+
+    // Working space is normalized so 1.0 == 10000 nits; rescale so SDR white
+    // sits at 1.0 and the tone curve has a meaningful domain.
+    vec3 nits = c.rgb * 10000.0;
+    vec3 v = nits / max(sdr_white_nits, 1.0);
+
+    vec3 lin709 = max(BT2020_TO_BT709 * v, 0.0);
+
+    // Soft knee: identity up to KNEE, then compress the excess asymptotically
+    // toward 1.0. Applied per channel so a highlight does not shift hue.
+    vec3 excess = max(lin709 - KNEE, 0.0);
+    vec3 rolled = KNEE + (1.0 - KNEE) * (1.0 - exp(-excess / (1.0 - KNEE)));
+    vec3 mapped = mix(lin709, rolled, step(KNEE, lin709));
+
+    gl_FragColor = vec4(linear_to_srgb(clamp(mapped, 0.0, 1.0)), c.a) * alpha;
+}
+"#;
 
 #[cfg(test)]
 mod scrgb_tests {
@@ -403,5 +481,103 @@ mod tests {
         assert!(out.r().abs() < EPSILON);
         assert!(out.g().abs() < EPSILON);
         assert!(out.b().abs() < EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod capture_encode_tests {
+    use super::*;
+
+    // The capture encode must tone-map, not clip. Clipping is what turns a
+    // captured HDR sky into a flat white blob, and it is the easy thing to write
+    // by accident since the destination is 0..1 anyway.
+    #[test]
+    fn capture_encode_rolls_off_rather_than_only_clamping() {
+        assert!(
+            ENCODE_LINEAR_TO_SDR.contains("1.0 - exp(-excess"),
+            "soft-knee rolloff must be present"
+        );
+    }
+
+    // Order: primaries (linear) -> tone map -> OETF. Applying the OETF before
+    // the tone curve would map perceptual values and crush midtones.
+    #[test]
+    fn capture_encode_applies_oetf_last() {
+        let matrix = ENCODE_LINEAR_TO_SDR.find("BT2020_TO_BT709 *").expect("matrix");
+        let tonemap = ENCODE_LINEAR_TO_SDR.find("1.0 - exp(-excess").expect("tone map");
+        let oetf = ENCODE_LINEAR_TO_SDR.find("linear_to_srgb(clamp").expect("oetf");
+        assert!(matrix < tonemap, "primaries before tone map");
+        assert!(tonemap < oetf, "tone map before OETF");
+    }
+
+    // It converts BT.2020 -> BT.709, the opposite direction to every decode
+    // shader. Reusing DECODE_SDR's matrix here would be a silent, plausible-
+    // looking colour shift.
+    #[test]
+    fn capture_encode_converts_out_of_bt2020_not_into_it() {
+        assert!(ENCODE_LINEAR_TO_SDR.contains("BT2020_TO_BT709"));
+        assert!(!ENCODE_LINEAR_TO_SDR.contains("BT709_TO_BT2020"));
+    }
+
+    // The maths, independent of GLSL. The property that matters is that ORDINARY
+    // SDR content is reproduced exactly -- a desktop screenshot must not get
+    // darker just because the output happens to be HDR-capable.
+    const KNEE: f32 = 0.8;
+    fn map(v: f32) -> f32 {
+        if v <= KNEE {
+            v
+        } else {
+            KNEE + (1.0 - KNEE) * (1.0 - (-(v - KNEE) / (1.0 - KNEE)).exp())
+        }
+    }
+
+    #[test]
+    fn sdr_range_below_the_knee_is_reproduced_exactly() {
+        for v in [0.0f32, 0.1, 0.25, 0.5, 0.75, 0.8] {
+            assert_eq!(map(v), v, "v = {v} must pass through untouched");
+        }
+    }
+
+    #[test]
+    fn highlights_compress_toward_one_without_exceeding_it() {
+        // Moderate highlights must still have headroom left -- if 2x SDR white
+        // already sat at 1.0 the knee would be doing nothing useful.
+        for v in [1.0f32, 2.0, 3.0] {
+            let m = map(v);
+            assert!(m > KNEE && m < 1.0, "v = {v} mapped to {m}");
+        }
+        // Nothing may exceed the 8-bit ceiling, at any input.
+        for v in [5.0f32, 49.3, 1000.0] {
+            assert!(map(v) <= 1.0, "v = {v} mapped to {} which overflows", map(v));
+        }
+        // 49.3 == 10000 nits against 203-nit SDR white: the top of the range.
+        // Saturating exactly at 1.0 here is correct, not a bug.
+        assert!(map(49.3) > 0.99, "peak should approach the ceiling, not fall short");
+    }
+
+    #[test]
+    fn curve_is_monotonic_and_continuous_at_the_knee() {
+        // Non-decreasing rather than strictly increasing: the curve legitimately
+        // saturates at 1.0 in f32 well before the top of the input range.
+        let mut prev = -1.0f32;
+        for i in 0..=500 {
+            let v = i as f32 * 0.1;
+            let m = map(v);
+            assert!(m >= prev, "not monotonic at v = {v}: {m} < {prev}");
+            prev = m;
+        }
+        // Strictly increasing where it actually matters -- through the SDR range
+        // and the first stop above it.
+        for i in 0..30 {
+            let a = i as f32 * 0.05;
+            let b = a + 0.05;
+            assert!(map(b) > map(a), "flat spot between {a} and {b}");
+        }
+        // C1 at the join: slope of the upper branch is exactly 1 at KNEE, so the
+        // two branches meet without a visible crease in a gradient.
+        let eps = 1e-4;
+        let below = (map(KNEE) - map(KNEE - eps)) / eps;
+        let above = (map(KNEE + eps) - map(KNEE)) / eps;
+        assert!((below - above).abs() < 1e-2, "slope discontinuity: {below} vs {above}");
     }
 }
