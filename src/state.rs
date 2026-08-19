@@ -776,6 +776,11 @@ impl RubixState {
         // so a plain config-file edit takes effect immediately without
         // needing a keybind nudge -- matches the gaps' live-swap behavior.
         self.sdr_white_nits = self.config.sdr_white_nits;
+        // Decoration is the safest field here to swap live: borders are drawn
+        // outside the client rect, so even a width change moves no window and
+        // needs no re-layout -- the next frame simply draws a different ring.
+        // Covers colors, rules and per-rule luminance in one go.
+        self.config.decoration = new.decoration;
         self.config.focus_follows_mouse = new.focus_follows_mouse;
         // Re-seeded like sdr_white_nits: a config edit wins over a runtime
         // toggle, so saving the file is always the way back to a known state.
