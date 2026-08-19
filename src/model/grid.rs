@@ -256,13 +256,30 @@ impl Monitor {
             return Some(RevealKind::Scrolled { down });
         }
 
-        let _ = self.active_group_mut(); // seed an empty group in the active column if it's empty.
-                                         // Needed to end the borrow of &mut self here.
-        let active_col = self.active_column;
-        let active_row = self.columns[active_col].active_row;
+        // The active column is the natural landing site, but it is NOT
+        // guaranteed to be on screen. DecrementVisibleColumns shrinks the
+        // visible range without clamping active_column, and focus_window sets
+        // active_column with no bound at all -- so the cursor can sit past
+        // visible_columns. Clamping into the visible range is what makes the
+        // destination a slot compute_layout actually emits, and it is also what
+        // keeps the swap sound: this branch has col >= visible_columns, so
+        // dest_col is strictly less than col and split_at_mut(col) is
+        // guaranteed to put the two in different halves.
+        let dest_col = self.active_column.min(self.visible_columns.saturating_sub(1));
+        debug_assert!(dest_col < col, "reveal destination must precede the split point");
+
+        // Seed an empty destination rather than indexing an empty Vec. The
+        // destination is not necessarily the active column, so seeding via
+        // active_group_mut would guard the wrong one.
+        if self.columns[dest_col].groups.is_empty() {
+            self.columns[dest_col].groups.push(Group::empty());
+            self.columns[dest_col].active_row = 0;
+        }
+        let dest_row = self.columns[dest_col].active_row;
+
         let (left, right) = self.columns.split_at_mut(col);
         std::mem::swap(
-            &mut left[active_col].groups[active_row],
+            &mut left[dest_col].groups[dest_row],
             &mut right[0].groups[row],
             );
         Some(RevealKind::Swapped)

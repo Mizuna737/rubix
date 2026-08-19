@@ -795,3 +795,29 @@
             assert!(laid_out_ids(&mon).contains(&id), "{id} not on screen");
         }
     }
+
+    #[test]
+    fn reveal_swap_survives_an_active_column_outside_the_visible_range() {
+        // Regression: reveal_window assumed active_column < visible_columns,
+        // which move_active_column's rem_euclid used to guarantee. Two things
+        // broke that: DecrementVisibleColumns shrinks the visible range without
+        // clamping active_column, and focus_window sets it with no bound at all.
+        // With active_column >= col, split_at_mut(col) puts the destination in
+        // the RIGHT half and left[active_column] indexes past the end.
+        let mut mon = four_by_three();
+        mon.visible_columns = 2;   // as DecrementVisibleColumns leaves it
+        mon.active_column = 2;     // still pointing at a now-off-screen column
+        assert!(matches!(mon.reveal_window(7), Some(RevealKind::Swapped)));
+        assert!(laid_out_ids(&mon).contains(&7), "revealed window must be on screen");
+    }
+
+    #[test]
+    fn reveal_swap_seeds_an_empty_destination_column() {
+        // The destination is not necessarily the active column any more, so
+        // seeding only the active column is not enough to keep the index safe.
+        let mut mon = four_by_three();
+        mon.visible_columns = 2;
+        mon.active_column = 2;
+        mon.columns[1].groups.clear();
+        assert!(matches!(mon.reveal_window(7), Some(RevealKind::Swapped)));
+    }
