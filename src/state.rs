@@ -784,6 +784,18 @@ impl RubixState {
     /// configure) onto the live window. Idempotent -- call it after every model
     /// mutation; re-mapping a window at an unchanged rect is a no-op and
     /// `send_pending_configure` only emits when the pending size actually differs.
+    /// The `Output` backing the active monitor, if it still exists.
+    ///
+    /// Used as the fallback when a surface asks for its preferred image
+    /// description before it has been mapped and so has no output yet.
+    pub(crate) fn active_monitor_output(&self) -> Option<Output> {
+        let monitor_id = self.workspace.active_monitor_id();
+        self.space
+            .outputs()
+            .find(|o| o.user_data().get::<MonitorId>().is_some_and(|m| m.0 == monitor_id))
+            .cloned()
+    }
+
     pub(crate) fn output_bounds_for(&self, monitor_id: u32) -> Option<Rect> {
         let Some(output) = self
             .space

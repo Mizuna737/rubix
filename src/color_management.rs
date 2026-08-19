@@ -25,6 +25,8 @@ use smithay::wayland::color::management::{
     ColorManagementState, Feature, ImageDescription, Primaries, PrimariesOption, TransferFunction,
 };
 
+use smithay::wayland::seat::WaylandFocus;
+
 use crate::RubixState;
 
 /// Which decode shader a surface's render elements should go through
@@ -261,12 +263,54 @@ impl ColorManagementHandler for RubixState {
         &mut self.color_management_state
     }
 
-    // `image_description_changed` and `preferred_description_for_surface`
-    // keep the trait's sRGB-default bodies: Rubix doesn't advertise a
-    // preferred-surface description this phase (Deferred: no tone mapping),
-    // and the render path reads the surface's OWN description on every frame
-    // via `surface_decode_kind` rather than reacting to a changed-surface
+    // `image_description_changed` keeps the trait's default body: the render
+    // path reads the surface's OWN description every frame via
+    // `surface_decode_kind` rather than reacting to a changed-surface
     // notification.
+
+    /// What a client should send for best results on the output it is on.
+    ///
+    /// This -- not `description_for_output` -- is how a nested compositor
+    /// discovers HDR headroom. gamescope goes straight to
+    /// `get_surface_feedback` -> `get_preferred` -> `get_information` and never
+    /// touches the output object, then computes
+    /// `bExposeHDRSupport = max_target_luminance > reference_luminance`
+    /// (WaylandBackend.cpp). Leaving this at the trait's sRGB default answered
+    /// `luminances(2000, 80, 80)` / `target_luminance(2000, 80)`, so 80 > 80 was
+    /// false and it refused to offer HDR to the game -- while our HDR output
+    /// description sat on a code path it never called.
+    ///
+    /// Reporting PQ/BT.2020 here is a hint, not an instruction: SDR clients that
+    /// ignore it are unaffected, and `surface_decode_kind` still keys off what a
+    /// client actually commits, not off what we suggested.
+    fn preferred_description_for_surface(&mut self, surface: &WlSurface) -> ImageDescription {
+        // A surface can ask before it is mapped -- gamescope does, immediately
+        // after creating it -- so "which output is it on" often has no answer
+        // yet. Fall back to the active monitor, which is where a new surface
+        // almost always lands, rather than to sRGB: guessing SDR on an HDR
+        // display is the failure this whole function exists to fix.
+        let output_name = self
+            .space
+            .elements()
+            .find(|w| w.wl_surface().as_deref() == Some(surface))
+            .and_then(|w| self.space.outputs_for_element(w).into_iter().next())
+            .or_else(|| self.active_monitor_output())
+            .map(|o| o.name());
+
+        let is_hdr = output_name
+            .as_deref()
+            .is_some_and(|name| self.hdr_outputs.contains(name));
+        tracing::info!(
+            "preferred_description_for_surface(output {:?}) -> {}",
+            output_name,
+            if is_hdr { "PQ/BT.2020 HDR" } else { "sRGB" },
+        );
+        if is_hdr {
+            hdr_output_description(self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32)
+        } else {
+            ImageDescription::SRGB
+        }
+    }
 
     /// Advertises PQ/BT.2020 on outputs currently running the HDR pipeline
     /// (`SurfaceData::hdr`, flipped live by `udev::toggle_hdr`), sRGB
