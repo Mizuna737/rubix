@@ -209,9 +209,13 @@ pub fn init(dh: &DisplayHandle) -> ColorManagementState {
 /// off, so the data can go out synchronously during request dispatch while the
 /// destructor is deferred as its contract requires. See the call site for why
 /// the ordering matters.
-fn send_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
+///
+/// Returns whether anything was actually sent -- the caller logs a failure,
+/// because "we were asked" and "we answered" are different facts and only the
+/// second one matters.
+fn send_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) -> bool {
     if !info.is_alive() {
-        return;
+        return false;
     }
     let container = Chromaticities::from_option(desc.primaries);
     if let Some(p) = container {
@@ -249,6 +253,7 @@ fn send_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
     if let Some(max_fall) = desc.max_fall {
         info.target_max_fall(max_fall);
     }
+    true
 }
 
 impl ColorManagementHandler for RubixState {
@@ -322,7 +327,10 @@ impl ColorManagementHandler for RubixState {
         // Sending the data first is safe: none of these are destructors. The
         // per-event client callbacks fire as they arrive, so the values land
         // before the roundtrip completes even though `done` follows it.
-        send_info_events(&info, &desc);
+        let sent = send_info_events(&info, &desc);
+        if !sent {
+            tracing::warn!("image_description_info object was already dead; nothing sent");
+        }
         self.loop_handle.insert_idle(move |_state| {
             if info.is_alive() {
                 info.done();
