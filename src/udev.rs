@@ -1499,8 +1499,17 @@ fn render_surface(
         surface.last_scanout_candidate = candidate;
         let output_name = surface.output.name();
         let element_count = elements.len();
+        // `tagged` distinguishes "client says it is SDR" from "client said
+        // nothing", which `fullscreen_kind` collapses. The one-shot warning in
+        // color_management only ever reports the FIRST frame, and image
+        // descriptions are created asynchronously -- so a first-frame miss
+        // proves nothing, and silence afterwards was reading as failure twice
+        // over. This line fires on every candidate change, so a client that
+        // tags late shows up here.
+        let tagged = fullscreen_candidate_surface(state, &surface.output)
+            .map(|s| crate::color_management::surface_description_present(&s));
         tracing::info!(
-            "direct-scanout on {output_name}: promoted = {promoted} ({element_count} elements, fullscreen = {fullscreen_kind:?})",
+            "direct-scanout on {output_name}: promoted = {promoted} ({element_count} elements,              fullscreen = {fullscreen_kind:?}, candidate tagged = {tagged:?})",
         );
         if !promoted && fullscreen_kind.is_some() {
             for (id, st) in frame.states.states.iter() {
@@ -1593,6 +1602,22 @@ fn render_surface(
 /// window's bbox must actually contain the whole output geometry, which is
 /// the same condition `DrmCompositor` requires for primary-plane promotion.
 /// Cheap -- no renderer work, just `Space`/surface-state lookups.
+/// The `WlSurface` of the fullscreen scanout candidate on `output`.
+///
+/// Companion to [`fullscreen_candidate_id`]; the diagnostic needs the surface
+/// itself to ask whether it carries a color-management description.
+fn fullscreen_candidate_surface(
+    state: &RubixState,
+    output: &Output,
+) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+    let id = fullscreen_candidate_id(state, output)?;
+    state
+        .windows
+        .get(&id)
+        .and_then(|w| w.wl_surface())
+        .map(|s| s.into_owned())
+}
+
 /// The window id `fullscreen_scanout_target` would pick for `output`.
 ///
 /// Same containment test, returning the identity rather than the decode kind,
