@@ -225,6 +225,16 @@ impl ColorManagementHandler for RubixState {
         // transient borrow conflict during dispatch silently downgraded an HDR
         // output to sRGB -- see `RubixState::hdr_outputs`.
         let is_hdr = self.hdr_outputs.contains(output.name().as_str());
+        // Logged because this is the single point where a client learns whether
+        // a display has HDR headroom, and getting it wrong is invisible from
+        // our side -- the client just quietly decides HDR is unavailable. Fires
+        // only on an explicit get_image_description, not per frame.
+        tracing::info!(
+            "description_for_output({}) -> {} (hdr_outputs = {:?})",
+            output.name(),
+            if is_hdr { "PQ/BT.2020 HDR" } else { "sRGB" },
+            self.hdr_outputs,
+        );
         if is_hdr {
             hdr_output_description(self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32)
         } else {
@@ -233,6 +243,16 @@ impl ColorManagementHandler for RubixState {
     }
 
     fn schedule_image_description_info(&mut self, info: WpImageDescriptionInfoV1, desc: ImageDescription) {
+        tracing::info!(
+            "image_description_info: tf={:?} primaries={:?} luminances={:?} \
+             mastering_luminance={:?} scrgb={} bt2100={}",
+            desc.transfer,
+            desc.primaries.named,
+            desc.luminances,
+            desc.mastering_luminance,
+            desc.windows_scrgb,
+            desc.windows_bt2100,
+        );
         // Must be deferred to an event-loop idle callback -- the trait's doc
         // comment warns that `done` is a destructor event and destroying the
         // object inside the very dispatch callback that created it corrupts
