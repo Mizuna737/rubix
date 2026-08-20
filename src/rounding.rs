@@ -85,8 +85,11 @@ float rubixCornerAlpha() {
     }
     vec2 p = v_coords * rubix_elem_size + rubix_elem_offset;
     vec2 h = rubix_win_size * 0.5;
-    vec2 q = abs(p - h) - (h - vec2(rubix_radius));
-    float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - rubix_radius;
+    // Clamped for the same reason as the border ring: a radius larger than the
+    // window's half-extent folds the distance field and breaks up the corners.
+    float r = min(rubix_radius, min(h.x, h.y));
+    vec2 q = abs(p - h) - (h - vec2(r));
+    float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
     return 1.0 - smoothstep(-0.5, 0.5, d);
 }
 
@@ -339,12 +342,21 @@ pub(crate) trait GlesAccess: RendererSuper {
     /// recorded it as a blocker; it is no longer one.)
     fn gles_renderer(&mut self) -> &mut GlesRenderer;
 
-    fn set_round_program(
+    /// Install a texture program, returning whatever was there before.
+    ///
+    /// Must be paired with [`Self::restore_round_program`] rather than a plain
+    /// clear. The HDR path installs its decode shader as a *renderer-level*
+    /// default that every new frame inherits, so clearing does not restore it
+    /// -- it wipes it, and every element drawn afterwards loses its decode.
+    /// That is not theoretical: it turned the bar white, because layer surfaces
+    /// are drawn after the space and their sRGB textures went into the linear
+    /// working space unconverted.
+    fn swap_round_program(
         frame: &mut Self::Frame<'_, '_>,
         program: GlesTexProgram,
         uniforms: Vec<Uniform<'static>>,
-    );
-    fn clear_round_program(frame: &mut Self::Frame<'_, '_>);
+    ) -> TexProgramOverride;
+    fn restore_round_program(frame: &mut Self::Frame<'_, '_>, previous: TexProgramOverride);
 
     /// Draw a `PixelShaderElement`, which smithay only implements
     /// `RenderElement` for against `GlesRenderer` directly. Same trick as the
@@ -360,6 +372,9 @@ pub(crate) trait GlesAccess: RendererSuper {
     );
 }
 
+/// What `GlesFrame` stores for a texture-program override.
+pub(crate) type TexProgramOverride = Option<(GlesTexProgram, Vec<Uniform<'static>>)>;
+
 fn warn_chrome(err: impl std::fmt::Debug) {
     tracing::warn!("border chrome failed to draw: {err:?}");
 }
@@ -369,15 +384,17 @@ impl GlesAccess for GlesRenderer {
         self
     }
 
-    fn set_round_program(
+    fn swap_round_program(
         frame: &mut Self::Frame<'_, '_>,
         program: GlesTexProgram,
         uniforms: Vec<Uniform<'static>>,
-    ) {
+    ) -> TexProgramOverride {
+        let previous = frame.take_tex_program_override();
         frame.override_default_tex_program(program, uniforms);
+        previous
     }
-    fn clear_round_program(frame: &mut Self::Frame<'_, '_>) {
-        frame.clear_tex_program_override();
+    fn restore_round_program(frame: &mut Self::Frame<'_, '_>, previous: TexProgramOverride) {
+        frame.set_tex_program_override(previous);
     }
 
     fn draw_pixel_shader(
@@ -400,18 +417,19 @@ impl<'r> GlesAccess for crate::udev::RubixRenderer<'r> {
         self.as_mut()
     }
 
-    fn set_round_program(
+    fn swap_round_program(
         frame: &mut Self::Frame<'_, '_>,
         program: GlesTexProgram,
         uniforms: Vec<Uniform<'static>>,
-    ) {
-        if let Some(gles) = frame.render_frame_mut() {
-            gles.override_default_tex_program(program, uniforms);
-        }
+    ) -> TexProgramOverride {
+        let Some(gles) = frame.render_frame_mut() else { return None };
+        let previous = gles.take_tex_program_override();
+        gles.override_default_tex_program(program, uniforms);
+        previous
     }
-    fn clear_round_program(frame: &mut Self::Frame<'_, '_>) {
+    fn restore_round_program(frame: &mut Self::Frame<'_, '_>, previous: TexProgramOverride) {
         if let Some(gles) = frame.render_frame_mut() {
-            gles.clear_tex_program_override();
+            gles.set_tex_program_override(previous);
         }
     }
 
@@ -445,12 +463,11 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        R::set_round_program(frame, self.program.clone(), self.uniforms.clone());
+        let previous = R::swap_round_program(frame, self.program.clone(), self.uniforms.clone());
         let result = self.inner.draw(frame, src, dst, damage, opaque_regions, cache);
-        // Cleared unconditionally, including on the error path: a leaked
-        // override would silently round every subsequent element in the frame,
-        // cursor and layer surfaces included.
-        R::clear_round_program(frame);
+        // Restored unconditionally, including on the error path. Restored, not
+        // cleared: see swap_round_program.
+        R::restore_round_program(frame, previous);
         result
     }
 

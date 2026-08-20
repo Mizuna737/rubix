@@ -91,28 +91,42 @@ float roundRectSdf(vec2 p, vec2 halfSize, float r) {
     return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
+// How far the ring's inner edge is pushed underneath the window, in pixels.
+//
+// Without it the corners fringe. The window's own rounded mask leaves partial
+// alpha along the curve, and the ring's inner edge ramps up from zero over the
+// same pixels; two partial coverages composited over the background do not add
+// to one, so the wallpaper shows through as a thin seam. The ring draws above
+// its window, so overlapping inward puts fully-opaque ring exactly where the
+// window's antialiasing is weakest, and the seam closes.
+#define RING_INNER_OVERLAP 1.0
+
 void main() {
     // The element covers the window inflated by border + glow, so the window
     // itself is centred within it.
     vec2 centred = v_coords * size - size * 0.5;
     vec2 winHalf = size * 0.5 - vec2(rubix_border + rubix_glow);
 
-    float dInner = roundRectSdf(centred, winHalf, rubix_radius);
-    float dOuter = roundRectSdf(
-        centred,
-        winHalf + vec2(rubix_border),
-        rubix_radius + rubix_border
-    );
+    // A radius larger than the window's own half-extent makes the distance
+    // field fold in on itself and the corners break up. Clamping matches what
+    // a capsule would do, which is the sane reading of "rounder than possible".
+    float r = min(rubix_radius, min(winHalf.x, winHalf.y));
+
+    float dInner = roundRectSdf(centred, winHalf, r);
+    float dOuter = roundRectSdf(centred, winHalf + vec2(rubix_border), r + rubix_border);
 
     // Inside the outer edge and outside the window edge, both antialiased over
-    // one pixel.
-    float ring = (1.0 - smoothstep(-0.5, 0.5, dOuter)) * smoothstep(-0.5, 0.5, dInner);
+    // one pixel, with the inner edge biased under the window.
+    float ring = (1.0 - smoothstep(-0.5, 0.5, dOuter))
+        * smoothstep(-0.5, 0.5, dInner + RING_INNER_OVERLAP);
 
     float glow = 0.0;
     if (rubix_glow > 0.0) {
         float t = clamp(dOuter / rubix_glow, 0.0, 1.0);
-        // Only outside the ring; pow shapes how quickly it gives out.
-        glow = pow(1.0 - t, rubix_falloff) * step(0.0, dOuter);
+        // Gated by a smoothstep rather than step(): a hard cut here is a
+        // discontinuity right where the glow is brightest, and it aliases
+        // along the curve for the same reason the seam above did.
+        glow = pow(1.0 - t, rubix_falloff) * smoothstep(-0.5, 0.5, dOuter);
     }
 
     float a = max(ring, glow);
