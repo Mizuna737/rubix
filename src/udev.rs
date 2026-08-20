@@ -1987,6 +1987,7 @@ fn gather_tagged_elements<'a>(
             .into_iter()
             .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
     );
+    crate::decoration::prune_ring_cache(state);
     tagged
 }
 

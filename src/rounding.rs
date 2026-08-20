@@ -599,6 +599,7 @@ where
             _ => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
         }
     }
+    crate::decoration::prune_ring_cache(state);
     elements
 }
 

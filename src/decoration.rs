@@ -165,7 +165,35 @@ void main() {
 }
 "#;
 
+/// Everything that decides what a ring looks like. Compared frame to frame so
+/// an unchanged ring can be reused rather than rebuilt.
+#[derive(PartialEq, Clone, Copy)]
+struct RingInputs {
+    area: Rectangle<i32, Logical>,
+    color: (f32, f32, f32, f32),
+    radius: f32,
+    border: f32,
+    glow: f32,
+    falloff: f32,
+    opacity: f32,
+}
+
 thread_local! {
+    // One cached ring per window.
+    //
+    // Not an optimization -- `PixelShaderElement::new` mints a fresh `Id`, and
+    // an element whose id changes every frame is a brand-new element to the
+    // damage tracker, which then fully damages its area every frame. With a
+    // glow the ring's area is the window inflated on all sides, so every
+    // window redamages a band around itself on every frame and partial-damage
+    // repaints stop being possible at all. (Stale state is pruned by the
+    // tracker, so this cost time rather than memory.)
+    //
+    // Reusing the element keeps its id and commit counter stable while nothing
+    // about it changes; a real change rebuilds, which correctly damages.
+    static RING_CACHE: RefCell<HashMap<u32, (RingInputs, PixelShaderElement)>> =
+        RefCell::new(HashMap::new());
+
     // Compiled once, same single-GL-context assumption as rounding.rs's cache.
     // A failure is remembered rather than retried so a broken shader warns once
     // instead of every frame forever; windows simply go unbordered.
@@ -438,25 +466,53 @@ where
     // concentric; the shader adds the border width for the outer curve.
     let radius = deco.corner_radius as f32;
 
-    Some(BorderRingElement {
-        inner: PixelShaderElement::new(
+    let inputs = RingInputs {
+        area,
+        color: (color.r(), color.g(), color.b(), color.a()),
+        radius,
+        border: width as f32,
+        glow: glow as f32,
+        falloff: style.glow_falloff,
+        // The ring fades with its window: the shader multiplies by this, so a
+        // dimmed window does not keep a full-strength border.
+        opacity: style.opacity,
+    };
+
+    let inner = RING_CACHE.with_borrow_mut(|cache| {
+        if let Some((cached, element)) = cache.get(&id) {
+            if *cached == inputs {
+                // Same id, same commit counter: no damage, nothing redrawn.
+                return element.clone();
+            }
+        }
+        let element = PixelShaderElement::new(
             program,
-            area,
+            inputs.area,
             // No opaque regions: a ring is a band and a glow over a hole.
             None,
-            // The ring fades with its window: the shader multiplies by this,
-            // so a dimmed window does not keep a full-strength border.
-            style.opacity,
+            inputs.opacity,
             vec![
-                Uniform::new("rubix_color", (color.r(), color.g(), color.b(), color.a())),
-                Uniform::new("rubix_radius", radius),
-                Uniform::new("rubix_border", width as f32),
-                Uniform::new("rubix_glow", glow as f32),
-                Uniform::new("rubix_falloff", style.glow_falloff),
+                Uniform::new("rubix_color", inputs.color),
+                Uniform::new("rubix_radius", inputs.radius),
+                Uniform::new("rubix_border", inputs.border),
+                Uniform::new("rubix_glow", inputs.glow),
+                Uniform::new("rubix_falloff", inputs.falloff),
             ],
             Kind::Unspecified,
-        ),
-    })
+        );
+        cache.insert(id, (inputs, element.clone()));
+        element
+    });
+
+    Some(BorderRingElement { inner })
+}
+
+/// Drop cached rings for windows that no longer exist. Called once per frame by
+/// the element gather, not once per window.
+pub(crate) fn prune_ring_cache(state: &RubixState) {
+    RING_CACHE.with_borrow_mut(|cache| {
+        cache.retain(|id, _| state.windows.contains_key(id));
+    });
 }
 
 #[cfg(test)]
@@ -478,6 +534,37 @@ mod tests {
     }
 
     // The shader deflates by exactly this margin to recover the window rect.
+    // A field left out of RingInputs' comparison would mean a ring that never
+    // updates when that field changes -- a border stuck on the wrong colour
+    // after a focus change, say. Each field is perturbed individually so a
+    // missing one fails here rather than on screen.
+    #[test]
+    fn every_ring_input_participates_in_the_comparison() {
+        let base = RingInputs {
+            area: rect(0, 0, 100, 100),
+            color: (0.1, 0.2, 0.3, 1.0),
+            radius: 8.0,
+            border: 2.0,
+            glow: 12.0,
+            falloff: 2.0,
+            opacity: 1.0,
+        };
+        let mutations: [(&str, fn(&mut RingInputs)); 7] = [
+            ("area", |i| i.area = rect(1, 0, 100, 100)),
+            ("color", |i| i.color = (0.9, 0.2, 0.3, 1.0)),
+            ("radius", |i| i.radius = 9.0),
+            ("border", |i| i.border = 3.0),
+            ("glow", |i| i.glow = 13.0),
+            ("falloff", |i| i.falloff = 3.0),
+            ("opacity", |i| i.opacity = 0.5),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = base;
+            mutate(&mut changed);
+            assert!(changed != base, "{name} is not compared, so it can go stale");
+        }
+    }
+
     // ---- occlusion ----
 
     #[test]
