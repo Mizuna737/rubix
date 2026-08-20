@@ -2175,31 +2175,31 @@ fn render_surface_hdr<'a>(
 }
 
 /// HDR Phase 1b's slow-path pipeline: used only when [`output_has_hdr_window`]
-/// found at least one HDR-declared surface on this output. Because the
-/// shader override is renderer-global-only (`MultiFrame` doesn't expose the
-/// underlying `GlesFrame` for a per-element override), each surface is
-/// decoded through its own transfer function via **multiple render passes
-/// grouped into maximal contiguous z-runs of equal `DecodeKind`**,
-/// accumulating into the same offscreen:
+/// found at least one HDR-declared surface on this output. Each surface is
+/// decoded through its own transfer function into a shared linear offscreen:
 ///
-/// 1. Partition `tagged_elements` (front-to-back) into runs, then reverse the
-///    run order (and each run's own element order) for back-to-front
-///    painter's-algorithm drawing -- equivalent to reversing the whole
-///    sequence once, just done in two nested steps so each run's `DecodeKind`
-///    stays intact.
-/// 2. Bind the offscreen once; set the SDR solid-color transform (live nits)
-///    once for the whole pass -- solids are never HDR.
-/// 3. For each run, back-to-front: set the renderer-global override to that
-///    run's decode shader (`decode_sdr` + `sdr_white_nits` uniform, or
-///    `decode_hdr_pq` with no uniforms), open a fresh `MultiFrame` via
-///    `renderer.render`, clear to black on the FIRST run only (subsequent
-///    runs must NOT clear, so content accumulates), draw each element with
-///    full per-element damage (the offscreen is redrawn fully every frame --
-///    matches the fresh-`Id` full-damage behavior the encode pass relies on),
-///    then drop the frame to release the renderer borrow before the next
-///    run's override.
-/// 4. Clear the tex override and solid transform after the pass. Then the
-///    shared [`encode_pass`] (structurally unchanged, no uniforms now).
+/// 1. Bind the offscreen and open ONE `MultiFrame`; set the SDR solid-color
+///    transform (live nits) for the whole pass -- solids are never HDR, so a
+///    single renderer-wide transform serves every element.
+/// 2. Clear once, then draw `tagged_elements` back-to-front, swapping the
+///    frame's texture program to each element's own decode immediately before
+///    its draw (`decode_sdr` plus its `sdr_white_nits` uniform, `decode_hdr_pq`
+///    or `decode_windows_scrgb` with none).
+/// 3. Drop the frame -- which discards the tex override with it -- clear the
+///    solid transform, then the shared [`encode_pass`].
+///
+/// This was several render passes until the fork gained
+/// `MultiFrame::render_frame_mut`. Without it the override could only be set
+/// renderer-wide, so elements had to be grouped into maximal contiguous runs of
+/// equal `DecodeKind`, each run taking its own frame with its own override and
+/// only the first clearing. That machinery existed solely to work around the
+/// missing accessor and is gone; the ordering it went to some trouble to
+/// preserve is now just a single reverse.
+///
+/// Still draws every element with full damage: the offscreen is redrawn
+/// completely every frame. That is the remaining cost, and it is what makes
+/// HDR compositing several times dearer than SDR at idle -- see the
+/// damage-aware HDR work, which this collapse is the prerequisite for.
 fn render_surface_hdr_zrun<'a>(
     surface: &mut SurfaceData,
     renderer: &mut RubixRenderer<'a>,
@@ -2208,18 +2208,6 @@ fn render_surface_hdr_zrun<'a>(
     feedback: &mut Option<OutputPresentationFeedback>,
 ) -> Result<bool, String> {
     let shaders = ensure_hdr_resources(surface, renderer)?;
-
-    // Maximal contiguous runs of equal `DecodeKind`, preserving `tagged_elements`'s
-    // front-to-back order; reversed below (run order AND per-run element
-    // order) for back-to-front drawing.
-    let mut runs: Vec<(DecodeKind, Vec<&RubixRenderElement<RubixRenderer<'a>>>)> = Vec::new();
-    for (kind, elem) in tagged_elements {
-        match runs.last_mut() {
-            Some((last_kind, elems)) if *last_kind == *kind => elems.push(elem),
-            _ => runs.push((*kind, vec![elem])),
-        }
-    }
-    runs.reverse();
 
     {
         let gles: &mut GlesRenderer = renderer.as_mut();
@@ -2233,10 +2221,25 @@ fn render_surface_hdr_zrun<'a>(
         let size = Size::<i32, Physical>::from((offscreen.size.w, offscreen.size.h));
         let full_rect = Rectangle::new(Point::from((0, 0)), size);
 
-        for (i, (kind, elems)) in runs.iter().enumerate() {
-            {
-                let gles: &mut GlesRenderer = renderer.as_mut();
-                let prog = match kind {
+        let mut frame = renderer
+            .render(&mut fb, size, Transform::Normal)
+            .map_err(|e| format!("HDR z-run render: {e:?}"))?;
+        frame
+            .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full_rect])
+            .map_err(|e| format!("HDR z-run clear: {e:?}"))?;
+
+        // Back-to-front, each element decoded through its own transfer function.
+        //
+        // This was several render passes until now: elements were grouped into
+        // maximal runs of equal DecodeKind and each run got its own frame with
+        // the decode installed renderer-wide, purely because the override could
+        // not be set per element -- `MultiFrame` did not expose the `GlesFrame`
+        // doing the work. Our fork patch adds `render_frame_mut`, so the
+        // program can be swapped between draws inside one frame and the run
+        // machinery has no reason to exist.
+        for (kind, elem) in tagged_elements.iter().rev() {
+            if let Some(gles) = frame.render_frame_mut() {
+                let (program, uniforms) = match kind {
                     DecodeKind::Sdr => (
                         shaders.decode_sdr.clone(),
                         vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
@@ -2247,31 +2250,23 @@ fn render_surface_hdr_zrun<'a>(
                     // not move HDR content.
                     DecodeKind::WindowsScrgb => (shaders.decode_windows_scrgb.clone(), Vec::new()),
                 };
-                gles.set_default_tex_program_override(Some(prog));
+                gles.override_default_tex_program(program, uniforms);
             }
-            let mut frame = renderer
-                .render(&mut fb, size, Transform::Normal)
-                .map_err(|e| format!("HDR z-run render: {e:?}"))?;
-            if i == 0 {
-                frame
-                    .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full_rect])
-                    .map_err(|e| format!("HDR z-run clear: {e:?}"))?;
-            }
-            for elem in elems.iter().rev() {
-                let dst = elem.geometry(Scale::from(1.0));
-                let src = elem.src();
-                let damage = [Rectangle::new(Point::from((0, 0)), dst.size)];
-                let opaque_regions = elem.opaque_regions(Scale::from(1.0));
-                elem.draw(&mut frame, src, dst, &damage, &opaque_regions, None)
-                    .map_err(|e| format!("HDR z-run draw: {e:?}"))?;
-            }
-            drop(frame);
+            let dst = elem.geometry(Scale::from(1.0));
+            let src = elem.src();
+            let damage = [Rectangle::new(Point::from((0, 0)), dst.size)];
+            let opaque_regions = elem.opaque_regions(Scale::from(1.0));
+            elem.draw(&mut frame, src, dst, &damage, &opaque_regions, None)
+                .map_err(|e| format!("HDR z-run draw: {e:?}"))?;
         }
+        drop(frame);
         Ok(())
     })();
     {
+        // The tex override now lives on the frame and dies with it. Only the
+        // solid transform is still renderer-wide: solids are never HDR, so one
+        // transform serves the whole pass.
         let gles: &mut GlesRenderer = renderer.as_mut();
-        gles.set_default_tex_program_override(None);
         gles.set_solid_color_transform(None);
     }
     decode_result?;
