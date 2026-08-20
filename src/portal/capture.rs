@@ -93,7 +93,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     match target {
         CaptureTarget::Monitor(name) => capture_monitor(state, renderer, name),
@@ -113,7 +113,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     let output = state
         .space
@@ -184,7 +184,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     let window = state.windows.get(&id).ok_or_else(|| format!("window {id} not found"))?.clone();
     let geo = window.geometry();
@@ -216,7 +216,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     let scale = 1.0_f64;
     let buffer_size = Size::<i32, BufferCoord>::from((phys.w, phys.h));

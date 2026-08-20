@@ -28,120 +28,247 @@
 //! monitor sees ordinary borders and pays nothing.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
-use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::Color32F;
-use smithay::utils::{Logical, Rectangle, Scale};
+use smithay::backend::renderer::element::{
+    Element, Id, Kind, RenderElement, UnderlyingStorage,
+};
+use smithay::backend::renderer::gles::element::PixelShaderElement;
+use smithay::backend::renderer::gles::{
+    GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
+};
+use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{Color32F, Renderer};
+use smithay::utils::user_data::UserDataMap;
+use smithay::utils::{
+    Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Transform,
+};
 
 use crate::config::BorderStyle;
+use crate::rounding::GlesAccess;
 use crate::RubixState;
 
+/// Fragment shader for the border ring and its glow.
+///
+/// One rounded-rectangle SDF drives both: the ring is the band between the
+/// window's rounded edge and that edge inflated by the border width, and the
+/// glow is an outward decay from the ring's outer boundary. Evaluating both
+/// from the same distance field is what keeps the glow concentric with the
+/// corner curve instead of pooling at the corners.
+///
+/// Colour arrives **already in the destination's colour space** -- sRGB-encoded
+/// for an SDR framebuffer, linear BT.2020 at absolute nits for the HDR
+/// working space. That is the whole reason this shader can express HDR chrome
+/// at all: a pixel shader bypasses both the solid-colour transform and the
+/// texture decode, so what we hand it is what gets written. It also means the
+/// luminance pre-compensation the four-rect version needed is gone.
+///
+/// Where an effect library plugs in later: everything below `ringAlpha` is a
+/// pure function of distance, so a future `pulse`/`breathing`/`snake` variant
+/// only has to modulate `a` (and take a time uniform) without touching the
+/// geometry. Deliberately not abstracted yet -- there is one effect.
+///
+/// No `#version` directive: smithay's pixel-shader path interprets these as
+/// GLSL 100 and prepends its own defines.
+const BORDER_RING: &str = r#"
+precision highp float;
+
+varying vec2 v_coords;
+uniform vec2 size;
+uniform float alpha;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+uniform vec4 rubix_color;
+uniform float rubix_radius;
+uniform float rubix_border;
+uniform float rubix_glow;
+uniform float rubix_falloff;
+
+float roundRectSdf(vec2 p, vec2 halfSize, float r) {
+    vec2 q = abs(p) - (halfSize - vec2(r));
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+void main() {
+    // The element covers the window inflated by border + glow, so the window
+    // itself is centred within it.
+    vec2 centred = v_coords * size - size * 0.5;
+    vec2 winHalf = size * 0.5 - vec2(rubix_border + rubix_glow);
+
+    float dInner = roundRectSdf(centred, winHalf, rubix_radius);
+    float dOuter = roundRectSdf(
+        centred,
+        winHalf + vec2(rubix_border),
+        rubix_radius + rubix_border
+    );
+
+    // Inside the outer edge and outside the window edge, both antialiased over
+    // one pixel.
+    float ring = (1.0 - smoothstep(-0.5, 0.5, dOuter)) * smoothstep(-0.5, 0.5, dInner);
+
+    float glow = 0.0;
+    if (rubix_glow > 0.0) {
+        float t = clamp(dOuter / rubix_glow, 0.0, 1.0);
+        // Only outside the ring; pow shapes how quickly it gives out.
+        glow = pow(1.0 - t, rubix_falloff) * step(0.0, dOuter);
+    }
+
+    float a = max(ring, glow);
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0) {
+        a = ring;
+    }
+#endif
+
+    // Premultiplied, which is what the renderer blends for.
+    gl_FragColor = vec4(rubix_color.rgb * rubix_color.a * a, rubix_color.a * a) * alpha;
+}
+"#;
+
 thread_local! {
-    // One `SolidColorBuffer` per (window id, ring side), kept across frames.
-    //
-    // Not an optimization -- a correctness requirement. A render element's id
-    // must be stable frame to frame or the damage tracker sees a brand-new
-    // element every frame and repaints the whole output; and its commit
-    // counter must advance when the element's appearance changes or the
-    // tracker sees no damage and leaves a stale border on screen (the visible
-    // symptom would be a focus ring that never moves). `SolidColorBuffer` owns
-    // both: a stable `Id` for its lifetime, and an `update` that increments the
-    // commit counter only when size or color actually changed.
-    //
-    // Thread-local because the compositor's event loop is single-threaded --
-    // the same reasoning (and the same shape) as `cursor.rs`'s CURSOR_CACHE.
-    // Pruned against live window ids on each call so closed windows don't
-    // accumulate.
-    static BORDER_BUFFERS: RefCell<HashMap<(u32, usize), SolidColorBuffer>> =
-        RefCell::new(HashMap::new());
+    // Compiled once, same single-GL-context assumption as rounding.rs's cache.
+    // A failure is remembered rather than retried so a broken shader warns once
+    // instead of every frame forever; windows simply go unbordered.
+    static RING_PROGRAM: RefCell<Option<Option<GlesPixelProgram>>> = const { RefCell::new(None) };
 }
 
-/// The four rects forming a border ring around `inner`, expanded outward by
-/// `width`. Corners belong to the top and bottom bars, so the four rects
-/// tile the ring exactly once -- no overlap, which matters because a
-/// translucent border would otherwise double-blend at the corners.
-///
-/// Returns an empty vec for a non-positive width so callers can stay
-/// branch-free.
-pub(crate) fn ring_rects(
-    inner: Rectangle<i32, Logical>,
-    width: i32,
-) -> Vec<Rectangle<i32, Logical>> {
-    if width <= 0 {
-        return Vec::new();
-    }
-    let (x, y) = (inner.loc.x, inner.loc.y);
-    let (w, h) = (inner.size.w, inner.size.h);
-    // Full-width top and bottom (they own the corners); left and right span
-    // only the inner height between them.
-    vec![
-        Rectangle::new((x - width, y - width).into(), (w + 2 * width, width).into()),
-        Rectangle::new((x - width, y + h).into(), (w + 2 * width, width).into()),
-        Rectangle::new((x - width, y).into(), (width, h).into()),
-        Rectangle::new((x + w, y).into(), (width, h).into()),
-    ]
+fn ring_program(renderer: &mut GlesRenderer) -> Option<GlesPixelProgram> {
+    RING_PROGRAM.with_borrow_mut(|cache| {
+        cache
+            .get_or_insert_with(|| {
+                match renderer.compile_custom_pixel_shader(
+                    BORDER_RING,
+                    &[
+                        UniformName::new("rubix_color", UniformType::_4f),
+                        UniformName::new("rubix_radius", UniformType::_1f),
+                        UniformName::new("rubix_border", UniformType::_1f),
+                        UniformName::new("rubix_glow", UniformType::_1f),
+                        UniformName::new("rubix_falloff", UniformType::_1f),
+                    ],
+                ) {
+                    Ok(program) => Some(program),
+                    Err(e) => {
+                        tracing::warn!("border shader compile failed, borders disabled: {e:?}");
+                        None
+                    }
+                }
+            })
+            .clone()
+    })
 }
 
-/// Rescale an sRGB-encoded color so its linear luminance is multiplied by
-/// `ratio`, returning a new sRGB-encoded color.
+/// Wraps a `PixelShaderElement`, which smithay only implements `RenderElement`
+/// for against `GlesRenderer`. The wrapper routes the draw through
+/// [`GlesAccess`] so it works on udev's `MultiRenderer` too.
+pub(crate) struct BorderRingElement {
+    inner: PixelShaderElement,
+}
+
+impl Element for BorderRingElement {
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        self.inner.location(scale)
+    }
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        self.inner.src()
+    }
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+    fn damage_since(&self, scale: Scale<f64>, commit: Option<CommitCounter>) -> DamageSet<i32, Physical> {
+        self.inner.damage_since(scale, commit)
+    }
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+    /// A ring is mostly transparent -- it is a band and a glow over a hole.
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+}
+
+impl<R> RenderElement<R> for BorderRingElement
+where
+    R: Renderer + GlesAccess,
+{
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        R::draw_pixel_shader(frame, &self.inner, src, dst, damage);
+        Ok(())
+    }
+
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+/// The colour to hand the ring shader, already in the destination's space.
 ///
-/// This exists to defeat a pass-wide transform. In the HDR composite,
-/// `hdr_shaders::sdr_solid_transform` is installed via
-/// `set_solid_color_transform` for the whole SDR decode pass, so *every*
-/// solid color -- clear color, borders, everything -- is linearized and
-/// scaled to `sdr_white_nits`. There is no per-element hook. To land a border
-/// at some other absolute luminance, we pre-compensate here by exactly the
-/// factor that transform will later apply, so the two cancel.
+/// On an HDR output this is linear BT.2020 scaled to absolute nits, so a rule
+/// asking for 350 nits gets exactly 350 nits. Everywhere else it is the
+/// configured sRGB colour, untouched -- `luminance_nits` is not consulted at
+/// all, so a machine with no HDR display behaves as though none of this exists.
+pub(crate) fn resolved_color(style: &BorderStyle, hdr: bool, sdr_white_nits: f32) -> Color32F {
+    if !hdr {
+        return style.color;
+    }
+    let nits = style.luminance_nits.unwrap_or(sdr_white_nits);
+    crate::hdr_shaders::srgb_to_bt2020_abs10k(style.color, nits)
+}
+
+/// The element area a ring occupies: the window inflated by the ring width
+/// plus the glow reach, on every side.
 ///
-/// Encoded values above 1.0 are produced and expected whenever `ratio > 1`
-/// (that is the entire point). Nothing clamps them: the transform is a CPU
-/// closure whose sRGB EOTF is an ordinary `powf` that extends fine past 1.0,
-/// and its output is scaled by `nits / 10000` -- so a 350-nit border leaves
-/// the transform at 0.035, nowhere near a ceiling.
-pub(crate) fn scale_srgb_luminance(color: Color32F, ratio: f32) -> Color32F {
-    fn to_linear(c: f32) -> f32 {
-        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-    }
-    fn from_linear(c: f32) -> f32 {
-        if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
-    }
-    if ratio == 1.0 {
-        return color;
-    }
-    Color32F::new(
-        from_linear(to_linear(color.r()) * ratio),
-        from_linear(to_linear(color.g()) * ratio),
-        from_linear(to_linear(color.b()) * ratio),
-        color.a(),
+/// Extracted and tested because the shader measures from the centre of this
+/// area and reconstructs the window rect by deflating it by the same amount.
+/// If the two ever disagree the ring silently drifts off the window edge, which
+/// looks like a rendering bug rather than an arithmetic one.
+pub(crate) fn ring_area(
+    window_rect: Rectangle<i32, Logical>,
+    border: i32,
+    glow: i32,
+) -> Rectangle<i32, Logical> {
+    let margin = border.max(0) + glow.max(0);
+    Rectangle::new(
+        (window_rect.loc.x - margin, window_rect.loc.y - margin).into(),
+        (
+            window_rect.size.w + 2 * margin,
+            window_rect.size.h + 2 * margin,
+        )
+            .into(),
     )
 }
 
-/// The color to actually hand the renderer for `style` on this output.
-///
-/// `sdr_white_nits` is the live value the HDR encode pass is using this frame.
-/// When the output is not compositing in HDR, or the style asks for no
-/// specific luminance, the configured color passes through untouched -- the
-/// SDR path is byte-for-byte what it would be with no HDR support at all.
-pub(crate) fn resolved_color(style: &BorderStyle, hdr: bool, sdr_white_nits: f32) -> Color32F {
-    match style.luminance_nits {
-        Some(nits) if hdr && sdr_white_nits > 0.0 => {
-            scale_srgb_luminance(style.color, nits / sdr_white_nits)
-        }
-        _ => style.color,
-    }
-}
-
-/// Border elements for ONE window, whose logical rect is already
+/// The border ring for ONE window, whose logical rect is already
 /// output-region-local (the same space `Space::render_elements_for_region`
 /// positions elements in).
 ///
 /// Per window rather than per output because borders have to be emitted
 /// *interleaved with* the windows they belong to. Drawn as one group above the
 /// whole space -- which is what this did originally -- every window's border
-/// floats above every other window, so a maximized window is covered in the
-/// borders of the windows hidden behind it.
+/// floats above every other window, so a maximized window ends up covered in
+/// the borders of the windows hidden behind it.
 ///
 /// Returns nothing for a fullscreen window: a border above a fullscreen window
 /// disqualifies it from direct primary-plane scanout, and there is no gap to
@@ -149,17 +276,20 @@ pub(crate) fn resolved_color(style: &BorderStyle, hdr: bool, sdr_white_nits: f32
 ///
 /// `hdr` says whether this output is compositing through the linear HDR path
 /// this frame; when false the luminance mechanism is entirely inert.
-pub(crate) fn window_border_elements(
+pub(crate) fn window_border_elements<R>(
     state: &RubixState,
+    renderer: &mut R,
     id: u32,
     window_rect: Rectangle<i32, Logical>,
-    scale: f64,
     hdr: bool,
-) -> Vec<SolidColorRenderElement> {
+) -> Option<BorderRingElement>
+where
+    R: GlesAccess,
+{
     let deco = &state.config.decoration;
     let width = deco.border_width as i32;
-    if width <= 0 || state.fullscreen_windows.contains(&id) {
-        return Vec::new();
+    if state.fullscreen_windows.contains(&id) {
+        return None;
     }
     let (app_id, title) = state.window_identity(id);
     let style = deco.style_for(
@@ -167,34 +297,38 @@ pub(crate) fn window_border_elements(
         title.as_deref(),
         state.focused_window_id() == Some(id),
     );
-    if style.color.a() <= 0.0 {
-        return Vec::new();
+    let glow = style.glow_margin as i32;
+    // Nothing to draw: no ring and no glow, or fully transparent.
+    if (width <= 0 && glow <= 0) || style.color.a() <= 0.0 {
+        return None;
     }
+    let program = ring_program(renderer.gles_renderer())?;
     let color = resolved_color(&style, hdr, state.sdr_white_nits);
 
-    let mut elements = Vec::new();
-    for (index, rect) in ring_rects(window_rect, width).into_iter().enumerate() {
-        BORDER_BUFFERS.with_borrow_mut(|buffers| {
-            let buffer = buffers.entry((id, index)).or_default();
-            buffer.update(rect.size, color);
-            elements.push(SolidColorRenderElement::from_buffer(
-                buffer,
-                rect.loc.to_physical_precise_round::<f64, i32>(scale),
-                Scale::from(scale),
-                1.0,
-                Kind::Unspecified,
-            ));
-        });
-    }
-    elements
-}
+    // The element covers the window inflated by ring + glow; the shader
+    // measures everything from the centre of that area, so the two must agree.
+    let area = ring_area(window_rect, width, glow);
+    // The corner radius the ring follows is the window's own, so the two stay
+    // concentric; the shader adds the border width for the outer curve.
+    let radius = deco.corner_radius as f32;
 
-/// Drop cached buffers for windows that no longer exist. Called once per frame
-/// by the element gather, not per window.
-pub(crate) fn prune_border_buffers(state: &RubixState) {
-    BORDER_BUFFERS.with_borrow_mut(|buffers| {
-        buffers.retain(|(id, _), _| state.windows.contains_key(id));
-    });
+    Some(BorderRingElement {
+        inner: PixelShaderElement::new(
+            program,
+            area,
+            // No opaque regions: a ring is a band and a glow over a hole.
+            None,
+            1.0,
+            vec![
+                Uniform::new("rubix_color", (color.r(), color.g(), color.b(), color.a())),
+                Uniform::new("rubix_radius", radius),
+                Uniform::new("rubix_border", width as f32),
+                Uniform::new("rubix_glow", glow as f32),
+                Uniform::new("rubix_falloff", style.glow_falloff),
+            ],
+            Kind::Unspecified,
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -205,122 +339,122 @@ mod tests {
         Rectangle::new((x, y).into(), (w, h).into())
     }
 
+    fn style(nits: Option<f32>) -> BorderStyle {
+        BorderStyle {
+            color: Color32F::new(0.4, 0.6, 0.9, 1.0),
+            luminance_nits: nits,
+            glow_margin: 0,
+            glow_falloff: 2.0,
+        }
+    }
+
+    // The shader deflates by exactly this margin to recover the window rect.
     #[test]
-    fn ring_is_empty_for_zero_width() {
-        assert!(ring_rects(rect(0, 0, 100, 100), 0).is_empty());
-        assert!(ring_rects(rect(0, 0, 100, 100), -1).is_empty());
+    fn ring_area_inflates_by_border_plus_glow_on_every_side() {
+        let area = ring_area(rect(10, 20, 100, 50), 2, 8);
+        assert_eq!((area.loc.x, area.loc.y), (0, 10));
+        assert_eq!((area.size.w, area.size.h), (120, 70));
     }
 
     #[test]
-    fn ring_lies_entirely_outside_the_inner_rect() {
-        let inner = rect(10, 20, 100, 50);
-        for r in ring_rects(inner, 3) {
-            assert!(!r.overlaps(inner), "{r:?} overlaps the client rect");
+    fn ring_area_is_the_window_itself_with_no_border_and_no_glow() {
+        let window = rect(10, 20, 100, 50);
+        assert_eq!(ring_area(window, 0, 0), window);
+    }
+
+    #[test]
+    fn ring_area_ignores_negative_inputs_rather_than_shrinking() {
+        let window = rect(10, 20, 100, 50);
+        assert_eq!(ring_area(window, -4, 0), window);
+    }
+
+    #[test]
+    fn ring_area_stays_centred_on_its_window() {
+        let window = rect(10, 20, 100, 50);
+        let area = ring_area(window, 3, 7);
+        let window_centre = (
+            window.loc.x * 2 + window.size.w,
+            window.loc.y * 2 + window.size.h,
+        );
+        let area_centre = (area.loc.x * 2 + area.size.w, area.loc.y * 2 + area.size.h);
+        assert_eq!(window_centre, area_centre, "shader assumes a shared centre");
+    }
+
+    // Every uniform the Rust side declares must exist in the GLSL, and vice
+    // versa. A mismatch compiles and links fine and simply never takes effect.
+    #[test]
+    fn shader_declares_every_uniform_the_element_sets() {
+        for (name, decl) in [
+            ("rubix_color", "uniform vec4 rubix_color;"),
+            ("rubix_radius", "uniform float rubix_radius;"),
+            ("rubix_border", "uniform float rubix_border;"),
+            ("rubix_glow", "uniform float rubix_glow;"),
+            ("rubix_falloff", "uniform float rubix_falloff;"),
+        ] {
+            assert!(
+                BORDER_RING.contains(decl),
+                "{name} is not declared in the border shader"
+            );
+            // And actually used, not just declared -- an unused uniform is
+            // optimised out and the driver reports no such location.
+            assert!(
+                BORDER_RING.matches(name).count() >= 2,
+                "{name} is declared but never read"
+            );
         }
     }
 
     #[test]
-    fn ring_rects_do_not_overlap_each_other() {
-        let ring = ring_rects(rect(10, 20, 100, 50), 4);
-        for (i, a) in ring.iter().enumerate() {
-            for b in ring.iter().skip(i + 1) {
-                assert!(!a.overlaps(*b), "{a:?} overlaps {b:?}");
-            }
-        }
+    fn shader_has_no_version_directive() {
+        // Smithay's pixel-shader path prepends its own; a #version here fails
+        // to compile at runtime, where there is no test to catch it.
+        assert!(!BORDER_RING.contains("#version"));
     }
 
     #[test]
-    fn ring_area_equals_the_frame_it_should_cover() {
-        let (w, h, bw) = (100, 50, 4);
-        let ring = ring_rects(rect(10, 20, w, h), bw);
-        let area: i32 = ring.iter().map(|r| r.size.w * r.size.h).sum();
-        // (outer area) - (inner area), with no double-counted corners.
-        let expected = (w + 2 * bw) * (h + 2 * bw) - w * h;
-        assert_eq!(area, expected);
+    fn shader_reads_the_varying_and_size_smithay_provides() {
+        assert!(BORDER_RING.contains("varying vec2 v_coords;"));
+        assert!(BORDER_RING.contains("uniform vec2 size;"));
+        assert!(BORDER_RING.contains("uniform float alpha;"));
     }
 
     #[test]
-    fn ring_expands_the_bounding_box_by_exactly_the_border_width() {
-        let inner = rect(10, 20, 100, 50);
-        let ring = ring_rects(inner, 3);
-        let min_x = ring.iter().map(|r| r.loc.x).min().unwrap();
-        let min_y = ring.iter().map(|r| r.loc.y).min().unwrap();
-        let max_x = ring.iter().map(|r| r.loc.x + r.size.w).max().unwrap();
-        let max_y = ring.iter().map(|r| r.loc.y + r.size.h).max().unwrap();
-        assert_eq!((min_x, min_y), (7, 17));
-        assert_eq!((max_x, max_y), (113, 73));
+    fn colour_passes_straight_through_on_a_non_hdr_output() {
+        let out = resolved_color(&style(Some(600.0)), false, 200.0);
+        assert_eq!((out.r(), out.g(), out.b()), (0.4, 0.6, 0.9));
     }
 
+    // 350 nits must land at 350/10000 of the working space's full scale,
+    // whatever SDR white happens to be -- that is the point of absolute
+    // luminance, and it is what lets a focus ring sit above SDR white.
     #[test]
-    fn luminance_scaling_is_identity_at_ratio_one() {
-        let c = Color32F::new(0.5, 0.25, 0.75, 1.0);
-        let out = scale_srgb_luminance(c, 1.0);
-        assert_eq!((out.r(), out.g(), out.b(), out.a()), (0.5, 0.25, 0.75, 1.0));
-    }
-
-    #[test]
-    fn luminance_scaling_preserves_alpha_and_brightens_monotonically() {
-        let c = Color32F::new(0.5, 0.5, 0.5, 0.8);
-        let up = scale_srgb_luminance(c, 1.75);
-        assert!((up.a() - 0.8).abs() < 1e-6, "alpha must not be touched");
-        assert!(up.r() > c.r(), "ratio > 1 must brighten");
-        let down = scale_srgb_luminance(c, 0.5);
-        assert!(down.r() < c.r(), "ratio < 1 must darken");
-    }
-
-    /// The whole point of the pre-compensation: pushing a color through
-    /// `scale_srgb_luminance` and then through the pass-wide solid transform
-    /// must land at the requested absolute luminance, not at `sdr_white_nits`.
-    #[test]
-    fn precompensation_cancels_the_pass_wide_solid_transform() {
-        let sdr_white = 200.0_f32;
-        let target = 350.0_f32;
-        let base = Color32F::new(1.0, 1.0, 1.0, 1.0);
-
-        // The exact closure `udev` installs via `set_solid_color_transform`,
-        // so this tests the real pass behaviour rather than a restatement of it.
-        let transform = crate::hdr_shaders::sdr_solid_transform(sdr_white);
-        let plain = transform(base);
-        let boosted = transform(scale_srgb_luminance(base, target / sdr_white));
-
-        // White at 200 nits lands at 200/10000; the same white pre-scaled for
-        // 350 nits must land at 350/10000 -- i.e. exactly target/sdr_white
-        // times as bright, in the linear working space.
-        let ratio = boosted.r() / plain.r();
+    fn hdr_colour_is_absolute_not_relative_to_sdr_white() {
+        let at_200 = resolved_color(&style(Some(350.0)), true, 200.0);
+        let at_300 = resolved_color(&style(Some(350.0)), true, 300.0);
         assert!(
-            (ratio - target / sdr_white).abs() < 1e-3,
-            "expected {}x, got {ratio}x",
-            target / sdr_white
+            (at_200.r() - at_300.r()).abs() < 1e-6,
+            "an absolute nit value must not move when SDR white does"
         );
     }
 
     #[test]
-    fn luminance_is_ignored_when_the_output_is_not_hdr() {
-        let style = BorderStyle {
-            color: Color32F::new(0.4, 0.6, 0.9, 1.0),
-            luminance_nits: Some(600.0),
-        };
-        let out = resolved_color(&style, false, 200.0);
-        assert_eq!((out.r(), out.g(), out.b()), (0.4, 0.6, 0.9));
+    fn hdr_colour_without_a_luminance_sits_at_sdr_white() {
+        let implicit = resolved_color(&style(None), true, 200.0);
+        let explicit = resolved_color(&style(Some(200.0)), true, 200.0);
+        assert!((implicit.r() - explicit.r()).abs() < 1e-6);
     }
 
     #[test]
-    fn luminance_applies_when_the_output_is_hdr() {
-        let style = BorderStyle {
-            color: Color32F::new(0.4, 0.6, 0.9, 1.0),
-            luminance_nits: Some(600.0),
-        };
-        let out = resolved_color(&style, true, 200.0);
-        assert!(out.r() > 0.4, "an HDR output should brighten the border");
+    fn a_brighter_rule_produces_a_brighter_colour() {
+        let dim = resolved_color(&style(Some(200.0)), true, 200.0);
+        let bright = resolved_color(&style(Some(600.0)), true, 200.0);
+        assert!(bright.r() > dim.r());
     }
 
     #[test]
-    fn a_style_without_luminance_passes_its_color_through_on_hdr() {
-        let style = BorderStyle {
-            color: Color32F::new(0.4, 0.6, 0.9, 1.0),
-            luminance_nits: None,
-        };
-        let out = resolved_color(&style, true, 200.0);
-        assert_eq!((out.r(), out.g(), out.b()), (0.4, 0.6, 0.9));
+    fn hdr_colour_preserves_alpha() {
+        let mut s = style(Some(350.0));
+        s.color = Color32F::new(0.4, 0.6, 0.9, 0.5);
+        assert!((resolved_color(&s, true, 200.0).a() - 0.5).abs() < 1e-6);
     }
 }

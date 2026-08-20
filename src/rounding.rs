@@ -41,6 +41,7 @@
 use std::cell::RefCell;
 
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::gles::element::PixelShaderElement;
 use smithay::backend::renderer::gles::{
     GlesError, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
 };
@@ -318,8 +319,8 @@ impl<E: Element> Element for RoundedElement<E> {
     }
 }
 
-/// Lets a render element install a texture program on whatever frame it is
-/// handed, without ever naming a `GlesFrame` outside a concrete impl.
+/// Lets a render element reach GL state on whatever frame it is handed,
+/// without ever naming a `GlesFrame` outside a concrete impl.
 ///
 /// The obvious shape -- a trait method returning `&mut GlesFrame` -- does not
 /// work: `GlesFrame` is invariant in its lifetimes, so a `GlesFrame<'a, 'b>`
@@ -328,7 +329,7 @@ impl<E: Element> Element for RoundedElement<E> {
 /// sidesteps that entirely, and has the side benefit that each renderer decides
 /// for itself how to reach its frame: winit's frame already is a `GlesFrame`,
 /// udev's wraps one behind the patched `render_frame_mut`.
-pub(crate) trait RoundingRenderer: RendererSuper {
+pub(crate) trait GlesAccess: RendererSuper {
     /// The concrete `GlesRenderer` behind this renderer.
     ///
     /// Needed to compile shaders. `AsMut<GlesRenderer>` covers udev's
@@ -344,9 +345,26 @@ pub(crate) trait RoundingRenderer: RendererSuper {
         uniforms: Vec<Uniform<'static>>,
     );
     fn clear_round_program(frame: &mut Self::Frame<'_, '_>);
+
+    /// Draw a `PixelShaderElement`, which smithay only implements
+    /// `RenderElement` for against `GlesRenderer` directly. Same trick as the
+    /// program setters: the operation goes inward rather than the frame coming
+    /// out. Failures are swallowed with a warning -- chrome that will not draw
+    /// must not take the frame down with it.
+    fn draw_pixel_shader(
+        frame: &mut Self::Frame<'_, '_>,
+        element: &PixelShaderElement,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    );
 }
 
-impl RoundingRenderer for GlesRenderer {
+fn warn_chrome(err: impl std::fmt::Debug) {
+    tracing::warn!("border chrome failed to draw: {err:?}");
+}
+
+impl GlesAccess for GlesRenderer {
     fn gles_renderer(&mut self) -> &mut GlesRenderer {
         self
     }
@@ -361,9 +379,23 @@ impl RoundingRenderer for GlesRenderer {
     fn clear_round_program(frame: &mut Self::Frame<'_, '_>) {
         frame.clear_tex_program_override();
     }
+
+    fn draw_pixel_shader(
+        frame: &mut Self::Frame<'_, '_>,
+        element: &PixelShaderElement,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) {
+        if let Err(e) =
+            RenderElement::<GlesRenderer>::draw(element, frame, src, dst, damage, &[], None)
+        {
+            warn_chrome(e);
+        }
+    }
 }
 
-impl<'r> RoundingRenderer for crate::udev::RubixRenderer<'r> {
+impl<'r> GlesAccess for crate::udev::RubixRenderer<'r> {
     fn gles_renderer(&mut self) -> &mut GlesRenderer {
         self.as_mut()
     }
@@ -382,11 +414,26 @@ impl<'r> RoundingRenderer for crate::udev::RubixRenderer<'r> {
             gles.clear_tex_program_override();
         }
     }
+
+    fn draw_pixel_shader(
+        frame: &mut Self::Frame<'_, '_>,
+        element: &PixelShaderElement,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) {
+        let Some(gles) = frame.render_frame_mut() else { return };
+        if let Err(e) =
+            RenderElement::<GlesRenderer>::draw(element, gles, src, dst, damage, &[], None)
+        {
+            warn_chrome(e);
+        }
+    }
 }
 
 impl<R, E> RenderElement<R> for RoundedElement<E>
 where
-    R: Renderer + RoundingRenderer,
+    R: Renderer + GlesAccess,
     E: RenderElement<R>,
 {
     fn draw(
@@ -434,7 +481,7 @@ pub(crate) fn space_elements<R>(
     mode: RoundMode,
 ) -> Vec<RubixRenderElement<R>>
 where
-    R: Renderer + ImportAll + ImportMem + RoundingRenderer,
+    R: Renderer + ImportAll + ImportMem + GlesAccess,
     R::TextureId: Clone + 'static,
     RubixRenderElement<R>: RenderElement<R>,
 {
@@ -483,11 +530,11 @@ where
         );
 
         if let Some(id) = id {
-            elements.extend(
-                crate::decoration::window_border_elements(state, id, local_rect, scale, hdr)
-                    .into_iter()
-                    .map(RubixRenderElement::Solid),
-            );
+            if let Some(ring) =
+                crate::decoration::window_border_elements(state, renderer, id, local_rect, hdr)
+            {
+                elements.push(RubixRenderElement::BorderRing(ring));
+            }
         }
 
         let surfaces = window.render_elements::<WaylandSurfaceRenderElement<R>>(
@@ -511,7 +558,6 @@ where
             _ => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
         }
     }
-    crate::decoration::prune_border_buffers(state);
     elements
 }
 

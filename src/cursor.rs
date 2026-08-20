@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 
-use crate::rounding::{RoundedElement, RoundingRenderer};
+use crate::rounding::{RoundedElement, GlesAccess};
 
 use smithay::{
     backend::{
@@ -76,15 +76,19 @@ use smithay::{
 // mid-scale is unmapped and drawn by hand -- the same treatment rotation
 // ghosts already get -- with each of its surface elements wrapped here.
 render_elements! {
-    pub RubixRenderElement<R> where R: ImportAll + ImportMem + RoundingRenderer;
+    pub RubixRenderElement<R> where R: ImportAll + ImportMem + GlesAccess;
     Surface = WaylandSurfaceRenderElement<R>,
     Memory = MemoryRenderBufferRenderElement<R>,
     Texture = TextureRenderElement<<R as RendererSuper>::TextureId>,
     // Compositor-authored chrome: window borders (see decoration.rs). Solid
     // colors, so no import bound beyond what the other variants already need.
     Solid = SolidColorRenderElement,
+    // The window border ring and its glow, drawn by a pixel shader (see
+    // decoration.rs). Wrapped because smithay implements RenderElement for
+    // PixelShaderElement against GlesRenderer only.
+    BorderRing = crate::decoration::BorderRingElement,
     // A window surface clipped to its window's rounded rect (see rounding.rs).
-    // The `RoundingRenderer` bound above exists for this variant alone -- it is
+    // The `GlesAccess` bound above exists for this variant alone -- it is
     // how the element reaches a `GlesFrame` to install its shader program.
     Rounded = RoundedElement<WaylandSurfaceRenderElement<R>>,
     Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,

@@ -272,7 +272,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     if state.pending_screencopy.is_empty() {
         return;
@@ -373,7 +373,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     let mode = output.current_mode().ok_or("output has no mode")?;
     let phys = output.current_transform().transform_size(mode.size);
@@ -465,7 +465,7 @@ where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
-    R: crate::rounding::RoundingRenderer,
+    R: crate::rounding::GlesAccess,
 {
     let scale = 1.0_f64;
     let mut background: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();

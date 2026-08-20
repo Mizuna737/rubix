@@ -92,9 +92,7 @@ border_width = 2
 #   - Fullscreen windows are never rounded. There is no gap for a corner to
 #     reveal, and rounding would cost the direct scanout that HDR gaming needs.
 #
-# NOT YET matched by the border: borders are still drawn as four straight
-# rects, so a rounded window with border_width > 0 shows square corner nubs.
-# Until the rounded ring lands, set border_width = 0 when using a radius.
+# The border follows this same radius, staying concentric with the window edge.
 # corner_radius = 8
 
 # Colors accept #RGB, #RRGGBB, or #RRGGBBAA (the leading '#' is optional). An
@@ -115,8 +113,30 @@ inactive_color = "#45475a"
 # then sits at SDR white like every other SDR element.
 # Commented out so this file matches the built-in defaults exactly: a config
 # omitting [decoration] entirely gets no luminance opinion. Uncomment to opt in.
-# active_luminance_nits = 350.0
+# # active_luminance_nits = 350.0
 # inactive_luminance_nits = 0
+
+# Glow: how far the border's light spills past the ring, in logical pixels.
+# 0 (the default) draws a plain ring and nothing else. The glow is drawn from
+# the same rounded-rect distance field as the ring, so it stays concentric with
+# the corner curve instead of pooling at the corners.
+#
+# This is where HDR earns its keep. In SDR a glow has to brighten toward white
+# to be visible at all, which washes out the hue and competes with window
+# content -- which is why glows tend to look gaudy. With a luminance above SDR
+# white the glow keeps its saturation and simply sits brighter than the desktop,
+# reading as light spilling off the window edge. Subtlety comes from the
+# headroom, not from turning the opacity down.
+#
+# Keep the margin inside your gaps, or neighbouring windows will sit in each
+# other's glow.
+# active_glow_margin = 12
+# inactive_glow_margin = 0
+
+# Shapes how quickly the glow gives out: 1.0 is linear, higher keeps it tight
+# to the border, lower spreads it across the gap. Applies to both states, and
+# can be overridden per rule.
+# glow_falloff = 2.0
 
 # Per-window overrides, consulted in file order; the first rule that matches AND
 # supplies a color for the relevant focus state wins, otherwise the defaults

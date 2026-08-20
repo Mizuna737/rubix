@@ -397,6 +397,12 @@ fn parse_chord(chord: &str, action: NavAction) -> Option<Keybind> {
 pub struct BorderStyle {
     pub color: Color32F,
     pub luminance_nits: Option<f32>,
+    /// How far the glow reaches beyond the ring, in logical pixels. `0`
+    /// (the default) draws a plain ring with no glow at all.
+    pub glow_margin: u32,
+    /// Shapes how quickly the glow gives out. `1.0` is linear; higher values
+    /// keep the glow tight to the border, lower values spread it.
+    pub glow_falloff: f32,
 }
 
 /// Resolved `[decoration]`. `active`/`inactive` are the fallbacks; `rules` are
@@ -472,6 +478,12 @@ struct RawDecoration {
     active_luminance_nits: Option<f32>,
     #[serde(default)]
     inactive_luminance_nits: Option<f32>,
+    #[serde(default)]
+    active_glow_margin: u32,
+    #[serde(default)]
+    inactive_glow_margin: u32,
+    #[serde(default = "default_glow_falloff")]
+    glow_falloff: f32,
     // Singular to match the `[[decoration.rule]]` array-of-tables header
     // exactly, same convention as `[[output]]`.
     #[serde(default)]
@@ -487,6 +499,9 @@ impl Default for RawDecoration {
             inactive_color: default_inactive_color(),
             active_luminance_nits: None,
             inactive_luminance_nits: None,
+            active_glow_margin: 0,
+            inactive_glow_margin: 0,
+            glow_falloff: default_glow_falloff(),
             rule: Vec::new(),
         }
     }
@@ -506,10 +521,22 @@ struct RawBorderRule {
     active_luminance_nits: Option<f32>,
     #[serde(default)]
     inactive_luminance_nits: Option<f32>,
+    #[serde(default)]
+    active_glow_margin: Option<u32>,
+    #[serde(default)]
+    inactive_glow_margin: Option<u32>,
+    #[serde(default)]
+    glow_falloff: Option<f32>,
 }
 
 fn default_border_width() -> u32 {
     2
+}
+
+/// Slightly super-linear, so the glow stays close to the border rather than
+/// washing across the gap. Subtlety in HDR comes from headroom, not spread.
+fn default_glow_falloff() -> f32 {
+    2.0
 }
 
 fn default_active_color() -> String {
@@ -576,15 +603,34 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
             // A rule supplies a style for a focus state only if it named a
             // color for it; a bare luminance with no color would otherwise
             // silently restyle windows the user never mentioned a color for.
-            let style = |color: Option<String>, nits: Option<f32>, fallback: Color32F| {
+            let falloff = r.glow_falloff.unwrap_or(raw.glow_falloff);
+            let style = |color: Option<String>,
+                         nits: Option<f32>,
+                         glow: Option<u32>,
+                         default_glow: u32,
+                         fallback: Color32F| {
                 color.map(|c| BorderStyle {
                     color: resolve_color(&c, fallback),
                     luminance_nits: resolve_luminance(nits),
+                    glow_margin: glow.unwrap_or(default_glow),
+                    glow_falloff: falloff,
                 })
             };
             BorderRule {
-                active: style(r.active_color, r.active_luminance_nits, active_fallback),
-                inactive: style(r.inactive_color, r.inactive_luminance_nits, inactive_fallback),
+                active: style(
+                    r.active_color,
+                    r.active_luminance_nits,
+                    r.active_glow_margin,
+                    raw.active_glow_margin,
+                    active_fallback,
+                ),
+                inactive: style(
+                    r.inactive_color,
+                    r.inactive_luminance_nits,
+                    r.inactive_glow_margin,
+                    raw.inactive_glow_margin,
+                    inactive_fallback,
+                ),
                 app_id: r.app_id,
                 title: r.title,
             }
@@ -597,10 +643,14 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
         active: BorderStyle {
             color: resolve_color(&raw.active_color, active_fallback),
             luminance_nits: resolve_luminance(raw.active_luminance_nits),
+            glow_margin: raw.active_glow_margin,
+            glow_falloff: raw.glow_falloff,
         },
         inactive: BorderStyle {
             color: resolve_color(&raw.inactive_color, inactive_fallback),
             luminance_nits: resolve_luminance(raw.inactive_luminance_nits),
+            glow_margin: raw.inactive_glow_margin,
+            glow_falloff: raw.glow_falloff,
         },
         rules,
     }

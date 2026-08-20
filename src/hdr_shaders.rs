@@ -289,7 +289,7 @@ pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, Gl
 
 /// CPU-side sRGB EOTF + BT.709->BT.2020 + nits scaling, factored out of
 /// [`sdr_solid_transform`] so it's independently unit-testable.
-fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Color32F {
+pub(crate) fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Color32F {
     fn to_linear(c: f32) -> f32 {
         if c <= 0.04045 {
             c / 12.92

@@ -1868,11 +1868,16 @@ fn gather_tagged_elements<'a>(
             // the solid-colour transform that decode installs.
             if let Some(id) = window_id {
                 let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);
-                space_tagged.extend(
-                    crate::decoration::window_border_elements(state, id, local_rect, scale, true)
-                        .into_iter()
-                        .map(|e| (DecodeKind::Sdr, RubixRenderElement::Solid(e))),
-                );
+                if let Some(ring) =
+                    crate::decoration::window_border_elements(state, renderer, id, local_rect, true)
+                {
+                    // The DecodeKind is irrelevant for a pixel shader -- it
+                    // bypasses the texture decode entirely and writes
+                    // working-space values directly -- but the z-run partition
+                    // is keyed on it, so it takes its neighbours' Sdr tag to
+                    // avoid splitting a run for no reason.
+                    space_tagged.push((DecodeKind::Sdr, RubixRenderElement::BorderRing(ring)));
+                }
             }
             let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
                 renderer,
