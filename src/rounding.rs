@@ -415,22 +415,17 @@ where
     }
 }
 
-/// The space's contribution to one output, rounded if configured.
+/// The space's contribution to one output: every window, plus that window's
+/// border, in front-to-back order.
 ///
-/// At `corner_radius == 0` this is the batched
-/// `Space::render_elements_for_region` call every backend used before rounding
-/// existed, mapped straight through -- the default path stays byte-for-byte
-/// what it was.
+/// Borders are emitted **interleaved with their windows** rather than as one
+/// group above the space. Grouped, every border floats above every window, so a
+/// maximized window ends up covered in the borders of the windows behind it.
 ///
-/// Above zero it gathers **per window** instead, because the batch call returns
-/// a flat element list with no way to tell which window each element came from,
-/// and rounding is a per-window property. The per-window geometry here
-/// reproduces `render_elements_for_region`'s algorithm exactly, the same way
-/// `udev::gather_tagged_elements` already does.
-///
-/// Fullscreen windows are never rounded: there is no gap for a rounded corner
-/// to reveal, and `RoundedElement` reports no underlying storage, which would
-/// cost the direct scanout a fullscreen window exists to get.
+/// Per-window gathering is required whenever there is any chrome at all, since
+/// the batched `Space::render_elements_for_region` call returns a flat list
+/// with no way to attribute elements back to windows. With both borders and
+/// rounding off, it falls back to that batched call unchanged.
 pub(crate) fn space_elements<R>(
     state: &RubixState,
     renderer: &mut R,
@@ -444,10 +439,12 @@ where
     RubixRenderElement<R>: RenderElement<R>,
 {
     let radius = state.config.decoration.corner_radius as f32;
+    let has_borders = state.config.decoration.border_width > 0;
+    let hdr = matches!(mode, RoundMode::Decode(_));
     let Some(region) = state.space.output_geometry(output) else {
         return Vec::new();
     };
-    if radius <= 0.0 {
+    if radius <= 0.0 && !has_borders {
         return state
             .space
             .render_elements_for_region(renderer, &region, scale, 1.0)
@@ -455,16 +452,11 @@ where
             .map(RubixRenderElement::Surface)
             .collect();
     }
-    let Some(shaders) = round_shaders(renderer.gles_renderer()) else {
-        // Shader compile failed and already warned. Square corners beat no
-        // desktop.
-        return state
-            .space
-            .render_elements_for_region(renderer, &region, scale, 1.0)
-            .into_iter()
-            .map(RubixRenderElement::Surface)
-            .collect();
-    };
+    // `None` means rounding is off or its shaders failed to compile; borders
+    // still work either way, windows are just drawn square.
+    let round = (radius > 0.0)
+        .then(|| round_shaders(renderer.gles_renderer()))
+        .flatten();
 
     let mut elements = Vec::new();
     for window in state.space.elements().rev() {
@@ -475,36 +467,51 @@ where
         let Some(location) = state.space.element_location(window) else { continue };
         let geometry = window.geometry();
         let render_location: Point<i32, Logical> = location - geometry.loc - region.loc;
-        let fullscreen = state
+        let id = state
             .windows
             .iter()
-            .any(|(id, w)| w == window && state.fullscreen_windows.contains(id));
+            .find_map(|(id, w)| (w == window).then_some(*id));
+        let fullscreen = id.is_some_and(|id| state.fullscreen_windows.contains(&id));
+
+        // Region-local logical rect of the window's content, which is what the
+        // border ring is built around and what the rounding mask is measured
+        // against.
+        let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);
         let window_rect = Rectangle::<i32, Physical>::new(
-            (location - region.loc).to_physical_precise_round(scale),
-            geometry.size.to_physical_precise_round(scale),
+            local_rect.loc.to_physical_precise_round(scale),
+            local_rect.size.to_physical_precise_round(scale),
         );
+
+        if let Some(id) = id {
+            elements.extend(
+                crate::decoration::window_border_elements(state, id, local_rect, scale, hdr)
+                    .into_iter()
+                    .map(RubixRenderElement::Solid),
+            );
+        }
+
         let surfaces = window.render_elements::<WaylandSurfaceRenderElement<R>>(
             renderer,
             render_location.to_physical_precise_round(scale),
             Scale::from(scale),
             1.0,
         );
-        if fullscreen {
-            elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface));
-            continue;
+        match (&round, fullscreen) {
+            (Some(shaders), false) => elements.extend(surfaces.into_iter().map(|e| {
+                RubixRenderElement::Rounded(RoundedElement::new(
+                    e,
+                    shaders,
+                    mode,
+                    radius,
+                    window_rect,
+                    Scale::from(scale),
+                    state.sdr_white_nits,
+                ))
+            })),
+            _ => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
         }
-        elements.extend(surfaces.into_iter().map(|e| {
-            RubixRenderElement::Rounded(RoundedElement::new(
-                e,
-                &shaders,
-                mode,
-                radius,
-                window_rect,
-                Scale::from(scale),
-                state.sdr_white_nits,
-            ))
-        }));
     }
+    crate::decoration::prune_border_buffers(state);
     elements
 }
 

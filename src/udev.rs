@@ -1374,23 +1374,6 @@ fn render_surface(
     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
     elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
     elements.extend(scaled.into_iter().map(RubixRenderElement::Rescaled));
-    // Window borders sit directly above the space and below every layer
-    // surface, so a bar or overlay still covers them. `surface.hdr` selects
-    // whether the configured per-rule luminance is applied: it is the same
-    // condition the HDR composite branch below tests, so the colors match the
-    // pass that will actually draw them.
-    //
-    // One seam, accepted knowingly: if the HDR pipeline *fails* and this frame
-    // falls through to the SDR path below, these colors were pre-compensated
-    // for a solid-color transform that will not run, so a boosted border draws
-    // too bright. That only happens on a frame that already logged an HDR
-    // failure warning, and a persistent failure means HDR is broken on this
-    // output entirely -- a bright border is a symptom, not the disease.
-    elements.extend(
-        crate::decoration::border_elements(state, &surface.output, scale, surface.hdr)
-            .into_iter()
-            .map(RubixRenderElement::Solid),
-    );
     elements.extend(space_elements);
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
@@ -1870,14 +1853,27 @@ fn gather_tagged_elements<'a>(
                 .wl_surface()
                 .map(|s| surface_decode_kind(&s))
                 .unwrap_or(DecodeKind::Sdr);
-            let fullscreen = state
+            let window_id = state
                 .windows
                 .iter()
-                .any(|(id, w)| w == window && state.fullscreen_windows.contains(id));
+                .find_map(|(id, w)| (w == window).then_some(*id));
+            let fullscreen = window_id.is_some_and(|id| state.fullscreen_windows.contains(&id));
             let window_rect = Rectangle::<i32, Physical>::new(
                 (location - region.loc).to_physical_precise_round(scale),
                 geometry.size.to_physical_precise_round(scale),
             );
+            // Always `Sdr`-tagged: borders are compositor-authored chrome, never
+            // client HDR content, so they take the SDR decode. Their per-rule
+            // luminance rides on the colour itself, pre-compensated for exactly
+            // the solid-colour transform that decode installs.
+            if let Some(id) = window_id {
+                let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);
+                space_tagged.extend(
+                    crate::decoration::window_border_elements(state, id, local_rect, scale, true)
+                        .into_iter()
+                        .map(|e| (DecodeKind::Sdr, RubixRenderElement::Solid(e))),
+                );
+            }
             let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
                 renderer,
                 render_location.to_physical_precise_round(scale),
@@ -1961,16 +1957,9 @@ fn gather_tagged_elements<'a>(
             .into_iter()
             .map(|e| (DecodeKind::Sdr, RubixRenderElement::Rescaled(e))),
     );
-    // Same z-slot as the fast path. Always `Sdr`-tagged: borders are
-    // compositor-authored chrome, never client HDR content, so they take the
-    // SDR decode. Their per-rule luminance rides on the color itself (see
-    // `decoration::scale_srgb_luminance`), pre-compensated for exactly the
-    // solid-color transform this decode installs.
-    tagged.extend(
-        crate::decoration::border_elements(state, output, scale, true)
-            .into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Solid(e))),
-    );
+    // Borders are emitted per window inside the space loop above, not as a
+    // group here -- grouped, every border floats above every window and a
+    // maximized window is covered in the borders of the windows behind it.
     tagged.extend(space_tagged);
     tagged.extend(
         bottom

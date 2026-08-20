@@ -165,14 +165,6 @@ where
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
     elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
-    // Borders are part of the desktop, so a screencast shows them. `hdr = false`:
-    // the readback destination is an 8-bit SDR buffer, so the border wants its
-    // plain color, not one pre-compensated for a transform this path never runs.
-    elements.extend(
-        crate::decoration::border_elements(state, &output, scale, false)
-            .into_iter()
-            .map(RubixRenderElement::Solid),
-    );
     elements.extend(space_elements);
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));

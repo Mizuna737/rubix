@@ -33,8 +33,7 @@ use std::collections::HashMap;
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Color32F;
-use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Scale};
+use smithay::utils::{Logical, Rectangle, Scale};
 
 use crate::config::BorderStyle;
 use crate::RubixState;
@@ -134,68 +133,68 @@ pub(crate) fn resolved_color(style: &BorderStyle, hdr: bool, sdr_white_nits: f32
     }
 }
 
-/// Border elements for every window on `output`, front-to-back, positioned
-/// relative to the output region exactly as `Space::render_elements_for_region`
-/// positions the windows they surround.
+/// Border elements for ONE window, whose logical rect is already
+/// output-region-local (the same space `Space::render_elements_for_region`
+/// positions elements in).
+///
+/// Per window rather than per output because borders have to be emitted
+/// *interleaved with* the windows they belong to. Drawn as one group above the
+/// whole space -- which is what this did originally -- every window's border
+/// floats above every other window, so a maximized window is covered in the
+/// borders of the windows hidden behind it.
+///
+/// Returns nothing for a fullscreen window: a border above a fullscreen window
+/// disqualifies it from direct primary-plane scanout, and there is no gap to
+/// draw it in anyway.
 ///
 /// `hdr` says whether this output is compositing through the linear HDR path
-/// this frame -- the winit backend and every SDR output pass `false`, which
-/// makes the whole luminance mechanism inert.
-pub(crate) fn border_elements(
+/// this frame; when false the luminance mechanism is entirely inert.
+pub(crate) fn window_border_elements(
     state: &RubixState,
-    output: &Output,
+    id: u32,
+    window_rect: Rectangle<i32, Logical>,
     scale: f64,
     hdr: bool,
 ) -> Vec<SolidColorRenderElement> {
     let deco = &state.config.decoration;
-    if deco.border_width == 0 {
+    let width = deco.border_width as i32;
+    if width <= 0 || state.fullscreen_windows.contains(&id) {
         return Vec::new();
     }
-    let Some(region) = state.space.output_geometry(output) else {
+    let (app_id, title) = state.window_identity(id);
+    let style = deco.style_for(
+        app_id.as_deref(),
+        title.as_deref(),
+        state.focused_window_id() == Some(id),
+    );
+    if style.color.a() <= 0.0 {
         return Vec::new();
-    };
-    let focused = state.focused_window_id();
-    let width = deco.border_width as i32;
+    }
+    let color = resolved_color(&style, hdr, state.sdr_white_nits);
 
     let mut elements = Vec::new();
-    for (id, window) in state.windows.iter() {
-        // See the module docs: a border over a fullscreen window would cost
-        // direct scanout, and there is no gap to draw it in anyway.
-        if state.fullscreen_windows.contains(id) {
-            continue;
-        }
-        let Some(geo) = state.space.element_geometry(window) else { continue };
-        if !region.overlaps(geo) {
-            continue;
-        }
-        let (app_id, title) = state.window_identity(*id);
-        let style = deco.style_for(app_id.as_deref(), title.as_deref(), focused == Some(*id));
-        if style.color.a() <= 0.0 {
-            continue;
-        }
-        let color = resolved_color(&style, hdr, state.sdr_white_nits);
-        for (index, rect) in ring_rects(geo, width).into_iter().enumerate() {
-            // Translate into region-local space the same way the space's own
-            // element positioning does, then round to physical once.
-            let loc: Point<i32, Logical> = rect.loc - region.loc;
-            BORDER_BUFFERS.with_borrow_mut(|buffers| {
-                let buffer = buffers.entry((*id, index)).or_default();
-                buffer.update(rect.size, color);
-                elements.push(SolidColorRenderElement::from_buffer(
-                    buffer,
-                    loc.to_physical_precise_round::<f64, i32>(scale),
-                    Scale::from(scale),
-                    1.0,
-                    Kind::Unspecified,
-                ));
-            });
-        }
+    for (index, rect) in ring_rects(window_rect, width).into_iter().enumerate() {
+        BORDER_BUFFERS.with_borrow_mut(|buffers| {
+            let buffer = buffers.entry((id, index)).or_default();
+            buffer.update(rect.size, color);
+            elements.push(SolidColorRenderElement::from_buffer(
+                buffer,
+                rect.loc.to_physical_precise_round::<f64, i32>(scale),
+                Scale::from(scale),
+                1.0,
+                Kind::Unspecified,
+            ));
+        });
     }
+    elements
+}
 
+/// Drop cached buffers for windows that no longer exist. Called once per frame
+/// by the element gather, not per window.
+pub(crate) fn prune_border_buffers(state: &RubixState) {
     BORDER_BUFFERS.with_borrow_mut(|buffers| {
         buffers.retain(|(id, _), _| state.windows.contains_key(id));
     });
-    elements
 }
 
 #[cfg(test)]
