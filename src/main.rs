@@ -13,6 +13,7 @@ mod hdr_shaders;
 mod input;
 mod ipc;
 mod model;
+mod output_power;
 mod portal;
 mod rounding;
 mod foreign_toplevel;
@@ -178,7 +179,215 @@ fn open_log_file() -> Option<std::fs::File> {
     std::fs::File::create(dir.join("rubix.log")).ok()
 }
 
+// `rubix screen ...` -- a tight `hyprctl`/`niri msg`-style client for
+// `zwlr_output_power_v1` (via `ipc::Request::SetScreenPower`/`ScreenStatus`),
+// NOT a general CLI framework. Lives in main.rs (not a submodule) because it
+// is intercepted at the very top of `main`, before ANYTHING else -- tracing
+// init, the event loop, backend bring-up -- so `rubix screen off` run from a
+// shell inside an already-running session talks to that session over IPC
+// instead of booting a second compositor. `-c`/`--command` is unaffected: it
+// stays exactly where it was, parsed after full bring-up (see below).
+
+/// `rubix screen on|off|toggle|status [OUTPUT]`. `None` if `args` isn't a
+/// `screen` invocation at all (caller falls through to normal startup);
+/// `Some(exit_code)` otherwise, which the caller must `std::process::exit`
+/// immediately -- this never returns into compositor bring-up.
+fn handle_screen_subcommand(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("screen") {
+        return None;
+    }
+    let rest = &args[1..];
+    let Some(action) = rest.first().map(String::as_str) else {
+        eprintln!("usage: rubix screen on|off|toggle|status [OUTPUT]");
+        return Some(2);
+    };
+    let output = rest.get(1).cloned();
+
+    let Some(socket_path) = resolve_rubix_socket() else {
+        eprintln!("rubix screen: no rubix*.sock found in $XDG_RUNTIME_DIR -- is the compositor running?");
+        return Some(1);
+    };
+    let mut stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rubix screen: failed to connect to {}: {e}", socket_path.display());
+            return Some(1);
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+
+    let code = match action {
+        "on" | "off" => {
+            let on = action == "on";
+            if !send_screen_power(&mut stream, on, output.as_deref()) {
+                1
+            } else {
+                println!("{} {}", if on { "on" } else { "off" }, output.as_deref().unwrap_or("(all outputs)"));
+                0
+            }
+        }
+        "toggle" => {
+            let Some(status) = fetch_screen_status(&mut stream) else { return Some(1) };
+            let on = match &output {
+                Some(name) => match status.iter().find(|(n, _)| n == name) {
+                    Some((_, currently_on)) => !*currently_on,
+                    None => {
+                        eprintln!("rubix screen: no such output: {name}");
+                        return Some(1);
+                    }
+                },
+                // Toggle-ALL converges rather than flips per-output: if
+                // anything is still lit, turn everything off; only once
+                // EVERY output is already off does it turn everything back
+                // on. A plain per-output XOR has no well-defined "next
+                // state" on a mixed multi-monitor setup (some on, some off).
+                None => !status.iter().any(|(_, on)| *on),
+            };
+            if !send_screen_power(&mut stream, on, output.as_deref()) {
+                1
+            } else {
+                println!("{}", if on { "on" } else { "off" });
+                0
+            }
+        }
+        "status" => {
+            let Some(status) = fetch_screen_status(&mut stream) else { return Some(1) };
+            let rows: Vec<_> = match &output {
+                Some(name) => status.into_iter().filter(|(n, _)| n == name).collect(),
+                None => status,
+            };
+            if let Some(name) = &output {
+                if rows.is_empty() {
+                    eprintln!("rubix screen: no such output: {name}");
+                    return Some(1);
+                }
+            }
+            for (name, on) in rows {
+                println!("{name}\t{}", if on { "on" } else { "off" });
+            }
+            0
+        }
+        other => {
+            eprintln!("rubix screen: unknown action '{other}' (expected on|off|toggle|status)");
+            2
+        }
+    };
+    Some(code)
+}
+
+/// Locate Rubix's IPC socket. Mirrors `contrib/waybar/rubixBar.py`'s
+/// `socketPath()` exactly, so the CLI agrees with every other IPC client
+/// about which socket a running session actually bound: prefer the
+/// display-agnostic `rubix.sock`, else the most recently modified
+/// `rubix-<n>.sock`.
+fn resolve_rubix_socket() -> Option<std::path::PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let plain = std::path::PathBuf::from(&runtime_dir).join("rubix.sock");
+    if plain.exists() {
+        return Some(plain);
+    }
+    let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(&runtime_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("rubix-") || !name.ends_with(".sock") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let is_newer = best.as_ref().map(|(_, t)| modified > *t).unwrap_or(true);
+        if is_newer {
+            best = Some((entry.path(), modified));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Send `set_screen_power` and confirm the compositor answered `Ok` (not
+/// `Error`, and not silence -- a closed connection or a timed-out read both
+/// count as failure). `true` on success.
+fn send_screen_power(stream: &mut std::os::unix::net::UnixStream, on: bool, output: Option<&str>) -> bool {
+    use std::io::Write;
+    let request = serde_json::json!({ "type": "set_screen_power", "on": on, "output": output });
+    let mut line = request.to_string();
+    line.push('\n');
+    if let Err(e) = stream.write_all(line.as_bytes()) {
+        eprintln!("rubix screen: write failed: {e}");
+        return false;
+    }
+    match read_ipc_reply(stream) {
+        Some(reply) if reply.get("type").and_then(|t| t.as_str()) == Some("error") => {
+            let msg = reply.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            eprintln!("rubix screen: compositor returned an error: {msg}");
+            false
+        }
+        Some(_) => true,
+        None => {
+            eprintln!("rubix screen: no reply from compositor (timed out or connection closed)");
+            false
+        }
+    }
+}
+
+/// Send `screen_status` and parse the `outputs` array back into `(name, on)`
+/// pairs. `None` on any failure (already logged to stderr).
+fn fetch_screen_status(stream: &mut std::os::unix::net::UnixStream) -> Option<Vec<(String, bool)>> {
+    use std::io::Write;
+    if let Err(e) = stream.write_all(b"{\"type\":\"screen_status\"}\n") {
+        eprintln!("rubix screen: write failed: {e}");
+        return None;
+    }
+    let reply = match read_ipc_reply(stream) {
+        Some(r) => r,
+        None => {
+            eprintln!("rubix screen: no reply from compositor (timed out or connection closed)");
+            return None;
+        }
+    };
+    if reply.get("type").and_then(|t| t.as_str()) == Some("error") {
+        let msg = reply.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+        eprintln!("rubix screen: compositor returned an error: {msg}");
+        return None;
+    }
+    let Some(outputs) = reply.get("outputs").and_then(|o| o.as_array()) else {
+        eprintln!("rubix screen: unexpected reply from compositor: {reply}");
+        return None;
+    };
+    Some(
+        outputs
+            .iter()
+            .filter_map(|o| {
+                let name = o.get("name")?.as_str()?.to_string();
+                let on = o.get("on")?.as_bool()?;
+                Some((name, on))
+            })
+            .collect(),
+    )
+}
+
+/// Read one newline-delimited JSON reply line off the socket.
+fn read_ipc_reply(stream: &mut std::os::unix::net::UnixStream) -> Option<serde_json::Value> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    if line.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&line).ok()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // MUST be the very first thing in `main`, before tracing init / event
+    // loop / backend bring-up -- see the module doc above
+    // `handle_screen_subcommand`. `-c`/`--command` (below, after full
+    // bring-up) is untouched by this.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = handle_screen_subcommand(&cli_args) {
+        std::process::exit(code);
+    }
+
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));

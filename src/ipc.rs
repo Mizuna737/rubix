@@ -63,12 +63,32 @@ enum Request {
     GetState,
     Action { action: NavAction },
     Subscribe,
+    // DPMS-equivalent screen power (see `RubixState::set_screen_power` /
+    // `udev::set_screen_power`). `output: None` means every output; `Some`
+    // targets one by name. This is what `rubix screen on|off [DP-3]` sends
+    // (see main.rs's `handle_screen_subcommand`) -- write the raw line
+    // yourself for anything else, e.g. from a shell:
+    //   printf '{"type":"set_screen_power","on":false,"output":null}\n' | \
+    //     socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rubix.sock"
+    // Replies `Reply::Ok`. `Reply::State` (from `get_state`/`subscribe`)
+    // carries a `screen_off: bool` -- true only once EVERY output is off
+    // (`RubixState::all_outputs_off`); see `ScreenStatus` below for
+    // per-output detail.
+    SetScreenPower { on: bool, output: Option<String> },
+    // Per-output power state -- what `rubix screen status` prints. Replies
+    // `Reply::ScreenStatus`.
+    ScreenStatus,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Reply {
     State(StateSnapshot),
+    // Struct variant (not a newtype-wrapping-a-Vec): internally-tagged
+    // enums (`#[serde(tag = "type")]`) can only merge the tag into a
+    // JSON object, and a bare `Vec` serializes as an array -- wrapping it
+    // in a named field is what keeps this representable at all.
+    ScreenStatus { outputs: Vec<OutputPowerView> },
     Ok,
     Error { message: String },
 }
@@ -78,6 +98,16 @@ struct StateSnapshot {
     visible_columns: usize,
     active_column: usize,
     columns: Vec<ColumnView>,
+    /// True only once EVERY output is off -- see `Request::SetScreenPower`'s
+    /// doc comment. A bar wanting per-output detail should use
+    /// `Request::ScreenStatus` instead.
+    screen_off: bool,
+}
+
+#[derive(Serialize)]
+struct OutputPowerView {
+    name: String,
+    on: bool,
 }
 
 #[derive(Serialize)]
@@ -122,7 +152,12 @@ fn build_snapshot(state: &RubixState) -> StateSnapshot {
     let Some(monitor) = state.workspace.active_monitor() else {
         // No active monitor (no output bound yet) -- empty snapshot rather
         // than panicking.
-        return StateSnapshot { visible_columns: 0, active_column: 0, columns: Vec::new() };
+        return StateSnapshot {
+            visible_columns: 0,
+            active_column: 0,
+            columns: Vec::new(),
+            screen_off: state.all_outputs_off(),
+        };
     };
     let columns = monitor
         .columns()
@@ -147,6 +182,7 @@ fn build_snapshot(state: &RubixState) -> StateSnapshot {
         visible_columns: monitor.visible_columns(),
         active_column: monitor.active_column(),
         columns,
+        screen_off: state.all_outputs_off(),
     }
 }
 
@@ -205,6 +241,17 @@ fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
                 client.subscribed.set(true);
                 Reply::State(build_snapshot(data))
             }
+            Ok(Request::SetScreenPower { on, output }) => {
+                data.set_screen_power(on, output.as_deref());
+                Reply::Ok
+            }
+            Ok(Request::ScreenStatus) => Reply::ScreenStatus {
+                outputs: data
+                    .output_power_status()
+                    .into_iter()
+                    .map(|(name, off)| OutputPowerView { name, on: !off })
+                    .collect(),
+            },
             Err(e) => Reply::Error { message: e.to_string() },
         };
         if write_reply(&mut client.stream, &reply).is_err() {

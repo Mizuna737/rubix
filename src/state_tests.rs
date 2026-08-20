@@ -659,3 +659,118 @@ fn a_press_on_a_different_window_takes_over_the_cycle_from_the_start() {
     assert_eq!(next_maximize(other, W, true, true), MaximizeState::Group(W));
     assert_eq!(next_maximize(other, W, false, true), MaximizeState::Monitor(W));
 }
+
+// ---- idle_timer_delay ----
+
+use crate::config::IdleConfig;
+use crate::state::idle_timer_delay;
+use std::time::Duration;
+
+fn idle_cfg(enabled: bool, screen_off_seconds: u64) -> IdleConfig {
+    IdleConfig { enabled, screen_off_seconds }
+}
+
+#[test]
+fn idle_timer_disarms_while_screen_already_off() {
+    let cfg = idle_cfg(true, 600);
+    assert_eq!(idle_timer_delay(true, false, &cfg, Duration::ZERO), None);
+}
+
+#[test]
+fn idle_timer_disarms_while_inhibited() {
+    let cfg = idle_cfg(true, 600);
+    assert_eq!(idle_timer_delay(false, true, &cfg, Duration::ZERO), None);
+}
+
+#[test]
+fn idle_timer_disarms_when_disabled() {
+    let cfg = idle_cfg(false, 600);
+    assert_eq!(idle_timer_delay(false, false, &cfg, Duration::ZERO), None);
+}
+
+#[test]
+fn idle_timer_disarms_at_zero_seconds_even_when_enabled() {
+    let cfg = idle_cfg(true, 0);
+    assert_eq!(idle_timer_delay(false, false, &cfg, Duration::ZERO), None);
+}
+
+#[test]
+fn idle_timer_arms_full_timeout_with_no_elapsed_time() {
+    let cfg = idle_cfg(true, 600);
+    assert_eq!(idle_timer_delay(false, false, &cfg, Duration::ZERO), Some(Duration::from_secs(600)));
+}
+
+#[test]
+fn idle_timer_arms_remaining_time_after_partial_elapse() {
+    let cfg = idle_cfg(true, 600);
+    let elapsed = Duration::from_secs(400);
+    assert_eq!(idle_timer_delay(false, false, &cfg, elapsed), Some(Duration::from_secs(200)));
+}
+
+// Config hot-reload shortening the timeout below the already-elapsed idle
+// duration must fire almost immediately, not wait out a fresh full timeout --
+// `saturating_sub` clamps to zero rather than underflowing/panicking.
+#[test]
+fn idle_timer_clamps_to_zero_when_already_past_the_new_shorter_timeout() {
+    let cfg = idle_cfg(true, 60);
+    let elapsed = Duration::from_secs(600);
+    assert_eq!(idle_timer_delay(false, false, &cfg, elapsed), Some(Duration::ZERO));
+}
+
+// screen_off and idle_inhibited are independent guards -- both set still
+// disarms (order/precedence should not matter).
+#[test]
+fn idle_timer_disarms_when_both_screen_off_and_inhibited() {
+    let cfg = idle_cfg(true, 600);
+    assert_eq!(idle_timer_delay(true, true, &cfg, Duration::ZERO), None);
+}
+
+// ---- any_off / all_off (Phase 3: per-output power state) ----
+
+use crate::state::{all_off, any_off};
+
+fn statuses(pairs: &[(&str, bool)]) -> Vec<(String, bool)> {
+    pairs.iter().map(|(n, off)| (n.to_string(), *off)).collect()
+}
+
+#[test]
+fn any_off_is_false_with_no_outputs() {
+    assert!(!any_off(&statuses(&[])));
+}
+
+#[test]
+fn any_off_is_false_when_every_output_is_on() {
+    assert!(!any_off(&statuses(&[("DP-3", false), ("HDMI-A-1", false)])));
+}
+
+#[test]
+fn any_off_is_true_when_one_of_several_outputs_is_off() {
+    assert!(any_off(&statuses(&[("DP-3", true), ("HDMI-A-1", false)])));
+}
+
+#[test]
+fn all_off_is_false_with_no_outputs() {
+    // Deliberately not vacuously true -- nothing to call "blanked" yet.
+    assert!(!all_off(&statuses(&[])));
+}
+
+#[test]
+fn all_off_is_false_when_only_some_outputs_are_off() {
+    assert!(!all_off(&statuses(&[("DP-3", true), ("HDMI-A-1", false)])));
+}
+
+#[test]
+fn all_off_is_true_only_when_every_output_is_off() {
+    assert!(all_off(&statuses(&[("DP-3", true), ("HDMI-A-1", true)])));
+}
+
+// The idle timer must keep counting down while any output is still lit
+// (its job -- blank everything -- isn't done), but wake-on-input must fire
+// as soon as even one output is dark. Same input, deliberately different
+// answers -- this is the crux of the Phase 3 any-vs-all split.
+#[test]
+fn any_and_all_diverge_on_a_partially_off_multi_monitor_setup() {
+    let mixed = statuses(&[("DP-3", true), ("HDMI-A-1", false)]);
+    assert!(any_off(&mixed), "wake-on-input should still have something to wake");
+    assert!(!all_off(&mixed), "idle timer should still be counting down");
+}

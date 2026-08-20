@@ -269,6 +269,13 @@ pub(crate) struct SurfaceData {
     /// `set_hdr_output_properties` / `set_sdr_output_properties` directly.
     /// `None` at bringup so the first frame always applies.
     applied_connector_hdr: Option<bool>,
+    /// Authoritative per-output screen power state (Phase 3 -- was a single
+    /// `RubixState::screen_off` global in Phase 1, moved here so one output
+    /// can be off while another stays lit). `true` = CRTC atomically disabled
+    /// (`set_screen_power`'s off path). `RubixState::any_output_off`/
+    /// `all_outputs_off` derive their answer by reading this across every
+    /// surface rather than tracking a second, independently-mutable copy.
+    pub(crate) power_off: bool,
     /// Whether the previous frame's primary-plane scanout attempt promoted
     /// (direct scanout) or fell back to composite. Tracked so the
     /// direct-scanout diagnostic in `render_surface` logs only on change.
@@ -946,6 +953,7 @@ fn connector_connected(
             hdr_encode_damage: DamageBag::default(),
             hdr_last_nits: None,
             applied_connector_hdr: None,
+            power_off: false,
             last_scanout_promoted: None,
             last_scanout_candidate: None,
             dmabuf_feedback,
@@ -1171,6 +1179,10 @@ fn connector_disconnected(
     if let Some(global) = surface.global {
         data.display_handle.remove_global::<RubixState>(global);
     }
+    // wlr-output-power: any live `zwlr_output_power_v1` bound to this output
+    // is now dangling hardware -- fail it per protocol ("The output
+    // disappeared") rather than leaving it silently stale.
+    crate::output_power::output_removed(data, &surface.output.name());
     tracing::info!("connector on {crtc:?} disconnected from {node}");
 }
 
@@ -1193,6 +1205,17 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, cr
         return;
     };
     let render_node = backend.render_node;
+
+    // Screen powered off (see `set_screen_power`): this CRTC is disabled, so
+    // there is nothing to scan out and no reason to keep rendering into a dark
+    // panel. Checked per-surface (not against a global flag) -- one output
+    // being off must not stop a still-lit output from rendering. Bail without
+    // rescheduling -- the render loop for this crtc stays fully quiet until
+    // `set_screen_power(.., true)` wakes it back up with its own
+    // `schedule_render` call.
+    if backend.surfaces.get(&crtc).is_some_and(|s| s.power_off) {
+        return;
+    }
 
     // Acquire the renderer (zero-copy on single GPU; copy across GPUs otherwise).
     let mut renderer = if primary == render_node {
@@ -2447,6 +2470,113 @@ pub(crate) fn nudge_all_renders(udev: &Rc<RefCell<UdevData>>) {
     }
 }
 
+/// Power one output (`output_name = Some(name)`), or every output
+/// (`output_name = None`, the idle timer's and CLI's "all" case), on this
+/// backend on or off. This is a real DPMS-equivalent (the panel is OLED -- a
+/// black-filled framebuffer left it lit), not a software blank: off
+/// atomically disables the CRTC via `DrmCompositor::clear` (resets every
+/// plane, disables the connectors, disables the crtc -- `ACTIVE=0` -- in one
+/// atomic commit); on resets the swapchain's buffer ages (forcing full damage
+/// on the next frame instead of trusting stale age tracking against a panel
+/// that was just dark) and clears the surface's cached `applied_connector_hdr`
+/// (plus `hdr_damage_tracker`), which makes `render_surface` treat the next
+/// frame as a color-state change and re-run
+/// `set_hdr_output_properties`/`set_sdr_output_properties` through its normal
+/// compare-and-apply path -- no separate resume path, same one the initial
+/// modeset and the HDR toggle already use. `DrmCompositor::clear`'s own doc
+/// comment: "Calling queue_frame will re-enable", which is exactly what the
+/// scheduled render below does.
+///
+/// Per-surface `power_off` (see `SurfaceData`) is the sole authority on power
+/// state -- idempotent by construction: a surface already in the requested
+/// state is skipped and does not appear in the returned list. Callers
+/// (`RubixState::set_screen_power`) use an empty return to know nothing
+/// actually changed, so they don't re-arm the idle timer or emit a spurious
+/// wlr-output-power `mode` event for a no-op call.
+pub(crate) fn set_screen_power(
+    udev: &Rc<RefCell<UdevData>>,
+    on: bool,
+    output_name: Option<&str>,
+) -> Vec<(Output, bool)> {
+    let mut changed: Vec<(Output, bool)> = Vec::new();
+    let mut wake_targets: Vec<(DrmNode, crtc::Handle)> = Vec::new();
+    {
+        let mut guard = udev.borrow_mut();
+        for (node, backend) in guard.backends.iter_mut() {
+            for (crtc, surface) in backend.surfaces.iter_mut() {
+                if let Some(name) = output_name {
+                    if surface.output.name() != name {
+                        continue;
+                    }
+                }
+                // Pulled out as a pure function (`power_transition`, below)
+                // purely so this decision is unit-testable without a real
+                // DRM device -- see the `#[cfg(test)] mod tests` at the
+                // bottom of this file.
+                let Some(new_power_off) = power_transition(surface.power_off, on) else {
+                    continue;
+                };
+                if on {
+                    surface.drm_output.with_compositor(|comp| comp.reset_buffer_ages());
+                    surface.applied_connector_hdr = None;
+                    // The HDR encode path keeps its own damage tracker, separate
+                    // from the swapchain buffer ages reset above. It survived the
+                    // blank still believing the last frame's elements are on
+                    // screen, so `damage_output` would report nothing to do and
+                    // skip the encode on the first frame back. Dropping it makes
+                    // the `get_or_insert_with` in `render_surface` rebuild a fresh
+                    // tracker, which reports full damage.
+                    surface.hdr_damage_tracker = None;
+                    surface.power_off = new_power_off;
+                    wake_targets.push((*node, *crtc));
+                } else {
+                    if let Err(e) = surface.drm_output.with_compositor(|comp| comp.clear()) {
+                        tracing::warn!("screen power off: failed to clear {crtc:?}: {e}");
+                        continue;
+                    }
+                    surface.power_off = new_power_off;
+                }
+                changed.push((surface.output.clone(), surface.power_off));
+            }
+        }
+    }
+
+    for (node, crtc) in wake_targets {
+        schedule_render(udev, node, crtc, Duration::ZERO);
+    }
+    changed
+}
+
+/// Pure per-output power-transition policy: given the surface's current
+/// `power_off` and the requested `on`, should anything change, and to what?
+/// `None` means "already in the requested state" -- the idempotent no-op
+/// path `set_screen_power` uses to skip a surface without touching DRM or
+/// reporting a spurious transition. `on` and `power_off` are meant to be
+/// logical opposites when matched (`on = true` <=> `power_off = false`), so
+/// a mismatch is exactly the "needs to change" case.
+fn power_transition(currently_off: bool, on: bool) -> Option<bool> {
+    let matches_already = currently_off != on;
+    if matches_already {
+        None
+    } else {
+        Some(!on)
+    }
+}
+
+/// Every known output's `(name, is_off)`, read fresh from `SurfaceData::
+/// power_off` -- the single per-output source of truth `set_screen_power`
+/// above writes to. Backs `RubixState::output_power_status`
+/// (`any_output_off`/`all_outputs_off`/`output_is_off`) and
+/// `ipc::Request::ScreenStatus`.
+pub(crate) fn output_power_status(udev: &Rc<RefCell<UdevData>>) -> Vec<(String, bool)> {
+    udev.borrow()
+        .backends
+        .values()
+        .flat_map(|backend| backend.surfaces.values())
+        .map(|surface| (surface.output.name(), surface.power_off))
+        .collect()
+}
+
 /// Arm a one-shot timer that renders `(node, crtc)` after `delay`. All render
 /// entry points funnel through here so the borrow discipline stays in one place.
 /// The timer closure captures its own `udev` clone and reaches `&mut RubixState`
@@ -2593,5 +2723,30 @@ fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData, states
                  is the likelier fix than anything in KMS.",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod power_transition_tests {
+    use super::power_transition;
+
+    #[test]
+    fn already_on_and_requesting_on_is_a_noop() {
+        assert_eq!(power_transition(false, true), None);
+    }
+
+    #[test]
+    fn already_off_and_requesting_off_is_a_noop() {
+        assert_eq!(power_transition(true, false), None);
+    }
+
+    #[test]
+    fn off_requesting_on_transitions_to_powered_on() {
+        assert_eq!(power_transition(true, true), Some(false));
+    }
+
+    #[test]
+    fn on_requesting_off_transitions_to_powered_off() {
+        assert_eq!(power_transition(false, false), Some(true));
     }
 }

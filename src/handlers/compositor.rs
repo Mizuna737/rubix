@@ -119,6 +119,20 @@ impl CompositorHandler for RubixState {
         }
         resize_grab::handle_commit(&mut self.space, surface);
     }
+
+    // Safety net for idle-inhibit-unstable-v1: Smithay's own dispatch only
+    // calls `IdleInhibitHandler::uninhibit` on an explicit
+    // `zwp_idle_inhibitor_v1.destroy` request (see handlers/idle.rs's doc
+    // comment). `CompositorHandler::destroyed` fires for a `wl_surface` on
+    // EVERY teardown path -- explicit `wl_surface.destroy`, and every surface
+    // owned by a client that disconnects or crashes -- so purging by surface
+    // identity here catches exactly the case an explicit-destroy-only handler
+    // misses: a dead client that never got to send `destroy` at all.
+    fn destroyed(&mut self, surface: &WlSurface) {
+        if self.idle_inhibitors.remove(surface) {
+            self.sync_idle_inhibited();
+        }
+    }
 }
 
 impl BufferHandler for RubixState {

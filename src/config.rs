@@ -50,6 +50,25 @@ pub struct Config {
     /// Border appearance. Live/hot-reloadable like the rest of the config;
     /// the render path reads it fresh every frame.
     pub decoration: DecorationConfig,
+
+    /// Self-contained idle screen-off timer -- Rubix's own DPMS-equivalent,
+    /// independent of any external daemon (gestureControl, swayidle, ...).
+    /// Live/hot-reloadable: `RubixState::reload_config` re-arms the idle
+    /// timer against the new `screen_off_seconds` immediately.
+    pub idle: IdleConfig,
+}
+
+/// Resolved `[idle]`. See `config/default.toml` for the on-disk defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IdleConfig {
+    /// Master switch. `false` disables the timer outright, independent of
+    /// `screen_off_seconds`.
+    pub enabled: bool,
+    /// Seconds of no keyboard/pointer activity before Rubix powers every
+    /// output off. `0` disables the timer regardless of `enabled` -- treated
+    /// as "no timeout" rather than "blank instantly", matching how `0` reads
+    /// as "off" for `border_width`/`corner_radius` above.
+    pub screen_off_seconds: u64,
 }
 
 /// Resolved placement for one physical output, matched by connector name
@@ -127,6 +146,11 @@ struct RawConfig {
     // manually in resolve(), not deserialized directly.
     #[serde(default)]
     output: Vec<RawOutput>,
+    // Optional section: a config omitting [idle] gets the defaults below
+    // (enabled, 600s) -- so a fresh install blanks its OLED panel out of the
+    // box with no separate setup.
+    #[serde(default)]
+    idle: RawIdle,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +200,30 @@ struct RawInput {
     // focus-follows-mouse changes what every keystroke does, so it is opt-in.
     #[serde(default)]
     focus_follows_mouse: bool,
+}
+
+// Optional section: a config omitting `[idle]` parses fine, taking the
+// defaults below (enabled, 600s) -- see `IdleConfig`'s doc comment.
+#[derive(Deserialize)]
+struct RawIdle {
+    #[serde(default = "default_idle_enabled")]
+    enabled: bool,
+    #[serde(default = "default_screen_off_seconds")]
+    screen_off_seconds: u64,
+}
+
+impl Default for RawIdle {
+    fn default() -> Self {
+        RawIdle { enabled: default_idle_enabled(), screen_off_seconds: default_screen_off_seconds() }
+    }
+}
+
+fn default_idle_enabled() -> bool {
+    true
+}
+
+fn default_screen_off_seconds() -> u64 {
+    600
 }
 
 fn default_duration_ms() -> u64 {
@@ -243,6 +291,10 @@ impl Config {
             sdr_white_nits: raw.sdr_white_nits.clamp(80.0, 300.0),
             focus_follows_mouse: raw.input.focus_follows_mouse,
             decoration: resolve_decoration(raw.decoration),
+            idle: IdleConfig {
+                enabled: raw.idle.enabled,
+                screen_off_seconds: raw.idle.screen_off_seconds,
+            },
         }
     }
 

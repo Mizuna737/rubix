@@ -19,6 +19,21 @@ startup = [
 # are clamped. Omitting the key defaults to 203 (BT.2408 reference SDR white).
 sdr_white_nits = 203.0
 
+# Self-contained idle screen-off timer -- Rubix's own DPMS-equivalent, with no
+# external daemon required. Powers every output off (real CRTC disable, not a
+# black-filled framebuffer -- correct for OLED panels) after this many seconds
+# of no keyboard/pointer activity, and back on on the next input. Held off
+# while any client holds an idle-inhibit (idle-inhibit-unstable-v1) lock, e.g.
+# a fullscreen video player or a Teams call.
+# Live/hot-reloadable: editing and saving re-arms the timer immediately.
+[idle]
+# Master switch. Optional section: omitting [idle] entirely takes these
+# defaults (a fresh install blanks its screen out of the box).
+enabled = true
+# Seconds of no activity before the screen powers off. 0 disables the timer
+# regardless of `enabled`.
+screen_off_seconds = 600
+
 [layout]
 # Number of columns instantiated on the monitor at startup.
 # Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.

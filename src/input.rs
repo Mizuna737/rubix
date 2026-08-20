@@ -74,6 +74,52 @@ enum KeyAction {
 
 impl RubixState {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // Single activity signal, computed once, feeding two independent
+        // consumers below: phase-1's screen wake, and phase-2's idle timer /
+        // ext-idle-notify (`notify_activity` bumps `last_activity`, pings
+        // ext-idle-notify listeners, and re-arms the idle timeout -- see
+        // state.rs). `InputEvent::DeviceAdded`/`DeviceRemoved` never reach
+        // here -- the udev libinput source filters those out before calling
+        // `process_input_event` (see src/udev.rs) specifically so a hotplug
+        // counts as neither a wake nor idle-timer activity.
+        let is_activity = matches!(
+            &event,
+            InputEvent::Keyboard { .. }
+                | InputEvent::PointerMotion { .. }
+                | InputEvent::PointerMotionAbsolute { .. }
+                | InputEvent::PointerButton { .. }
+                | InputEvent::PointerAxis { .. }
+        );
+
+        if is_activity {
+            self.notify_activity();
+        }
+
+        // Keyboard/pointer-button *presses* that cause the wake are consumed
+        // (returned early, never forwarded) so waking never types a character
+        // into whatever had focus or clicks whatever was under the cursor.
+        // Motion and axis events, and button/key releases, fall through to the
+        // normal dispatch below unchanged.
+        //
+        // Phase 3 policy: wake turns ON EVERY output that is off, regardless
+        // of which one (or why) -- `set_screen_power(true, None)` is "all
+        // outputs", not just whichever one the cursor happens to be over. A
+        // user must never end up unable to recover a dark panel from the
+        // keyboard just because it was a client's `set_mode(Off)` that put
+        // it there, not the idle timer.
+        if self.any_output_off() && is_activity {
+            self.set_screen_power(true, None);
+
+            let consume_press = match &event {
+                InputEvent::Keyboard { event, .. } => event.state() == KeyState::Pressed,
+                InputEvent::PointerButton { event, .. } => event.state() == ButtonState::Pressed,
+                _ => false,
+            };
+            if consume_press {
+                return;
+            }
+        }
+
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();

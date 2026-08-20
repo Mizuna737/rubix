@@ -15,6 +15,7 @@ use smithay::{
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction},
         wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1,
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
@@ -326,6 +327,52 @@ pub struct RubixState {
     // (required -- see that impl's doc comment). Cloned from `event_loop.handle()`
     // at construction; calloop's `LoopHandle` is itself a cheap `Rc`-backed clone.
     pub(crate) loop_handle: LoopHandle<'static, RubixState>,
+
+    // ---- Idle timer / idle-inhibit / ext-idle-notify (Phase 2) ----
+    //
+    // `last_activity` is the single clock all three consult: `notify_activity`
+    // (called from `input.rs::process_input_event` for every keyboard/pointer
+    // event, screen on or off) stamps it, `idle_notifier_state.notify_activity`
+    // pings ext-idle-notify listeners off the same call, and `rearm_idle_timer`
+    // computes the next timeout's delay from it -- one signal feeding every
+    // consumer, not a second parallel clock.
+    pub(crate) last_activity: std::time::Instant,
+    // The pending idle-timeout calloop timer, if one is armed. `None` while
+    // disarmed (screen already off, idle disabled/`screen_off_seconds == 0`,
+    // or an inhibitor is held) -- see `rearm_idle_timer`.
+    pub(crate) idle_timer: Option<smithay::reexports::calloop::RegistrationToken>,
+    // Surfaces currently holding a live `zwp_idle_inhibitor_v1`. A `HashSet`
+    // rather than a count: a client destroying its *wl_surface* without ever
+    // sending the inhibitor's `destroy` request (crash, or just sloppy
+    // teardown order) must still release cleanly -- see
+    // `CompositorHandler::destroyed` in handlers/compositor.rs, which purges
+    // by surface identity.
+    pub(crate) idle_inhibitors: HashSet<WlSurface>,
+    // Mirrors `!idle_inhibitors.is_empty()`, kept as its own field (rather
+    // than recomputed) so `sync_idle_inhibited` can short-circuit on no
+    // change instead of always re-pushing to `idle_notifier_state`.
+    pub(crate) idle_inhibited: bool,
+    // Never read after construction, same reasoning as `presentation_state`
+    // above: holding it IS its purpose (owns the `zwp_idle_inhibit_manager_v1`
+    // global's `GlobalId` -- dropping this would tear the global down).
+    #[allow(dead_code)]
+    pub(crate) idle_inhibit_manager_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState,
+    pub(crate) idle_notifier_state: smithay::wayland::idle_notify::IdleNotifierState<RubixState>,
+
+    // ---- Screen power / wlr-output-power-management-v1 (Phase 3) ----
+    //
+    // Authoritative power state moved to per-output (`udev::SurfaceData::
+    // power_off`) in Phase 3 -- a single `screen_off: bool` here could not
+    // represent "DP-3 off, HDMI-A-1 on". `any_output_off`/`all_outputs_off`
+    // below derive their answer by reading every surface fresh each call, so
+    // there is no second copy that could drift from the per-output truth.
+    // Semantics (deliberately asymmetric, see `input.rs`/`rearm_idle_timer`):
+    //   - wake-on-input turns ON every output that is off, regardless of why.
+    //   - the idle timer disarms only once EVERY output is off.
+    /// Bound `zwlr_output_power_v1` control objects, one per output at most
+    /// (see output_power.rs's module doc for the one-object-per-output rule
+    /// and its crash-safety guarantee).
+    pub(crate) output_power: HashMap<String, ZwlrOutputPowerV1>,
 }
 
 impl RubixState {
@@ -342,6 +389,11 @@ impl RubixState {
         let presentation_state =
             PresentationState::new::<RubixState>(&dh, <Monotonic as ClockSource>::ID as u32);
         let color_management_state = crate::color_management::init(&dh);
+        let idle_inhibit_manager_state =
+            smithay::wayland::idle_inhibit::IdleInhibitManagerState::new::<Self>(&dh);
+        let idle_notifier_state =
+            smithay::wayland::idle_notify::IdleNotifierState::<Self>::new(&dh, loop_handle.clone());
+        crate::output_power::init(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let relative_pointer_manager_state = RelativePointerManagerState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
@@ -407,7 +459,7 @@ impl RubixState {
         let sdr_white_nits = config.sdr_white_nits.clamp(80.0, 300.0);
         let focus_follows_mouse = config.focus_follows_mouse;
 
-        Self {
+        let mut state = Self {
             start_time,
             display_handle: dh,
 
@@ -467,7 +519,20 @@ impl RubixState {
             presentation_state,
             color_management_state,
             loop_handle,
-        }
+
+            last_activity: start_time,
+            idle_timer: None,
+            idle_inhibitors: HashSet::new(),
+            idle_inhibited: false,
+            idle_inhibit_manager_state,
+            idle_notifier_state,
+            output_power: HashMap::new(),
+        };
+        // Arm the idle timer from a cold start too -- a session nobody has
+        // touched yet should still blank at `screen_off_seconds`, not only
+        // after the first real activity re-arms it.
+        state.rearm_idle_timer();
+        state
     }
 
     /// Force a repaint so a queued screencopy capture is serviced. The udev
@@ -505,6 +570,176 @@ impl RubixState {
                 self.hdr_outputs.remove(&output.name());
             }
             self.color_management_state.output_description_changed(&output);
+        }
+    }
+
+    /// True if `name` is a known udev output that is currently powered off.
+    /// `false` (not "unknown") for a name that doesn't match anything --
+    /// callers that need to distinguish "off" from "no such output" (there
+    /// are none today) would need a different signature. Always `false` on
+    /// winit (no real CRTCs to power down).
+    pub(crate) fn output_is_off(&self, name: &str) -> bool {
+        self.output_power_status().into_iter().any(|(n, off)| n == name && off)
+    }
+
+    /// True if AT LEAST ONE known output is currently powered off. Drives
+    /// wake-on-input (`input.rs`): per the Phase 3 policy, input wakes EVERY
+    /// off output regardless of why it was off, so the wake check only needs
+    /// to know "is there anything to wake at all".
+    pub(crate) fn any_output_off(&self) -> bool {
+        any_off(&self.output_power_status())
+    }
+
+    /// True only if EVERY known output is currently powered off. Drives the
+    /// idle timer's disarm guard (`idle_timer_delay`'s `screen_off` param) --
+    /// per the Phase 3 policy, the timer keeps counting down as long as any
+    /// output is still lit, since its job (blank everything) isn't done yet.
+    /// `false` -- not vacuously `true` -- when there are no known outputs at
+    /// all (nothing has connected yet, or winit): there is nothing to call
+    /// "blanked" in that case.
+    pub(crate) fn all_outputs_off(&self) -> bool {
+        all_off(&self.output_power_status())
+    }
+
+    /// Every known output's current power state, `(name, is_off)`. Backs the
+    /// three predicates above and `ipc::Request::ScreenStatus`. On winit
+    /// (`udev_handle` is `None`) this lists every mapped output as always on
+    /// -- there are no real CRTCs to power down there, matching Phase 1/2's
+    /// blanket no-op semantics for that backend.
+    pub(crate) fn output_power_status(&self) -> Vec<(String, bool)> {
+        let Some(udev) = &self.udev_handle else {
+            return self.space.outputs().map(|o| (o.name(), false)).collect();
+        };
+        crate::udev::output_power_status(udev)
+    }
+
+    /// DPMS-equivalent screen power for one output (`output_name = Some(name)`)
+    /// or every output (`output_name = None` -- the idle timer's and the CLI's
+    /// "all" case), driven by `ipc::Request::SetScreenPower`, `input.rs`'s wake
+    /// hook, and `output_power.rs`'s own `set_mode` handler. No-op on winit --
+    /// `udev_handle` is `None` there, so there are no real CRTCs to power down.
+    /// See `crate::udev::set_screen_power` for the actual DRM atomic-commit
+    /// work; per-output truth lives entirely there (`SurfaceData::power_off`),
+    /// never duplicated here.
+    ///
+    /// Returns the outputs that actually transitioned (matches
+    /// `udev::set_screen_power`'s return) -- empty means every targeted
+    /// output already matched `on`, in which case this deliberately skips
+    /// re-arming the idle timer and emitting a `mode` event: a no-op request
+    /// must produce no observable side effect.
+    pub(crate) fn set_screen_power(&mut self, on: bool, output_name: Option<&str>) -> Vec<(Output, bool)> {
+        let Some(udev) = self.udev_handle.clone() else {
+            return Vec::new();
+        };
+        let changed = crate::udev::set_screen_power(&udev, on, output_name);
+        if changed.is_empty() {
+            return changed;
+        }
+
+        if on {
+            // Any power-on -- input wake, an explicit IPC/CLI call, or a
+            // client's own `set_mode(on)` -- restarts the idle countdown.
+            // Without this, waking a stale-idle session could have the timer
+            // fire again on the very next tick.
+            self.last_activity = std::time::Instant::now();
+        }
+        // Re-arm unconditionally, not just on wake: turning an output off
+        // might now mean every output is off (see `idle_timer_delay`'s
+        // `all_outputs_off` guard), in which case this cancels the timer;
+        // otherwise it's a cheap recompute against the (possibly still
+        // ticking) elapsed time, same as the idle-inhibit-release path.
+        self.rearm_idle_timer();
+
+        // wlr-output-power: tell every bound client about every transition,
+        // regardless of what caused it -- see output_power.rs's module doc
+        // for why this has to be unconditional here rather than left to
+        // individual call sites to remember.
+        crate::output_power::notify_power_changed(self, &changed);
+        changed
+    }
+
+    /// Single activity signal for the idle subsystem: called from
+    /// `input.rs::process_input_event` for every keyboard/pointer event
+    /// (screen on or off). Stamps `last_activity`, pings ext-idle-notify
+    /// listeners, and re-arms the idle timeout -- the one clock phase-1's
+    /// wake hook, the idle timer, and ext-idle-notify all read.
+    pub(crate) fn notify_activity(&mut self) {
+        self.last_activity = std::time::Instant::now();
+        let seat = self.seat.clone();
+        self.idle_notifier_state.notify_activity(&seat);
+        self.rearm_idle_timer();
+    }
+
+    /// (Re)arm the idle-timeout calloop timer against the current config and
+    /// `last_activity`, first dropping whatever was previously armed. Refuses
+    /// to arm (leaves `idle_timer` as `None`) while the screen is already
+    /// off, idle is disabled or timed out to `0`, or an inhibitor is held --
+    /// `idle_timer_delay` holds that policy as a pure function so it's
+    /// unit-testable without a real calloop loop (see state_tests.rs).
+    ///
+    /// Computing the delay from *elapsed* time since `last_activity`, rather
+    /// than always arming the full timeout, is what makes config hot-reload
+    /// correct: `reload_config` calls this after swapping in a new
+    /// `screen_off_seconds`, and if the session has already been idle longer
+    /// than the new (shorter) timeout, this arms a near-immediate fire
+    /// instead of waiting out a full fresh timeout.
+    pub(crate) fn rearm_idle_timer(&mut self) {
+        if let Some(token) = self.idle_timer.take() {
+            self.loop_handle.remove(token);
+        }
+        let Some(delay) = idle_timer_delay(
+            self.all_outputs_off(),
+            self.idle_inhibited,
+            &self.config.idle,
+            self.last_activity.elapsed(),
+        ) else {
+            return;
+        };
+        let loop_handle = self.loop_handle.clone();
+        let timer = if delay.is_zero() {
+            smithay::reexports::calloop::timer::Timer::immediate()
+        } else {
+            smithay::reexports::calloop::timer::Timer::from_duration(delay)
+        };
+        let token = loop_handle.insert_source(timer, move |_, _, data| {
+            // Guarded again here (not just at arm time): an inhibitor taken
+            // out, or the screen already turned off some other way, between
+            // arming and firing must not blank it a second time / redundantly.
+            if !data.all_outputs_off() && !data.idle_inhibited {
+                tracing::info!(
+                    "idle timeout ({}s) reached; powering every output off",
+                    data.config.idle.screen_off_seconds,
+                );
+                data.set_screen_power(false, None);
+            }
+            data.idle_timer = None;
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        });
+        self.idle_timer = token.ok();
+    }
+
+    /// Recompute `idle_inhibited` from `idle_inhibitors` and, on change,
+    /// propagate it to `idle_notifier_state` (so ext-idle-notify clients --
+    /// swayidle, hypridle -- observe the same inhibit state Rubix itself
+    /// acts on) and either cancel or restart the idle timer.
+    pub(crate) fn sync_idle_inhibited(&mut self) {
+        let inhibited = !self.idle_inhibitors.is_empty();
+        if inhibited == self.idle_inhibited {
+            return;
+        }
+        self.idle_inhibited = inhibited;
+        self.idle_notifier_state.set_is_inhibited(inhibited);
+        if inhibited {
+            if let Some(token) = self.idle_timer.take() {
+                self.loop_handle.remove(token);
+            }
+        } else {
+            // Inhibitor released: count idle time from now, not from
+            // whatever `last_activity` was before the inhibitor was taken --
+            // otherwise releasing a long-held inhibitor could blank the
+            // screen instantly.
+            self.last_activity = std::time::Instant::now();
+            self.rearm_idle_timer();
         }
     }
 
@@ -785,6 +1020,13 @@ impl RubixState {
         // Re-seeded like sdr_white_nits: a config edit wins over a runtime
         // toggle, so saving the file is always the way back to a known state.
         self.focus_follows_mouse = self.config.focus_follows_mouse;
+        // Live like the rest: a changed `screen_off_seconds` (or `enabled`)
+        // re-arms the idle timer immediately, computed against the same
+        // `last_activity` -- so shortening the timeout below the current idle
+        // duration fires it almost immediately rather than waiting a full
+        // fresh interval, and disabling it (or setting `0`) cancels outright.
+        self.config.idle = new.idle;
+        self.rearm_idle_timer();
         tracing::info!("reloaded config: {count} keybinds active");
         // Force a repaint so an sdr_white_nits edit is visible immediately,
         // same reasoning as the keybind path in dispatch_nav below.
@@ -1726,6 +1968,38 @@ where
         }
     }
     out
+}
+
+/// Pure policy backing `RubixState::any_output_off`: true if any listed
+/// output is off. Split out (mirroring `idle_timer_delay` below) so the
+/// any/all distinction between wake-on-input and the idle timer's disarm
+/// guard is unit-testable without a real udev backend -- see state_tests.rs.
+fn any_off(statuses: &[(String, bool)]) -> bool {
+    statuses.iter().any(|(_, off)| *off)
+}
+
+/// Pure policy backing `RubixState::all_outputs_off`. Deliberately `false`,
+/// not vacuously `true`, on an empty list -- see that method's doc comment.
+fn all_off(statuses: &[(String, bool)]) -> bool {
+    !statuses.is_empty() && statuses.iter().all(|(_, off)| *off)
+}
+
+/// Pure policy for `RubixState::rearm_idle_timer`: given the current guard
+/// conditions and how long it's been since the last activity, how much
+/// longer (if any) the idle timer should wait before firing. `None` means
+/// stay disarmed. Split out purely so this decision is unit-testable without
+/// a real calloop event loop -- see state_tests.rs.
+fn idle_timer_delay(
+    screen_off: bool,
+    idle_inhibited: bool,
+    idle: &crate::config::IdleConfig,
+    elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if screen_off || idle_inhibited || !idle.enabled || idle.screen_off_seconds == 0 {
+        return None;
+    }
+    let timeout = std::time::Duration::from_secs(idle.screen_off_seconds);
+    Some(timeout.saturating_sub(elapsed))
 }
 
 /// Bounding box of every on-screen tile belonging to `ids`.
