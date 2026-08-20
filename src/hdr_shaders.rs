@@ -258,13 +258,6 @@ pub struct HdrShaders {
     /// [`DECODE_WINDOWS_SCRGB`].
     pub decode_windows_scrgb: GlesTexProgram,
     pub encode: GlesTexProgram,
-    /// Tone-mapping encode for capture targets. See [`ENCODE_LINEAR_TO_SDR`].
-    ///
-    /// Compiled but not yet wired: screencopy and the ScreenCast portal both still
-    /// re-render surfaces in SDR rather than tone-mapping the HDR composite, so
-    /// nothing reads this yet. It is the shader HDR Phase 4a needs.
-    #[allow(dead_code)]
-    pub encode_sdr: GlesTexProgram,
 }
 
 /// Compile all HDR shaders against the given `GlesRenderer`. Call once
@@ -279,16 +272,11 @@ pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, Gl
     let decode_windows_scrgb =
         renderer.compile_custom_texture_shader(DECODE_WINDOWS_SCRGB, &[])?;
     let encode = renderer.compile_custom_texture_shader(ENCODE_LINEAR_TO_PQ, &[])?;
-    let encode_sdr = renderer.compile_custom_texture_shader(
-        ENCODE_LINEAR_TO_SDR,
-        &[UniformName::new("sdr_white_nits", UniformType::_1f)],
-    )?;
     Ok(HdrShaders {
         decode_sdr,
         decode_hdr_pq,
         decode_windows_scrgb,
         encode,
-        encode_sdr,
     })
 }
 
@@ -335,8 +323,8 @@ pub fn sdr_solid_transform(sdr_white_nits: f32) -> impl Fn(Color32F) -> Color32F
     move |color| srgb_to_bt2020_abs10k(color, sdr_white_nits)
 }
 
-/// Encode pass for **capture**: linear BT.2020 / 10000-nit working space down to
-/// 8-bit sRGB, tone-mapped rather than clipped.
+/// Shared tail for the **capture** tone-map shaders: linear BT.709, already
+/// scaled so 1.0 == SDR white, down to 8-bit sRGB.
 ///
 /// The display encode ([`ENCODE_LINEAR_TO_PQ`]) hands the panel absolute
 /// luminance and lets it do the work. A screenshot or a screenshare has no such
@@ -345,9 +333,9 @@ pub fn sdr_solid_transform(sdr_white_nits: f32) -> impl Fn(Color32F) -> Color32F
 /// clipping is what makes captured HDR look like a blown-out white sky, which is
 /// the specific failure this exists to avoid.
 ///
-/// Order matters. Primaries first (a linear 3x3, safe to do before tone-mapping),
-/// then the luminance rolloff, then the sRGB OETF last -- tone-mapping after the
-/// OETF would be operating on perceptual values and crush midtones.
+/// Order matters. Primaries first (a linear 3x3, done by the caller before this
+/// tail), then the luminance rolloff, then the sRGB OETF last -- tone-mapping
+/// after the OETF would be operating on perceptual values and crush midtones.
 ///
 /// The curve is a **soft knee**, not global Reinhard. Global Reinhard maps SDR
 /// white (v = 1.0) to ~0.55, which is correct when tone-mapping a wholly-HDR
@@ -358,53 +346,127 @@ pub fn sdr_solid_transform(sdr_white_nits: f32) -> impl Fn(Color32F) -> Color32F
 /// So: identity below `KNEE`, and above it an exponential that is C1-continuous
 /// at the join (its slope is exactly 1 there) and asymptotic to 1.0. Ordinary
 /// content passes through untouched; only genuine highlights compress.
-pub const ENCODE_LINEAR_TO_SDR: &str = r#"
-#version 100
-
-//_DEFINES_
-
-precision highp float;
-uniform sampler2D tex;
-uniform float alpha;
-uniform float sdr_white_nits;
-varying vec2 v_coords;
-
-// Inverse of DECODE_SDR's matrix: BT.2020 -> BT.709, linear-light, column-major.
-const mat3 BT2020_TO_BT709 = mat3(
-     1.660491000, -0.124550000, -0.018151000,   // column 0
-    -0.587641000,  1.132900000, -0.100579000,   // column 1
-    -0.072850000, -0.008349000,  1.118730000);  // column 2
-
+///
+/// Defined once and spliced into both capture variants, so the curve cannot
+/// drift between the PQ and scRGB paths.
+const TONEMAP_TAIL_GLSL: &str = r#"
 // Where the rolloff begins, in multiples of SDR white. Below this, output ==
 // input: the SDR desktop is reproduced exactly.
-const float KNEE = 0.8;
+const float RUBIX_KNEE = 0.8;
 
-vec3 linear_to_srgb(vec3 c) {
+vec3 rubixLinearToSrgb(vec3 c) {
     vec3 lo = c * 12.92;
     vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
     vec3 cutoff = step(vec3(0.0031308), c);
     return mix(lo, hi, cutoff);
 }
 
-void main() {
-    vec4 c = texture2D(tex, v_coords);
-
-    // Working space is normalized so 1.0 == 10000 nits; rescale so SDR white
-    // sits at 1.0 and the tone curve has a meaningful domain.
-    vec3 nits = c.rgb * 10000.0;
-    vec3 v = nits / max(sdr_white_nits, 1.0);
-
-    vec3 lin709 = max(BT2020_TO_BT709 * v, 0.0);
-
-    // Soft knee: identity up to KNEE, then compress the excess asymptotically
-    // toward 1.0. Applied per channel so a highlight does not shift hue.
-    vec3 excess = max(lin709 - KNEE, 0.0);
-    vec3 rolled = KNEE + (1.0 - KNEE) * (1.0 - exp(-excess / (1.0 - KNEE)));
-    vec3 mapped = mix(lin709, rolled, step(KNEE, lin709));
-
-    gl_FragColor = vec4(linear_to_srgb(clamp(mapped, 0.0, 1.0)), c.a) * alpha;
+// Input: linear BT.709 in multiples of SDR white. Output: sRGB-encoded 0..1.
+vec3 rubixToneMap(vec3 lin709) {
+    // Applied per channel so a highlight does not shift hue.
+    vec3 excess = max(lin709 - RUBIX_KNEE, 0.0);
+    vec3 rolled = RUBIX_KNEE + (1.0 - RUBIX_KNEE) * (1.0 - exp(-excess / (1.0 - RUBIX_KNEE)));
+    vec3 mapped = mix(lin709, rolled, step(RUBIX_KNEE, lin709));
+    return rubixLinearToSrgb(clamp(mapped, 0.0, 1.0));
 }
 "#;
+
+/// Shared preamble for the capture tone-map shaders. Mirrors the decode shaders'
+/// sampler handling exactly -- a window's buffer may well be an external
+/// (dmabuf) texture, and a capture path that assumed `sampler2D` would fail on
+/// precisely the fullscreen HDR game this is for.
+const TONEMAP_HEAD_GLSL: &str = r#"
+#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+precision highp float;
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+uniform float sdr_white_nits;
+varying vec2 v_coords;
+"#;
+
+/// PQ/BT.2020 straight to tone-mapped sRGB, for a capture target.
+///
+/// Fused rather than decode-to-linear-then-encode: a capture destination is an
+/// ordinary sRGB buffer, so an SDR window in the same capture needs no
+/// conversion at all. Going through a linear working space would mean building
+/// an offscreen and round-tripping every SDR pixel on the screen through it to
+/// serve the one window that needed it.
+pub fn tonemap_pq_to_sdr() -> String {
+    format!(
+        r#"{TONEMAP_HEAD_GLSL}
+// SMPTE ST 2084 / Rec. 2100 PQ inverse EOTF -- identical to DECODE_HDR_PQ's.
+vec3 pq_eotf(vec3 e) {{
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 ep = pow(e, vec3(1.0 / m2));
+    vec3 num = max(ep - c1, 0.0);
+    vec3 den = c2 - c3 * ep;
+    return pow(num / den, vec3(1.0 / m1));   // 0..1 == 0..10000 nits
+}}
+
+// Inverse of DECODE_SDR's matrix: BT.2020 -> BT.709, linear-light, column-major.
+const mat3 BT2020_TO_BT709 = mat3(
+     1.660491000, -0.124550000, -0.018151000,   // column 0
+    -0.587641000,  1.132900000, -0.100579000,   // column 1
+    -0.072850000, -0.008349000,  1.118730000);  // column 2
+{TONEMAP_TAIL_GLSL}
+void main() {{
+    vec4 c = texture2D(tex, v_coords);
+    // PQ decodes to absolute luminance; rescale so SDR white sits at 1.0 and the
+    // tone curve has a meaningful domain.
+    vec3 nits = pq_eotf(c.rgb) * 10000.0;
+    vec3 lin709 = max(BT2020_TO_BT709 * (nits / max(sdr_white_nits, 1.0)), 0.0);
+#if defined(NO_ALPHA)
+    gl_FragColor = vec4(rubixToneMap(lin709), 1.0) * alpha;
+#else
+    gl_FragColor = vec4(rubixToneMap(lin709), c.a) * alpha;
+#endif
+}}
+"#
+    )
+}
+
+/// Windows-scRGB straight to tone-mapped sRGB, for a capture target.
+///
+/// scRGB is *already* linear BT.709, so unlike the compositing path this does no
+/// primaries conversion at all: BT.709 -> BT.2020 -> BT.709 would be two lossy
+/// matrix multiplies to arrive back where it started, and the round trip clips
+/// the wide-gamut negatives scRGB is specifically able to carry.
+pub fn tonemap_scrgb_to_sdr() -> String {
+    format!(
+        r#"{TONEMAP_HEAD_GLSL}
+// Windows-scRGB: nominal 1.0 == 80 cd/m^2. Same constant as DECODE_WINDOWS_SCRGB.
+const float SCRGB_WHITE_NITS = 80.0;
+{TONEMAP_TAIL_GLSL}
+void main() {{
+    vec4 c = texture2D(tex, v_coords);
+    // NO EOTF and no matrix: already linear BT.709. Straight to multiples of
+    // SDR white.
+    vec3 lin709 = max(c.rgb * (SCRGB_WHITE_NITS / max(sdr_white_nits, 1.0)), 0.0);
+#if defined(NO_ALPHA)
+    gl_FragColor = vec4(rubixToneMap(lin709), 1.0) * alpha;
+#else
+    gl_FragColor = vec4(rubixToneMap(lin709), c.a) * alpha;
+#endif
+}}
+"#
+    )
+}
 
 #[cfg(test)]
 mod scrgb_tests {
@@ -493,35 +555,102 @@ mod tests {
 mod capture_encode_tests {
     use super::*;
 
-    // The capture encode must tone-map, not clip. Clipping is what turns a
+    // The capture shaders must tone-map, not clip. Clipping is what turns a
     // captured HDR sky into a flat white blob, and it is the easy thing to write
     // by accident since the destination is 0..1 anyway.
     #[test]
-    fn capture_encode_rolls_off_rather_than_only_clamping() {
-        assert!(
-            ENCODE_LINEAR_TO_SDR.contains("1.0 - exp(-excess"),
-            "soft-knee rolloff must be present"
-        );
+    fn capture_shaders_roll_off_rather_than_only_clamping() {
+        for (name, src) in [("pq", tonemap_pq_to_sdr()), ("scrgb", tonemap_scrgb_to_sdr())] {
+            assert!(
+                src.contains("1.0 - exp(-excess"),
+                "{name}: soft-knee rolloff must be present"
+            );
+        }
     }
 
     // Order: primaries (linear) -> tone map -> OETF. Applying the OETF before
     // the tone curve would map perceptual values and crush midtones.
     #[test]
-    fn capture_encode_applies_oetf_last() {
-        let matrix = ENCODE_LINEAR_TO_SDR.find("BT2020_TO_BT709 *").expect("matrix");
-        let tonemap = ENCODE_LINEAR_TO_SDR.find("1.0 - exp(-excess").expect("tone map");
-        let oetf = ENCODE_LINEAR_TO_SDR.find("linear_to_srgb(clamp").expect("oetf");
+    fn capture_pq_applies_oetf_last() {
+        // Checked as execution order, not source order: the shared tail is
+        // spliced in as helper *declarations* above main, so a naive
+        // whole-source find() would compare a declaration against a call site
+        // and report the pipeline backwards.
+        let src = tonemap_pq_to_sdr();
+        let body = &src[src.find("void main()").expect("main")..];
+        let matrix = body.find("BT2020_TO_BT709 *").expect("matrix");
+        let tonemap = body.find("rubixToneMap(").expect("tone map call");
         assert!(matrix < tonemap, "primaries before tone map");
-        assert!(tonemap < oetf, "tone map before OETF");
+
+        // ...and inside the curve itself, the OETF is genuinely last.
+        let knee = TONEMAP_TAIL_GLSL.find("1.0 - exp(-excess").expect("tone map");
+        let oetf = TONEMAP_TAIL_GLSL
+            .find("rubixLinearToSrgb(clamp")
+            .expect("oetf");
+        assert!(knee < oetf, "tone map before OETF");
     }
 
-    // It converts BT.2020 -> BT.709, the opposite direction to every decode
-    // shader. Reusing DECODE_SDR's matrix here would be a silent, plausible-
-    // looking colour shift.
+    // The PQ variant converts BT.2020 -> BT.709, the opposite direction to every
+    // decode shader. Reusing DECODE_SDR's matrix here would be a silent,
+    // plausible-looking colour shift.
     #[test]
-    fn capture_encode_converts_out_of_bt2020_not_into_it() {
-        assert!(ENCODE_LINEAR_TO_SDR.contains("BT2020_TO_BT709"));
-        assert!(!ENCODE_LINEAR_TO_SDR.contains("BT709_TO_BT2020"));
+    fn capture_pq_converts_out_of_bt2020_not_into_it() {
+        let src = tonemap_pq_to_sdr();
+        assert!(src.contains("BT2020_TO_BT709"));
+        assert!(!src.contains("BT709_TO_BT2020"));
+    }
+
+    // scRGB is already linear BT.709. A primaries conversion here would be two
+    // lossy matrices back to where it started, and would clip the wide-gamut
+    // negatives scRGB exists to carry.
+    #[test]
+    fn capture_scrgb_does_no_primaries_conversion_at_all() {
+        let src = tonemap_scrgb_to_sdr();
+        assert!(!src.contains("BT2020_TO_BT709"), "scRGB needs no matrix");
+        assert!(!src.contains("BT709_TO_BT2020"), "scRGB needs no matrix");
+        assert!(src.contains("SCRGB_WHITE_NITS"), "80-nit anchor must be applied");
+    }
+
+    // Both capture variants must sample the same way the decode shaders do: a
+    // fullscreen HDR game's buffer is routinely an external (dmabuf) texture, and
+    // a shader that only declared sampler2D would fail on exactly that case.
+    #[test]
+    fn capture_shaders_handle_external_textures_and_the_defines_marker() {
+        for (name, src) in [("pq", tonemap_pq_to_sdr()), ("scrgb", tonemap_scrgb_to_sdr())] {
+            assert!(src.contains("//_DEFINES_"), "{name}: defines marker missing");
+            assert!(
+                src.contains("samplerExternalOES"),
+                "{name}: external-texture sampler missing"
+            );
+            assert!(src.contains("NO_ALPHA"), "{name}: alpha variant missing");
+        }
+    }
+
+    // The curve is defined once and spliced into both. If a variant ever grows
+    // its own copy, the two paths can drift apart silently.
+    #[test]
+    fn both_capture_variants_share_one_tone_curve() {
+        assert!(TONEMAP_TAIL_GLSL.contains("1.0 - exp(-excess"));
+        for src in [tonemap_pq_to_sdr(), tonemap_scrgb_to_sdr()] {
+            assert!(src.contains(TONEMAP_TAIL_GLSL.trim()));
+        }
+    }
+
+    // Both feed the tone curve in multiples of SDR white, so the live slider
+    // decides where the knee falls. A missing uniform would silently pin the
+    // knee to whatever the shader happened to hardcode.
+    #[test]
+    fn capture_shaders_scale_by_the_live_sdr_white_point() {
+        for (name, src) in [("pq", tonemap_pq_to_sdr()), ("scrgb", tonemap_scrgb_to_sdr())] {
+            assert!(
+                src.contains("uniform float sdr_white_nits;"),
+                "{name}: uniform not declared"
+            );
+            assert!(
+                src.contains("max(sdr_white_nits, 1.0)"),
+                "{name}: white point never applied (or unguarded against zero)"
+            );
+        }
     }
 
     // The maths, independent of GLSL. The property that matters is that ORDINARY

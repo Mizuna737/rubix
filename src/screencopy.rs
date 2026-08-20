@@ -468,10 +468,17 @@ where
     R: crate::rounding::GlesAccess,
 {
     let scale = 1.0_f64;
-    let mut background: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
-    let mut bottom: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
-    let mut top: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
-    let mut overlay: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
+    // HDR Phase 4a. A capture destination is an ordinary 8-bit sRGB buffer, so
+    // an HDR surface's texels have to be decoded and tone-mapped rather than
+    // handed over as if they were already sRGB -- which is what made a captured
+    // HDR game look like a blown-out white sky. Gated on there actually being an
+    // HDR surface present, so the overwhelmingly common all-SDR capture takes
+    // exactly the path it always did.
+    let tonemap = crate::udev::output_has_hdr_window(state, output);
+    let mut background: Vec<RubixRenderElement<R>> = Vec::new();
+    let mut bottom: Vec<RubixRenderElement<R>> = Vec::new();
+    let mut top: Vec<RubixRenderElement<R>> = Vec::new();
+    let mut overlay: Vec<RubixRenderElement<R>> = Vec::new();
     {
         use smithay::wayland::shell::wlr_layer::Layer;
         let map = layer_map_for_output(output);
@@ -484,6 +491,23 @@ where
                 Scale::from(scale),
                 1.0,
             );
+            let surface = layer.wl_surface().clone();
+            let elems: Vec<RubixRenderElement<R>> = elems
+                .into_iter()
+                .map(|e| {
+                    if tonemap {
+                        crate::rounding::tonemap_capture_element(
+                            renderer,
+                            &surface,
+                            e,
+                            scale,
+                            state.sdr_white_nits,
+                        )
+                    } else {
+                        RubixRenderElement::Surface(e)
+                    }
+                })
+                .collect();
             match layer.layer() {
                 Layer::Background => background.extend(elems),
                 Layer::Bottom => bottom.extend(elems),
@@ -493,15 +517,21 @@ where
         }
     }
 
-    // RoundMode::Plain: no colour conversion is in play on this path, so a
-    // rounded element takes the plain texture program rather than a decode
-    // variant. Falls back to the batched call at corner_radius = 0.
+    // Without HDR content: RoundMode::Plain, since no colour conversion is in
+    // play and a rounded element takes the plain texture program (falling back
+    // to the batched call at corner_radius = 0). With it: each window resolved
+    // to its own fused decode+tone-map.
+    let space_mode = if tonemap {
+        crate::rounding::SpaceMode::TonemapCapture
+    } else {
+        crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
+    };
     let space_elements = crate::rounding::space_elements(
         state,
         renderer,
         output,
         scale,
-        crate::rounding::RoundMode::Plain,
+        space_mode,
     );
 
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
@@ -513,11 +543,11 @@ where
             scale,
         ));
     }
-    elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(top.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(overlay);
+    elements.extend(top);
     elements.extend(space_elements);
-    elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(background.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(bottom);
+    elements.extend(background);
     elements
 }
 

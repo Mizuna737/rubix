@@ -20,6 +20,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use smithay::wayland::seat::WaylandFocus;
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -126,10 +127,14 @@ where
     let phys = output.current_transform().transform_size(mode.size);
     let scale = 1.0_f64;
 
-    let mut background: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
-    let mut bottom: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
-    let mut top: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
-    let mut overlay: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
+    // HDR Phase 4a -- see `screencopy::build_elements` for the reasoning. Gated
+    // on an HDR surface actually being present, so an all-SDR screenshare is
+    // byte-for-byte the path it always took.
+    let tonemap = crate::udev::output_has_hdr_window(state, &output);
+    let mut background: Vec<RubixRenderElement<R>> = Vec::new();
+    let mut bottom: Vec<RubixRenderElement<R>> = Vec::new();
+    let mut top: Vec<RubixRenderElement<R>> = Vec::new();
+    let mut overlay: Vec<RubixRenderElement<R>> = Vec::new();
     {
         use smithay::wayland::shell::wlr_layer::Layer;
         let map = layer_map_for_output(&output);
@@ -142,6 +147,23 @@ where
                 Scale::from(scale),
                 1.0,
             );
+            let surface = layer.wl_surface().clone();
+            let elems: Vec<RubixRenderElement<R>> = elems
+                .into_iter()
+                .map(|e| {
+                    if tonemap {
+                        crate::rounding::tonemap_capture_element(
+                            renderer,
+                            &surface,
+                            e,
+                            scale,
+                            state.sdr_white_nits,
+                        )
+                    } else {
+                        RubixRenderElement::Surface(e)
+                    }
+                })
+                .collect();
             match layer.layer() {
                 Layer::Background => background.extend(elems),
                 Layer::Bottom => bottom.extend(elems),
@@ -151,23 +173,25 @@ where
         }
     }
 
-    // RoundMode::Plain: no colour conversion is in play on this path, so a
-    // rounded element takes the plain texture program rather than a decode
-    // variant. Falls back to the batched call at corner_radius = 0.
+    let space_mode = if tonemap {
+        crate::rounding::SpaceMode::TonemapCapture
+    } else {
+        crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
+    };
     let space_elements = crate::rounding::space_elements(
         state,
         renderer,
         &output,
         scale,
-        crate::rounding::RoundMode::Plain,
+        space_mode,
     );
 
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
-    elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(top.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(overlay);
+    elements.extend(top);
     elements.extend(space_elements);
-    elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(background.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(bottom);
+    elements.extend(background);
 
     render_and_readback(renderer, phys, &elements)
 }
@@ -196,8 +220,24 @@ where
 
     let surface_elems: Vec<WaylandSurfaceRenderElement<R>> =
         window.render_elements(renderer, loc, Scale::from(scale), 1.0);
-    let elements: Vec<RubixRenderElement<R>> =
-        surface_elems.into_iter().map(RubixRenderElement::Surface).collect();
+    // HDR Phase 4a. This is the single most likely capture to carry HDR content
+    // -- "share just the game window" -- and it is the one where getting it
+    // wrong is most visible, since there is no SDR desktop around it to compare
+    // against. `tonemap_capture_element` returns SDR surfaces untouched.
+    let surface = window.wl_surface().map(|s| s.into_owned());
+    let elements: Vec<RubixRenderElement<R>> = surface_elems
+        .into_iter()
+        .map(|e| match &surface {
+            Some(surface) => crate::rounding::tonemap_capture_element(
+                renderer,
+                surface,
+                e,
+                scale,
+                state.sdr_white_nits,
+            ),
+            None => RubixRenderElement::Surface(e),
+        })
+        .collect();
 
     render_and_readback(renderer, phys, &elements)
 }

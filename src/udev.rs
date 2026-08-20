@@ -383,15 +383,18 @@ fn get_surface_dmabuf_feedback(
 /// decode pass renders into and the encode pass samples back out of, plus
 /// the `OutputDamageTracker` that drives the decode pass.
 ///
-/// The encode element deliberately does NOT reuse a stable `Id` across
-/// frames: the offscreen's *content* is fully re-rendered every frame, so a
-/// persistent id would make `DrmCompositor`'s damage tracking on the encode
-/// call see an unchanged element and report *empty* damage after the first
-/// frame -- leaving every other scanout backbuffer cleared to black (the
-/// "black screen, cursor still visible on its hw plane" failure). A fresh
-/// `Id::new()` per frame reads as remove-old + add-new = full damage, which
-/// is correct because the whole fullscreen element genuinely changes each
-/// frame. See `render_surface_hdr`'s encode pass.
+/// The encode element originally minted a fresh `Id::new()` every frame, on the
+/// reasoning that the offscreen's content is fully re-rendered each frame and a
+/// persistent id would make `DrmCompositor` see an unchanged element and report
+/// *empty* damage, leaving scanout backbuffers black. That is true only if the
+/// element reports no damage of its own -- and it was far more expensive than it
+/// looked: a brand-new element every frame fabricates full-output damage, which
+/// queues a flip, whose VBlank schedules another render, so the HDR path could
+/// never go idle. It cost roughly 4x the GPU of the SDR path on a still desktop.
+///
+/// It now carries a stable `SurfaceData::hdr_encode_id` plus a real
+/// `DamageBag`, so the encode reports exactly what changed and an idle desktop
+/// stops compositing. See `encode_pass`.
 struct HdrOffscreen {
     texture: GlesTexture,
     /// Buffer-space size the texture was created at (mode.size verbatim --
@@ -1342,11 +1345,11 @@ fn render_surface(
     // rounded element must use the rounding variant of *that* decode rather
     // than the plain one. (The z-run path below does its own, per-window
     // tagging -- this branch only ever runs when no HDR client is present.)
-    let space_mode = if surface.hdr {
+    let space_mode = crate::rounding::SpaceMode::Fixed(if surface.hdr {
         RoundMode::Decode(DecodeKind::Sdr)
     } else {
         RoundMode::Plain
-    };
+    });
     let space_elements =
         crate::rounding::space_elements(state, renderer, &surface.output, scale, space_mode);
 
@@ -1851,7 +1854,7 @@ fn fullscreen_scanout_target(state: &RubixState, output: &Output, hdr_capable: b
 /// space windows need checking. Filters by output-region bbox overlap, same
 /// as `Space::render_elements_for_region`, so a window tiled on a DIFFERENT
 /// output doesn't wrongly force this one onto the slow path.
-fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
+pub(crate) fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
     let Some(region) = state.space.output_geometry(output) else {
         return false;
     };
@@ -2176,10 +2179,10 @@ fn ensure_hdr_resources(
 /// wrapped as a single fullscreen `RubixRenderElement::Texture`, goes through
 /// the SAME `drm_output.render_frame` call the non-HDR path uses, with the
 /// renderer-global override set to the (Phase 1b: now bare-PQ, no uniforms)
-/// encode shader. Fresh `Id` every frame on purpose: the offscreen is fully
-/// re-rendered each frame, so the encode element must report full damage
-/// each frame or `DrmCompositor` leaves stale/black backbuffers (see
-/// `HdrOffscreen`'s doc). `FrameFlags::empty()` forces GL composition so the
+/// encode shader. Stable `Id` plus an explicit `DamageBag`, so the encode
+/// reports exactly the region that changed rather than fabricating full-output
+/// damage every frame (see `HdrOffscreen`'s doc for what that used to cost).
+/// `FrameFlags::empty()` forces GL composition so the
 /// encode shader can't be bypassed by direct-scanout promotion (see
 /// `compositor/mod.rs:2880-2911`'s scanout-eligibility check).
 fn encode_pass(

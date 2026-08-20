@@ -136,7 +136,7 @@ pub fn init_winit(
                         renderer,
                         &output,
                         scale,
-                        crate::rounding::RoundMode::Plain,
+                        crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain),
                     );
 
                     // Ghost elements for any in-flight rotation wrap, built from

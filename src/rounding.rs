@@ -54,6 +54,7 @@ use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::utils::user_data::UserDataMap;
 
+use smithay::wayland::seat::WaylandFocus;
 use crate::color_management::DecodeKind;
 use crate::cursor::RubixRenderElement;
 use crate::RubixState;
@@ -173,6 +174,10 @@ pub struct RoundShaders {
     decode_sdr: GlesTexProgram,
     decode_hdr_pq: GlesTexProgram,
     decode_windows_scrgb: GlesTexProgram,
+    /// Capture variants: decode and tone-map fused, straight to sRGB. See
+    /// `RoundMode::Tonemap`.
+    tonemap_pq: GlesTexProgram,
+    tonemap_scrgb: GlesTexProgram,
 }
 
 impl RoundShaders {
@@ -190,6 +195,17 @@ impl RoundShaders {
                 .compile_custom_texture_shader(with_rounding(DECODE_HDR_PQ), &names)?,
             decode_windows_scrgb: renderer
                 .compile_custom_texture_shader(with_rounding(DECODE_WINDOWS_SCRGB), &names)?,
+            // Both carry `sdr_white_nits` for the same reason `decode_sdr` does:
+            // the tone curve's domain is "multiples of SDR white", so the live
+            // slider decides where the knee falls.
+            tonemap_pq: renderer.compile_custom_texture_shader(
+                with_rounding(&crate::hdr_shaders::tonemap_pq_to_sdr()),
+                &sdr_names,
+            )?,
+            tonemap_scrgb: renderer.compile_custom_texture_shader(
+                with_rounding(&crate::hdr_shaders::tonemap_scrgb_to_sdr()),
+                &sdr_names,
+            )?,
         })
     }
 
@@ -199,6 +215,11 @@ impl RoundShaders {
             RoundMode::Decode(DecodeKind::Sdr) => &self.decode_sdr,
             RoundMode::Decode(DecodeKind::HdrPq) => &self.decode_hdr_pq,
             RoundMode::Decode(DecodeKind::WindowsScrgb) => &self.decode_windows_scrgb,
+            // An SDR window drawn into an sRGB capture target needs no colour
+            // conversion whatsoever -- the plain program IS the correct one.
+            RoundMode::Tonemap(DecodeKind::Sdr) => &self.plain,
+            RoundMode::Tonemap(DecodeKind::HdrPq) => &self.tonemap_pq,
+            RoundMode::Tonemap(DecodeKind::WindowsScrgb) => &self.tonemap_scrgb,
         }
     }
 }
@@ -239,6 +260,26 @@ pub(crate) enum RoundMode {
     Plain,
     /// An HDR composite pass, where the slot already holds this decode.
     Decode(DecodeKind),
+    /// A **capture** pass. The destination is an ordinary 8-bit sRGB buffer, so
+    /// this window's transfer function is decoded and tone-mapped down to sRGB
+    /// in one program (HDR Phase 4a). Unlike `Decode`, which is uniform across
+    /// a pass, this is resolved per window: a capture routinely contains one
+    /// HDR window and an otherwise SDR desktop.
+    Tonemap(DecodeKind),
+}
+
+/// How `space_elements` picks a [`RoundMode`] for each window.
+///
+/// A display composite draws every window through the same program, because the
+/// whole pass shares one working space. A capture cannot: its destination is
+/// sRGB, so each window is converted (or not) according to its own declared
+/// transfer function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpaceMode {
+    /// One program for the whole pass.
+    Fixed(RoundMode),
+    /// HDR Phase 4a: resolve each window to its own `RoundMode::Tonemap`.
+    TonemapCapture,
 }
 
 /// Wraps one surface element, clipping it to its window's rounded rect.
@@ -490,12 +531,58 @@ where
 /// the batched `Space::render_elements_for_region` call returns a flat list
 /// with no way to attribute elements back to windows. With both borders and
 /// rounding off, it falls back to that batched call unchanged.
+/// Wrap one capture element in the tone-map program its surface's declared
+/// transfer function calls for (HDR Phase 4a).
+///
+/// Used for layer surfaces, which `space_elements` never sees -- the concrete
+/// case is an HDR wallpaper on the background layer. Windows go through
+/// `SpaceMode::TonemapCapture` instead, which resolves the same thing per window
+/// while it already has the window in hand.
+///
+/// SDR surfaces (overwhelmingly the common case) are returned untouched, so this
+/// costs a `DecodeKind` lookup and nothing else on an ordinary desktop.
+pub(crate) fn tonemap_capture_element<R>(
+    renderer: &mut R,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    element: WaylandSurfaceRenderElement<R>,
+    scale: f64,
+    sdr_white_nits: f32,
+) -> RubixRenderElement<R>
+where
+    R: Renderer + ImportAll + ImportMem + GlesAccess,
+    R::TextureId: Clone + 'static,
+    RubixRenderElement<R>: RenderElement<R>,
+{
+    let kind = crate::color_management::surface_decode_kind(surface);
+    if matches!(kind, DecodeKind::Sdr) {
+        return RubixRenderElement::Surface(element);
+    }
+    let Some(shaders) = round_shaders(renderer.gles_renderer()) else {
+        // Shaders would not compile; an unconverted HDR layer is wrong, but it is
+        // less wrong than dropping it out of the capture entirely.
+        return RubixRenderElement::Surface(element);
+    };
+    let geometry = element.geometry(Scale::from(scale));
+    RubixRenderElement::Rounded(RoundedElement::new(
+        element,
+        &shaders,
+        RoundMode::Tonemap(kind),
+        // Layer surfaces are never rounded, so the mask is a no-op and
+        // `window_rect` is unused -- geometry is passed only to keep the
+        // uniforms well-defined.
+        0.0,
+        geometry,
+        Scale::from(scale),
+        sdr_white_nits,
+    ))
+}
+
 pub(crate) fn space_elements<R>(
     state: &RubixState,
     renderer: &mut R,
     output: &Output,
     scale: f64,
-    mode: RoundMode,
+    mode: SpaceMode,
 ) -> Vec<RubixRenderElement<R>>
 where
     R: Renderer + ImportAll + ImportMem + GlesAccess,
@@ -516,11 +603,16 @@ where
                 s.opacity.is_some_and(|o| o < 1.0) || s.glow_margin.is_some_and(|g| g > 0)
             })
         });
-    let hdr = matches!(mode, RoundMode::Decode(_));
+    let hdr = matches!(mode, SpaceMode::Fixed(RoundMode::Decode(_)));
+    // Capture resolves a program per window, which the batched call cannot
+    // express -- it hands back one flat element list with no window identity
+    // left in it. So this forces the per-window walk below even with no chrome
+    // configured at all, which is exactly the bare-desktop-plus-HDR-game case.
+    let per_window_program = matches!(mode, SpaceMode::TonemapCapture);
     let Some(region) = state.space.output_geometry(output) else {
         return Vec::new();
     };
-    if radius <= 0.0 && !has_borders {
+    if radius <= 0.0 && !has_borders && !per_window_program {
         return state
             .space
             .render_elements_for_region(renderer, &region, scale, 1.0)
@@ -530,7 +622,11 @@ where
     }
     // `None` means rounding is off or its shaders failed to compile; borders
     // still work either way, windows are just drawn square.
-    let round = (radius > 0.0)
+    // Also compiled at radius 0 for a capture: `RoundedElement` doubles as the
+    // "draw this element with that program" wrapper, and `rubixCornerAlpha`
+    // returns exactly 1.0 when `rubix_radius <= 0.0`, so the rounding half is a
+    // true no-op rather than an approximate one.
+    let round = (radius > 0.0 || per_window_program)
         .then(|| round_shaders(renderer.gles_renderer()))
         .flatten();
 
@@ -584,19 +680,41 @@ where
             Scale::from(scale),
             opacity,
         );
-        match (&round, fullscreen) {
-            (Some(shaders), false) => elements.extend(surfaces.into_iter().map(|e| {
+        let elem_mode = match mode {
+            SpaceMode::Fixed(m) => m,
+            SpaceMode::TonemapCapture => RoundMode::Tonemap(
+                window
+                    .wl_surface()
+                    .map(|s| crate::color_management::surface_decode_kind(&s))
+                    .unwrap_or(DecodeKind::Sdr),
+            ),
+        };
+        // A fullscreen window is never rounded -- it covers the output, so there
+        // is no corner to cut.
+        let elem_radius = if fullscreen { 0.0 } else { radius };
+        // An SDR window in a capture resolves to the plain program, which is what
+        // it would have been drawn with anyway; wrapping it would buy a program
+        // swap per element for nothing.
+        let needs_program = matches!(
+            elem_mode,
+            RoundMode::Tonemap(DecodeKind::HdrPq) | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
+        );
+        let wrap = round
+            .as_ref()
+            .filter(|_| elem_radius > 0.0 || needs_program);
+        match wrap {
+            Some(shaders) => elements.extend(surfaces.into_iter().map(|e| {
                 RubixRenderElement::Rounded(RoundedElement::new(
                     e,
                     shaders,
-                    mode,
-                    radius,
+                    elem_mode,
+                    elem_radius,
                     window_rect,
                     Scale::from(scale),
                     state.sdr_white_nits,
                 ))
             })),
-            _ => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
+            None => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
         }
     }
     crate::decoration::prune_ring_cache(state);
@@ -623,6 +741,36 @@ mod tests {
             assert!(
                 out.contains("rubixCornerAlpha();"),
                 "{name}: mask never applied to the output"
+            );
+        }
+    }
+
+    // The capture tone-map variants go through the same splice, and they are the
+    // ones most likely to break it: they are built by `format!` rather than
+    // written out as a literal, so a stray change to the head or tail could move
+    // the anchors `with_rounding` looks for.
+    #[test]
+    fn capture_tonemap_variants_survive_the_rounding_splice() {
+        for (name, source) in [
+            ("tonemap_pq", crate::hdr_shaders::tonemap_pq_to_sdr()),
+            ("tonemap_scrgb", crate::hdr_shaders::tonemap_scrgb_to_sdr()),
+        ] {
+            let out = with_rounding(&source);
+            assert!(out.contains("float rubixCornerAlpha()"), "{name}: helper missing");
+            assert!(
+                out.contains("rubixCornerAlpha();"),
+                "{name}: mask never applied to the output"
+            );
+            let varying = out.find("varying vec2 v_coords;").expect("v_coords declared");
+            let helper = out.find("float rubixCornerAlpha()").expect("helper present");
+            assert!(varying < helper, "{name}: helper must come after the varying it reads");
+            // Both the NO_ALPHA and the alpha-carrying branch end in `* alpha;`,
+            // and both have to pick up the mask -- rounding only one of them
+            // would round opaque windows and leave translucent ones square.
+            assert_eq!(
+                out.matches("* alpha * rubixCornerAlpha();").count(),
+                2,
+                "{name}: both alpha branches must be masked"
             );
         }
     }
