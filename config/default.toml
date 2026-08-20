@@ -81,6 +81,22 @@ focus_follows_mouse = false
 # Logical pixels. 0 disables borders entirely and skips all decoration work.
 border_width = 2
 
+# Corner radius in logical pixels. 0 (the default) disables rounding entirely
+# and keeps the batched render path the compositor used before rounding
+# existed, so nobody pays for a feature they have not asked for.
+#
+# Rounding clips each window with a signed-distance mask in the fragment
+# shader. Two consequences worth knowing:
+#   - A rounded window is no longer opaque, so it stops contributing to
+#     occlusion culling. Expect slightly more work per frame on a busy screen.
+#   - Fullscreen windows are never rounded. There is no gap for a corner to
+#     reveal, and rounding would cost the direct scanout that HDR gaming needs.
+#
+# NOT YET matched by the border: borders are still drawn as four straight
+# rects, so a rounded window with border_width > 0 shows square corner nubs.
+# Until the rounded ring lands, set border_width = 0 when using a radius.
+# corner_radius = 8
+
 # Colors accept #RGB, #RRGGBB, or #RRGGBBAA (the leading '#' is optional). An
 # alpha of 0 skips the border for that window without disabling the feature.
 # Defaults are Catppuccin Mocha blue / surface1.

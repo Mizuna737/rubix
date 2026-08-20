@@ -101,6 +101,7 @@ use smithay::utils::{
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::color_management::{surface_decode_kind, DecodeKind};
+use crate::rounding::RoundMode;
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
 use crate::hdr_shaders::{compile_hdr_shaders, sdr_solid_transform, HdrShaders};
 use crate::state::Pos;
@@ -127,7 +128,7 @@ type RubixDrmOutput = DrmOutput<
 /// The multi-GPU renderer, both slots the same GBM/GLES backend. For Rubix's
 /// single GPU the render and target node are identical, so this is always the
 /// zero-copy `single_renderer` case; the alias keeps the door open for N GPUs.
-type RubixRenderer<'a> =
+pub(crate) type RubixRenderer<'a> =
     MultiRenderer<'a, 'a, GbmGlesBackend<GlesRenderer, DrmDeviceFd>, GbmGlesBackend<GlesRenderer, DrmDeviceFd>>;
 
 /// 10-bit-capable formats first, then 8-bit. `initialize_output` walks these in
@@ -1282,11 +1283,20 @@ fn render_surface(
         }
     }
 
-    let space_elements: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = state
-        .space
-        .output_geometry(&surface.output)
-        .map(|geo| state.space.render_elements_for_region(renderer, &geo, scale, 1.0))
-        .unwrap_or_default();
+    // Rounding needs to know which texture program each window element would
+    // otherwise be drawn with, because there is only one program slot per draw.
+    // On an `hdr = true` output this whole element list is drawn by
+    // `render_surface_hdr` with the SDR decode installed renderer-wide, so a
+    // rounded element must use the rounding variant of *that* decode rather
+    // than the plain one. (The z-run path below does its own, per-window
+    // tagging -- this branch only ever runs when no HDR client is present.)
+    let space_mode = if surface.hdr {
+        RoundMode::Decode(DecodeKind::Sdr)
+    } else {
+        RoundMode::Plain
+    };
+    let space_elements =
+        crate::rounding::space_elements(state, renderer, &surface.output, scale, space_mode);
 
     // Ghost elements for any in-flight rotation wrap, built from
     // `active_ghosts` (populated by `step_animations` right before this call,
@@ -1381,7 +1391,7 @@ fn render_surface(
             .into_iter()
             .map(RubixRenderElement::Solid),
     );
-    elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(space_elements);
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
 
@@ -1839,7 +1849,14 @@ fn gather_tagged_elements<'a>(
 
     let output_geo = state.space.output_geometry(output);
 
-    let mut space_tagged: Vec<(DecodeKind, WaylandSurfaceRenderElement<RubixRenderer<'a>>)> = Vec::new();
+    let mut space_tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
+    // Compiled before the loop so the renderer borrow is released; `None`
+    // means either rounding is off or its shaders failed to build, and either
+    // way windows are drawn exactly as they were before rounding existed.
+    let radius = state.config.decoration.corner_radius as f32;
+    let round = (radius > 0.0)
+        .then(|| crate::rounding::round_shaders(renderer.as_mut()))
+        .flatten();
     if let Some(region) = output_geo {
         for window in state.space.elements().rev() {
             let Some(bbox) = state.space.element_bbox(window) else { continue };
@@ -1847,18 +1864,47 @@ fn gather_tagged_elements<'a>(
                 continue;
             }
             let Some(location) = state.space.element_location(window) else { continue };
-            let render_location: Point<i32, Logical> = location - window.geometry().loc - region.loc;
+            let geometry = window.geometry();
+            let render_location: Point<i32, Logical> = location - geometry.loc - region.loc;
             let kind = window
                 .wl_surface()
                 .map(|s| surface_decode_kind(&s))
                 .unwrap_or(DecodeKind::Sdr);
+            let fullscreen = state
+                .windows
+                .iter()
+                .any(|(id, w)| w == window && state.fullscreen_windows.contains(id));
+            let window_rect = Rectangle::<i32, Physical>::new(
+                (location - region.loc).to_physical_precise_round(scale),
+                geometry.size.to_physical_precise_round(scale),
+            );
             let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
                 renderer,
                 render_location.to_physical_precise_round(scale),
                 Scale::from(scale),
                 1.0,
             );
-            space_tagged.extend(elems.into_iter().map(|e| (kind, e)));
+            match (&round, fullscreen) {
+                // Rounded elements carry the rounding variant of the decode
+                // this window would have taken anyway -- the program slot
+                // holds one or the other, never both.
+                (Some(shaders), false) => space_tagged.extend(elems.into_iter().map(|e| {
+                    (
+                        kind,
+                        RubixRenderElement::Rounded(crate::rounding::RoundedElement::new(
+                            e,
+                            shaders,
+                            crate::rounding::RoundMode::Decode(kind),
+                            radius,
+                            window_rect,
+                            Scale::from(scale),
+                            state.sdr_white_nits,
+                        )),
+                    )
+                })),
+                _ => space_tagged
+                    .extend(elems.into_iter().map(|e| (kind, RubixRenderElement::Surface(e)))),
+            }
         }
     }
 
@@ -1925,7 +1971,7 @@ fn gather_tagged_elements<'a>(
             .into_iter()
             .map(|e| (DecodeKind::Sdr, RubixRenderElement::Solid(e))),
     );
-    tagged.extend(space_tagged.into_iter().map(|(k, e)| (k, RubixRenderElement::Surface(e))));
+    tagged.extend(space_tagged);
     tagged.extend(
         bottom
             .into_iter()

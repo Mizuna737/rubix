@@ -405,6 +405,10 @@ pub struct DecorationConfig {
     /// Logical pixels, drawn outside the client rect. `0` disables borders
     /// entirely and short-circuits all decoration work in the render path.
     pub border_width: u32,
+    /// Corner radius in logical pixels. `0` (the default) disables rounding
+    /// entirely and keeps the batched, un-attributed element path every
+    /// backend used before rounding existed.
+    pub corner_radius: u32,
     pub active: BorderStyle,
     pub inactive: BorderStyle,
     pub rules: Vec<BorderRule>,
@@ -458,6 +462,8 @@ impl DecorationConfig {
 struct RawDecoration {
     #[serde(default = "default_border_width")]
     border_width: u32,
+    #[serde(default)]
+    corner_radius: u32,
     #[serde(default = "default_active_color")]
     active_color: String,
     #[serde(default = "default_inactive_color")]
@@ -476,6 +482,7 @@ impl Default for RawDecoration {
     fn default() -> Self {
         RawDecoration {
             border_width: default_border_width(),
+            corner_radius: 0,
             active_color: default_active_color(),
             inactive_color: default_inactive_color(),
             active_luminance_nits: None,
@@ -586,6 +593,7 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
 
     DecorationConfig {
         border_width: raw.border_width,
+        corner_radius: raw.corner_radius,
         active: BorderStyle {
             color: resolve_color(&raw.active_color, active_fallback),
             luminance_nits: resolve_luminance(raw.active_luminance_nits),

@@ -272,6 +272,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     if state.pending_screencopy.is_empty() {
         return;
@@ -372,6 +373,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     let mode = output.current_mode().ok_or("output has no mode")?;
     let phys = output.current_transform().transform_size(mode.size);
@@ -463,6 +465,7 @@ where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     let scale = 1.0_f64;
     let mut background: Vec<WaylandSurfaceRenderElement<R>> = Vec::new();
@@ -490,11 +493,16 @@ where
         }
     }
 
-    let space_elements: Vec<WaylandSurfaceRenderElement<R>> = state
-        .space
-        .output_geometry(output)
-        .map(|geo| state.space.render_elements_for_region(renderer, &geo, scale, 1.0))
-        .unwrap_or_default();
+    // RoundMode::Plain: no colour conversion is in play on this path, so a
+    // rounded element takes the plain texture program rather than a decode
+    // variant. Falls back to the batched call at corner_radius = 0.
+    let space_elements = crate::rounding::space_elements(
+        state,
+        renderer,
+        output,
+        scale,
+        crate::rounding::RoundMode::Plain,
+    );
 
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
     if overlay_cursor {
@@ -514,7 +522,7 @@ where
             .into_iter()
             .map(RubixRenderElement::Solid),
     );
-    elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(space_elements);
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
     elements

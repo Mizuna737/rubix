@@ -14,6 +14,7 @@ mod input;
 mod ipc;
 mod model;
 mod portal;
+mod rounding;
 mod foreign_toplevel;
 mod screencopy;
 mod state;

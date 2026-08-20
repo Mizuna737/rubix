@@ -128,11 +128,16 @@ pub fn init_winit(
                     // double-render every layer surface if combined with the
                     // pass above. `render_elements_for_region` gives the space's
                     // own contribution alone.
-                    let space_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = data
-                        .space
-                        .output_geometry(&output)
-                        .map(|geo| data.space.render_elements_for_region(renderer, &geo, scale, 1.0))
-                        .unwrap_or_default();
+                    // RoundMode::Plain: no colour conversion is in play on this path, so a
+                    // rounded element takes the plain texture program rather than a decode
+                    // variant. Falls back to the batched call at corner_radius = 0.
+                    let space_elements = crate::rounding::space_elements(
+                        data,
+                        renderer,
+                        &output,
+                        scale,
+                        crate::rounding::RoundMode::Plain,
+                    );
 
                     // Ghost elements for any in-flight rotation wrap, built from
                     // `active_ghosts` (populated by `step_animations` above, same
@@ -191,7 +196,7 @@ pub fn init_winit(
                             .into_iter()
                             .map(RubixRenderElement::Solid),
                     );
-                    elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
+                    elements.extend(space_elements);
                     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
 

@@ -93,6 +93,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     match target {
         CaptureTarget::Monitor(name) => capture_monitor(state, renderer, name),
@@ -112,6 +113,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     let output = state
         .space
@@ -149,11 +151,16 @@ where
         }
     }
 
-    let space_elements: Vec<WaylandSurfaceRenderElement<R>> = state
-        .space
-        .output_geometry(&output)
-        .map(|geo| state.space.render_elements_for_region(renderer, &geo, scale, 1.0))
-        .unwrap_or_default();
+    // RoundMode::Plain: no colour conversion is in play on this path, so a
+    // rounded element takes the plain texture program rather than a decode
+    // variant. Falls back to the batched call at corner_radius = 0.
+    let space_elements = crate::rounding::space_elements(
+        state,
+        renderer,
+        &output,
+        scale,
+        crate::rounding::RoundMode::Plain,
+    );
 
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
     elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
@@ -166,7 +173,7 @@ where
             .into_iter()
             .map(RubixRenderElement::Solid),
     );
-    elements.extend(space_elements.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(space_elements);
     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
 
@@ -185,6 +192,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     let window = state.windows.get(&id).ok_or_else(|| format!("window {id} not found"))?.clone();
     let geo = window.geometry();
@@ -216,6 +224,7 @@ where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesRenderbuffer> + Bind<GlesRenderbuffer>,
     R::TextureId: Texture + Clone + Send + 'static,
     RubixRenderElement<R>: RenderElement<R>,
+    R: crate::rounding::RoundingRenderer,
 {
     let scale = 1.0_f64;
     let buffer_size = Size::<i32, BufferCoord>::from((phys.w, phys.h));
