@@ -152,7 +152,7 @@ where
                 .into_iter()
                 .map(|e| {
                     if tonemap {
-                        crate::rounding::tonemap_capture_element(
+                        crate::rounding::tonemap_sdr_element(
                             renderer,
                             &surface,
                             e,
@@ -174,7 +174,7 @@ where
     }
 
     let space_mode = if tonemap {
-        crate::rounding::SpaceMode::TonemapCapture
+        crate::rounding::SpaceMode::TonemapSdr
     } else {
         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
     };
@@ -223,12 +223,12 @@ where
     // HDR Phase 4a. This is the single most likely capture to carry HDR content
     // -- "share just the game window" -- and it is the one where getting it
     // wrong is most visible, since there is no SDR desktop around it to compare
-    // against. `tonemap_capture_element` returns SDR surfaces untouched.
+    // against. `tonemap_sdr_element` returns SDR surfaces untouched.
     let surface = window.wl_surface().map(|s| s.into_owned());
     let elements: Vec<RubixRenderElement<R>> = surface_elems
         .into_iter()
         .map(|e| match &surface {
-            Some(surface) => crate::rounding::tonemap_capture_element(
+            Some(surface) => crate::rounding::tonemap_sdr_element(
                 renderer,
                 surface,
                 e,

@@ -1314,10 +1314,21 @@ fn render_surface(
     // composite bypass below.
     let fullscreen_kind = fullscreen_scanout_target(state, &surface.output, surface.hdr_capable);
 
-    let mut background: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
-    let mut bottom: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
-    let mut top: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
-    let mut overlay: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
+    // An SDR output showing HDR content is the same problem a capture has: the
+    // destination is 8-bit sRGB with no linear working space to convert in, so
+    // the source's transfer function has to be undone and tone-mapped per
+    // surface. The realistic case is one HDR wallpaper spanning a mixed set of
+    // monitors, only some of them HDR-capable. Without this the SDR head draws
+    // PQ texels as though they were sRGB -- the washed-out grey failure.
+    //
+    // Only for `!surface.hdr`: an HDR output has the linear pipeline and does
+    // this properly through the decode/encode passes instead.
+    let sdr_tonemap =
+        sdr_tonemap_needed(surface.hdr, output_has_hdr_window(state, &surface.output));
+    let mut background: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
+    let mut bottom: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
+    let mut top: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
+    let mut overlay: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
     {
         let map = layer_map_for_output(&surface.output);
         for layer in map.layers() {
@@ -1329,6 +1340,25 @@ fn render_surface(
                 Scale::from(scale),
                 1.0,
             );
+            // The wallpaper is a background-layer surface, so this is the branch
+            // an HDR wallpaper actually goes through.
+            let layer_surface = layer.wl_surface().clone();
+            let elems: Vec<RubixRenderElement<RubixRenderer<'_>>> = elems
+                .into_iter()
+                .map(|e| {
+                    if sdr_tonemap {
+                        crate::rounding::tonemap_sdr_element(
+                            renderer,
+                            &layer_surface,
+                            e,
+                            scale,
+                            state.sdr_white_nits,
+                        )
+                    } else {
+                        RubixRenderElement::Surface(e)
+                    }
+                })
+                .collect();
             match layer.layer() {
                 Layer::Background => background.extend(elems),
                 Layer::Bottom => bottom.extend(elems),
@@ -1345,11 +1375,13 @@ fn render_surface(
     // rounded element must use the rounding variant of *that* decode rather
     // than the plain one. (The z-run path below does its own, per-window
     // tagging -- this branch only ever runs when no HDR client is present.)
-    let space_mode = crate::rounding::SpaceMode::Fixed(if surface.hdr {
-        RoundMode::Decode(DecodeKind::Sdr)
+    let space_mode = if surface.hdr {
+        crate::rounding::SpaceMode::Fixed(RoundMode::Decode(DecodeKind::Sdr))
+    } else if sdr_tonemap {
+        crate::rounding::SpaceMode::TonemapSdr
     } else {
-        RoundMode::Plain
-    });
+        crate::rounding::SpaceMode::Fixed(RoundMode::Plain)
+    };
     let space_elements =
         crate::rounding::space_elements(state, renderer, &surface.output, scale, space_mode);
 
@@ -1425,13 +1457,13 @@ fn render_surface(
     // everything else, including overlay layers.
     let mut elements: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
     elements.extend(cursor_elements);
-    elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(top.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(overlay);
+    elements.extend(top);
     elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
     elements.extend(scaled.into_iter().map(RubixRenderElement::Rescaled));
     elements.extend(space_elements);
-    elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(background.into_iter().map(RubixRenderElement::Surface));
+    elements.extend(bottom);
+    elements.extend(background);
 
     // Connector color state follows the exclusive-fullscreen window's own
     // declared transfer function; on the desktop (no exclusive fullscreen) it
@@ -1854,6 +1886,20 @@ fn fullscreen_scanout_target(state: &RubixState, output: &Output, hdr_capable: b
 /// space windows need checking. Filters by output-region bbox overlap, same
 /// as `Space::render_elements_for_region`, so a window tiled on a DIFFERENT
 /// output doesn't wrongly force this one onto the slow path.
+/// Whether this output has to tone-map HDR surfaces down to sRGB itself.
+///
+/// True only for an output that is **not** HDR-capable but has HDR content on
+/// it. An HDR output does the conversion properly through its linear pipeline
+/// (decode into the 16F offscreen, encode to PQ), and an SDR output with no HDR
+/// content has nothing to convert -- both take the plain program.
+///
+/// Split out from `render_surface` purely to pin the truth table: the failure
+/// mode of getting it backwards is silent, and looks like a plausible colour
+/// shift rather than an error.
+pub(crate) fn sdr_tonemap_needed(output_is_hdr: bool, has_hdr_content: bool) -> bool {
+    !output_is_hdr && has_hdr_content
+}
+
 pub(crate) fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
     let Some(region) = state.space.output_geometry(output) else {
         return false;
@@ -2726,6 +2772,34 @@ fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData, states
                  is the likelier fix than anything in KMS.",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sdr_tonemap_tests {
+    use super::sdr_tonemap_needed;
+
+    // The case this exists for: one HDR wallpaper spanning a mixed monitor set.
+    // The SDR head must convert; the HDR head must not.
+    #[test]
+    fn sdr_output_with_hdr_content_converts() {
+        assert!(sdr_tonemap_needed(false, true));
+    }
+
+    // An HDR output has a linear working space and does this properly through
+    // its decode/encode passes. Tone-mapping here as well would crush the
+    // highlights twice and defeat the entire point of the HDR pipeline.
+    #[test]
+    fn hdr_output_never_tone_maps_on_this_path() {
+        assert!(!sdr_tonemap_needed(true, true));
+        assert!(!sdr_tonemap_needed(true, false));
+    }
+
+    // Nothing to convert: the overwhelmingly common case, and it must stay on
+    // exactly the path it has always taken.
+    #[test]
+    fn sdr_output_without_hdr_content_is_untouched() {
+        assert!(!sdr_tonemap_needed(false, false));
     }
 }
 

@@ -78,14 +78,30 @@ const mat3 BT709_TO_BT2020 = mat3(
 
 void main() {
     vec4 c = texture2D(tex, v_coords);
-    vec3 lin709 = srgb_to_linear(c.rgb);
+
+    // Wayland buffers carry PREMULTIPLIED alpha, and the sRGB EOTF is
+    // nonlinear, so srgb_to_linear(a*s) != a*srgb_to_linear(s). Decoding the
+    // premultiplied value directly makes any client-side transparency come out
+    // too dark -- roughly 24% low for a light surface at 80% alpha. Invisible
+    // while every window was opaque; not invisible now that they are not, and
+    // worse over a bright backdrop.
+    //
+    // So: back to straight alpha, through the curve, then re-premultiply.
+    // `max(c.a, 1e-5)` rather than a branch -- a premultiplied texel with a == 0
+    // has rgb == 0 too, so the guarded divide yields 0 either way.
+#if defined(NO_ALPHA)
+    vec3 straight = c.rgb;
+#else
+    vec3 straight = c.rgb / max(c.a, 1e-5);
+#endif
+    vec3 lin709 = srgb_to_linear(straight);
     vec3 lin2020 = BT709_TO_BT2020 * lin709;
     vec3 abs10k = lin2020 * (sdr_white_nits / 10000.0);
 
 #if defined(NO_ALPHA)
     gl_FragColor = vec4(abs10k, 1.0) * alpha;
 #else
-    gl_FragColor = vec4(abs10k, c.a) * alpha;
+    gl_FragColor = vec4(abs10k * c.a, c.a) * alpha;
 #endif
 }
 "#;
@@ -427,14 +443,22 @@ const mat3 BT2020_TO_BT709 = mat3(
 {TONEMAP_TAIL_GLSL}
 void main() {{
     vec4 c = texture2D(tex, v_coords);
+    // Straight alpha before any nonlinearity -- see DECODE_SDR. Both the PQ
+    // EOTF and the tone curve are nonlinear, so a premultiplied texel would be
+    // decoded at the wrong luminance entirely.
+#if defined(NO_ALPHA)
+    vec3 straight = c.rgb;
+#else
+    vec3 straight = c.rgb / max(c.a, 1e-5);
+#endif
     // PQ decodes to absolute luminance; rescale so SDR white sits at 1.0 and the
     // tone curve has a meaningful domain.
-    vec3 nits = pq_eotf(c.rgb) * 10000.0;
+    vec3 nits = pq_eotf(straight) * 10000.0;
     vec3 lin709 = max(BT2020_TO_BT709 * (nits / max(sdr_white_nits, 1.0)), 0.0);
 #if defined(NO_ALPHA)
     gl_FragColor = vec4(rubixToneMap(lin709), 1.0) * alpha;
 #else
-    gl_FragColor = vec4(rubixToneMap(lin709), c.a) * alpha;
+    gl_FragColor = vec4(rubixToneMap(lin709) * c.a, c.a) * alpha;
 #endif
 }}
 "#
@@ -455,13 +479,20 @@ const float SCRGB_WHITE_NITS = 80.0;
 {TONEMAP_TAIL_GLSL}
 void main() {{
     vec4 c = texture2D(tex, v_coords);
+    // scRGB needs no EOTF -- but the tone curve below is still nonlinear, so the
+    // un-premultiply is required all the same. See DECODE_SDR.
+#if defined(NO_ALPHA)
+    vec3 straight = c.rgb;
+#else
+    vec3 straight = c.rgb / max(c.a, 1e-5);
+#endif
     // NO EOTF and no matrix: already linear BT.709. Straight to multiples of
     // SDR white.
-    vec3 lin709 = max(c.rgb * (SCRGB_WHITE_NITS / max(sdr_white_nits, 1.0)), 0.0);
+    vec3 lin709 = max(straight * (SCRGB_WHITE_NITS / max(sdr_white_nits, 1.0)), 0.0);
 #if defined(NO_ALPHA)
     gl_FragColor = vec4(rubixToneMap(lin709), 1.0) * alpha;
 #else
-    gl_FragColor = vec4(rubixToneMap(lin709), c.a) * alpha;
+    gl_FragColor = vec4(rubixToneMap(lin709) * c.a, c.a) * alpha;
 #endif
 }}
 "#
@@ -713,5 +744,82 @@ mod capture_encode_tests {
         let below = (map(KNEE) - map(KNEE - eps)) / eps;
         let above = (map(KNEE + eps) - map(KNEE)) / eps;
         assert!((below - above).abs() < 1e-2, "slope discontinuity: {below} vs {above}");
+    }
+}
+
+#[cfg(test)]
+mod premultiply_tests {
+    use super::*;
+
+    // Wayland buffers are premultiplied. Every shader that puts a texel through a
+    // NONLINEAR curve has to undo that first, or client-side transparency decodes
+    // at the wrong luminance. This was invisible while every window was opaque.
+    #[test]
+    fn nonlinear_shaders_operate_on_straight_alpha() {
+        for (name, src) in [
+            ("decode_sdr", DECODE_SDR.to_string()),
+            ("tonemap_pq", tonemap_pq_to_sdr()),
+            ("tonemap_scrgb", tonemap_scrgb_to_sdr()),
+        ] {
+            let undo = src
+                .find("c.rgb / max(c.a, 1e-5)")
+                .unwrap_or_else(|| panic!("{name}: never un-premultiplies"));
+            let redo = src
+                .rfind("* c.a, c.a)")
+                .unwrap_or_else(|| panic!("{name}: never re-premultiplies"));
+            assert!(undo < redo, "{name}: re-premultiply must come after the curve");
+        }
+    }
+
+    // The scRGB variant is the one where this looks unnecessary -- its input is
+    // already linear light, so the premultiply commutes with the matrix. It does
+    // NOT commute with the tone curve that follows, which is the actual reason.
+    #[test]
+    fn scrgb_still_needs_it_despite_being_linear() {
+        // Scoped to main's body: the shared tail declares `rubixToneMap` above
+        // main, so searching the whole source would match the declaration and
+        // compare it against a call site.
+        let src = tonemap_scrgb_to_sdr();
+        let body = &src[src.find("void main()").expect("main")..];
+        let undo = body.find("c.rgb / max(c.a, 1e-5)").expect("un-premultiplies");
+        let curve = body.find("rubixToneMap(").expect("tone curve applied");
+        assert!(undo < curve, "straight alpha must be established before the curve");
+    }
+
+    // DECODE_WINDOWS_SCRGB and DECODE_HDR_PQ are deliberately NOT in the list
+    // above: PQ forces output alpha to 1.0 (HDR surfaces are treated as opaque),
+    // and the scRGB decode is linear end to end. Pinned so that if either grows a
+    // nonlinear step later, this comment is where the reasoning is.
+    #[test]
+    fn the_linear_decodes_have_no_curve_to_be_wrong_about() {
+        assert!(!DECODE_WINDOWS_SCRGB.contains("pow("), "scRGB decode must stay linear");
+        assert!(
+            DECODE_HDR_PQ.contains("vec4(pq_eotf(c.rgb), 1.0)"),
+            "PQ decode still assumes opaque; revisit the premultiply if that changes"
+        );
+    }
+
+    // The magnitude, independent of GLSL: this is why it is worth fixing rather
+    // than noting. A light surface at 80% client alpha lands ~24% dark.
+    #[test]
+    fn decoding_premultiplied_would_be_visibly_dark() {
+        fn to_linear(c: f32) -> f32 {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        let alpha = 0.8_f32;
+        let colour = 0.9_f32;
+        let wrong = to_linear(alpha * colour);
+        let right = alpha * to_linear(colour);
+        assert!(wrong < right, "the error direction is 'too dark'");
+        let error = 1.0 - wrong / right;
+        assert!(
+            error > 0.2,
+            "expected a clearly visible error, got {:.1}%",
+            error * 100.0
+        );
     }
 }

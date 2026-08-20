@@ -496,7 +496,7 @@ where
                 .into_iter()
                 .map(|e| {
                     if tonemap {
-                        crate::rounding::tonemap_capture_element(
+                        crate::rounding::tonemap_sdr_element(
                             renderer,
                             &surface,
                             e,
@@ -522,7 +522,7 @@ where
     // to the batched call at corner_radius = 0). With it: each window resolved
     // to its own fused decode+tone-map.
     let space_mode = if tonemap {
-        crate::rounding::SpaceMode::TonemapCapture
+        crate::rounding::SpaceMode::TonemapSdr
     } else {
         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
     };

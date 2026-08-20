@@ -278,8 +278,15 @@ pub(crate) enum RoundMode {
 pub(crate) enum SpaceMode {
     /// One program for the whole pass.
     Fixed(RoundMode),
-    /// HDR Phase 4a: resolve each window to its own `RoundMode::Tonemap`.
-    TonemapCapture,
+    /// The destination is 8-bit sRGB: resolve each window to its own
+    /// `RoundMode::Tonemap`.
+    ///
+    /// Two callers, same problem. A **capture** target is always sRGB (HDR
+    /// Phase 4a). So is an **SDR output** showing HDR content -- an HDR
+    /// wallpaper on a second monitor that is not HDR-capable. Both need the
+    /// source's transfer function undone and the result tone-mapped, and
+    /// neither has a linear working space to do it in.
+    TonemapSdr,
 }
 
 /// Wraps one surface element, clipping it to its window's rounded rect.
@@ -531,17 +538,19 @@ where
 /// the batched `Space::render_elements_for_region` call returns a flat list
 /// with no way to attribute elements back to windows. With both borders and
 /// rounding off, it falls back to that batched call unchanged.
-/// Wrap one capture element in the tone-map program its surface's declared
-/// transfer function calls for (HDR Phase 4a).
+/// Wrap one element in the tone-map program its surface's declared transfer
+/// function calls for, for any destination that is 8-bit sRGB.
 ///
-/// Used for layer surfaces, which `space_elements` never sees -- the concrete
-/// case is an HDR wallpaper on the background layer. Windows go through
-/// `SpaceMode::TonemapCapture` instead, which resolves the same thing per window
+/// Two destinations qualify: a capture target (HDR Phase 4a) and an SDR output
+/// showing HDR content. Used for layer surfaces, which `space_elements` never
+/// sees -- the concrete case being an HDR wallpaper on the background layer,
+/// which is exactly what lands here on a non-HDR monitor. Windows go through
+/// `SpaceMode::TonemapSdr` instead, which resolves the same thing per window
 /// while it already has the window in hand.
 ///
 /// SDR surfaces (overwhelmingly the common case) are returned untouched, so this
 /// costs a `DecodeKind` lookup and nothing else on an ordinary desktop.
-pub(crate) fn tonemap_capture_element<R>(
+pub(crate) fn tonemap_sdr_element<R>(
     renderer: &mut R,
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     element: WaylandSurfaceRenderElement<R>,
@@ -608,7 +617,7 @@ where
     // express -- it hands back one flat element list with no window identity
     // left in it. So this forces the per-window walk below even with no chrome
     // configured at all, which is exactly the bare-desktop-plus-HDR-game case.
-    let per_window_program = matches!(mode, SpaceMode::TonemapCapture);
+    let per_window_program = matches!(mode, SpaceMode::TonemapSdr);
     let Some(region) = state.space.output_geometry(output) else {
         return Vec::new();
     };
@@ -682,7 +691,7 @@ where
         );
         let elem_mode = match mode {
             SpaceMode::Fixed(m) => m,
-            SpaceMode::TonemapCapture => RoundMode::Tonemap(
+            SpaceMode::TonemapSdr => RoundMode::Tonemap(
                 window
                     .wl_surface()
                     .map(|s| crate::color_management::surface_decode_kind(&s))
