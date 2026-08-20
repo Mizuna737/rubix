@@ -58,7 +58,7 @@ use smithay::backend::renderer::damage::{Error as OutputDamageTrackerError, Outp
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
-use smithay::backend::renderer::utils::with_renderer_surface_state;
+use smithay::backend::renderer::utils::{with_renderer_surface_state, DamageBag};
 use smithay::backend::renderer::element::{
     AsRenderElements, Element, Id, Kind, RenderElement, RenderElementPresentationState,
     RenderElementStates, RenderingReason, default_primary_scanout_output_compare,
@@ -75,6 +75,7 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::wayland::presentation::Refresh;
 use smithay::desktop::utils::surface_presentation_feedback_flags_from_states;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Buffer as BufferCoords;
 use smithay::utils::{Clock, Monotonic, Time};
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::desktop::space::SpaceRenderElements;
@@ -238,6 +239,30 @@ pub(crate) struct SurfaceData {
     /// output's current mode. Re-created only when the mode size changes
     /// (`render_surface_hdr`'s resize check) -- never per frame.
     hdr_offscreen: Option<HdrOffscreen>,
+    /// Damage tracking for the HDR composite, which `DrmOutput::render_frame`
+    /// cannot do for us: it only ever sees the finished offscreen, not the
+    /// elements that went into it.
+    ///
+    /// Without this the HDR path never came to rest. `encode_pass` built its
+    /// texture element with a fresh `Id` every frame, so `render_frame` always
+    /// found damage, always queued a flip, and the flip's VBlank always
+    /// scheduled another render -- a full-output composite every vblank on a
+    /// completely idle desktop. SDR never had the problem because its elements
+    /// carry stable ids and an idle frame reports no damage, which is exactly
+    /// why HDR measured several times dearer.
+    hdr_damage_tracker: Option<OutputDamageTracker>,
+    /// Stable id for the encode element, minted once per surface.
+    hdr_encode_id: Id,
+    /// Damage accumulated into the offscreen, handed to the encode element so
+    /// `render_frame` re-encodes and re-scans-out only what changed.
+    hdr_encode_damage: DamageBag<i32, BufferCoords>,
+    /// The SDR-white value the offscreen was last composited at.
+    ///
+    /// Element damage cannot see this. `sdr_white_nits` is a uniform on the
+    /// decode shader, so changing it alters every pixel of the offscreen while
+    /// leaving every element bit-identical -- the brightness keybind would move
+    /// nothing on screen until something else happened to cause damage.
+    hdr_last_nits: Option<f32>,
     /// Connector color state currently staged on this output. `render_surface`
     /// is the sole owner: it computes the desired mode each frame and only
     /// touches DRM on a transition, so nothing else may call
@@ -916,6 +941,10 @@ fn connector_connected(
             hdr_capable: output_hdr,
             hdr_shaders: None,
             hdr_offscreen: None,
+            hdr_damage_tracker: None,
+            hdr_encode_id: Id::new(),
+            hdr_encode_damage: DamageBag::default(),
+            hdr_last_nits: None,
             applied_connector_hdr: None,
             last_scanout_promoted: None,
             last_scanout_candidate: None,
@@ -1457,9 +1486,69 @@ fn render_surface(
     //                   would misrender badly. It MUST go through decode+encode.
     let fullscreen_needs_conversion = matches!(fullscreen_kind, Some(DecodeKind::WindowsScrgb));
     if surface.hdr && (fullscreen_kind.is_none() || fullscreen_needs_conversion) {
+        // Ask whether anything actually changed before compositing.
+        //
+        // `DrmOutput::render_frame` cannot answer this for the HDR path: it
+        // only ever sees the finished offscreen as one texture element, never
+        // the elements that went into it. So the HDR path has to do its own
+        // element-level damage tracking, and until now it did none -- which is
+        // why it never came to rest. The encode element carried a fresh `Id`
+        // every frame, so `render_frame` always found damage, always queued a
+        // flip, and the flip's VBlank always scheduled another render: a
+        // full-output composite every vblank on an idle desktop.
+        //
+        // `damage_output` computes the damage without drawing anything, so an
+        // unchanged frame costs a geometry walk instead of a 16-bit float
+        // composite plus an encode pass.
+        let tracker = surface
+            .hdr_damage_tracker
+            .get_or_insert_with(|| OutputDamageTracker::from_output(&surface.output));
+        // A change in SDR white repaints everything, for the reason on
+        // `hdr_last_nits`. Checked before the damage query so the query still
+        // runs and keeps its own bookkeeping in step.
+        let nits_changed = surface.hdr_last_nits != Some(state.sdr_white_nits);
+        let hdr_damage: Option<Vec<Rectangle<i32, Physical>>> = match tracker.damage_output(1, &elements) {
+            Ok((Some(damage), _)) if !damage.is_empty() => Some(damage.clone()),
+            Ok(_) => None,
+            Err(err) => {
+                // No mode: nothing sensible to draw. Treat as no damage rather
+                // than compositing blind.
+                tracing::warn!("HDR damage query failed on {:?}: {err:?}", surface.output.name());
+                None
+            }
+        };
+        let output_size = surface
+            .output
+            .current_mode()
+            .map(|m| Size::<i32, Physical>::from((m.size.w, m.size.h)));
+        let hdr_damage = match (nits_changed, output_size) {
+            (true, Some(size)) => Some(vec![Rectangle::new(Point::from((0, 0)), size)]),
+            _ => hdr_damage,
+        };
+        let Some(hdr_damage) = hdr_damage else {
+            // Nothing changed. No flip, so the caller arms a heartbeat instead
+            // of being woken by a VBlank -- the render loop comes to rest.
+            //
+            // Presentation feedback is deliberately left alone: it is only
+            // taken when a frame is actually being built, so there is nothing
+            // here to present or discard, and taking it just to discard it
+            // would destroy callbacks a later frame will honour.
+            return Ok(false);
+        };
+        // Buffer coordinates for the encode element. The offscreen is the
+        // output's own size at scale 1, so this is a relabel, not a transform.
+        surface.hdr_encode_damage.add(
+            hdr_damage
+                .iter()
+                .map(|r| Rectangle::<i32, BufferCoords>::new(
+                    (r.loc.x, r.loc.y).into(),
+                    (r.size.w, r.size.h).into(),
+                )),
+        );
         // Built up front so a failure inside the HDR pipeline still leaves
         // something to discard -- see the `.take()` in `encode_pass`.
         let mut hdr_feedback = Some(take_frame_feedback(state, &surface.output, None));
+        surface.hdr_last_nits = Some(state.sdr_white_nits);
         let hdr_result = if output_has_hdr_window(state, &surface.output) {
             let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
             render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits, &mut hdr_feedback)
@@ -2082,8 +2171,13 @@ fn encode_pass(
     };
     let gles: &mut GlesRenderer = renderer.as_mut();
     let context_id = gles.context_id();
-    let texture_element = TextureRenderElement::from_static_texture(
-        Id::new(),
+    // Stable id plus real damage, so `render_frame` re-encodes and re-scans-out
+    // only what changed. A fresh `Id` here -- which is what this did -- makes
+    // the element brand new every frame, which fabricates full-output damage,
+    // which queues a flip, whose VBlank schedules another render: the HDR path
+    // could never go idle.
+    let texture_element = TextureRenderElement::from_texture_with_damage(
+        surface.hdr_encode_id.clone(),
         context_id,
         Point::<f64, Physical>::from((0.0, 0.0)),
         texture,
@@ -2093,6 +2187,7 @@ fn encode_pass(
         None,
         None,
         None,
+        surface.hdr_encode_damage.snapshot(),
         Kind::Unspecified,
     );
     // Phase 1b: the encode shader dropped `sdr_white_nits` (moved into the
