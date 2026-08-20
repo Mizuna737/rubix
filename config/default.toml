@@ -138,6 +138,20 @@ inactive_color = "#45475a"
 # can be overridden per rule.
 # glow_falloff = 2.0
 
+# Window opacity, 0.0-1.0. 1.0 (the default) leaves windows untouched and keeps
+# every optimization an opaque window gets -- below 1.0 a window stops
+# contributing to occlusion culling, so things behind it must be drawn.
+#
+# Fullscreen windows are always forced opaque regardless of any rule: a
+# translucent window cannot take direct primary-plane scanout, which is the path
+# a fullscreen window exists to get.
+#
+# Note this composites in the linear working space on an HDR output, so
+# translucency blends in light rather than in gamma-encoded values -- which is
+# more correct than most compositors manage, and looks it.
+# active_opacity = 1.0
+# inactive_opacity = 0.92
+
 # Per-window overrides, consulted in file order; the first rule that matches AND
 # supplies a color for the relevant focus state wins, otherwise the defaults
 # above apply. `app_id` and `title` are case-insensitive SUBSTRING matches; when
@@ -147,10 +161,21 @@ inactive_color = "#45475a"
 # A rule that sets only `active_color` does not also take over the inactive
 # appearance -- it falls through, so a rule can restyle just the focused case.
 #
+# A rule supplies a style for a focus state only when it names a COLOUR for
+# that state -- so a rule setting only `active_opacity` does nothing. Give it an
+# active_color too.
+#
 # [[decoration.rule]]
 # app_id = "signal"
 # active_color = "#f38ba8"
 # active_luminance_nits = 600.0
+#
+# [[decoration.rule]]
+# app_id = "alacritty"
+# active_color = "#89b4fa"
+# inactive_color = "#45475a"
+# active_opacity = 0.95
+# inactive_opacity = 0.85
 
 # Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
 # variant name -- serde deserializes it straight into the enum, so there is no

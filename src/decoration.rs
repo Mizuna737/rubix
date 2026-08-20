@@ -43,7 +43,7 @@ use smithay::utils::{
     Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Transform,
 };
 
-use crate::config::BorderStyle;
+use crate::config::WindowStyle;
 use crate::rounding::GlesAccess;
 use crate::RubixState;
 
@@ -263,12 +263,35 @@ where
 /// asking for 350 nits gets exactly 350 nits. Everywhere else it is the
 /// configured sRGB colour, untouched -- `luminance_nits` is not consulted at
 /// all, so a machine with no HDR display behaves as though none of this exists.
-pub(crate) fn resolved_color(style: &BorderStyle, hdr: bool, sdr_white_nits: f32) -> Color32F {
+pub(crate) fn resolved_color(style: &WindowStyle, hdr: bool, sdr_white_nits: f32) -> Color32F {
     if !hdr {
         return style.color;
     }
     let nits = style.luminance_nits.unwrap_or(sdr_white_nits);
     crate::hdr_shaders::srgb_to_bt2020_abs10k(style.color, nits)
+}
+
+/// The style in force for one window right now.
+///
+/// Resolved once per window per frame and shared by the window's own surfaces
+/// (for opacity) and its border, so the two can never disagree about which
+/// rule matched.
+///
+/// Fullscreen windows are forced fully opaque regardless of what a rule says.
+/// A translucent window cannot take direct primary-plane scanout, which is the
+/// path a fullscreen window exists to get -- the same trade borders and
+/// rounding already make.
+pub(crate) fn style_for_window(state: &RubixState, id: u32) -> WindowStyle {
+    let (app_id, title) = state.window_identity(id);
+    let mut style = state.config.decoration.style_for(
+        app_id.as_deref(),
+        title.as_deref(),
+        state.focused_window_id() == Some(id),
+    );
+    if state.fullscreen_windows.contains(&id) {
+        style.opacity = 1.0;
+    }
+    style
 }
 
 /// The element area a ring occupies: the window inflated by the ring width
@@ -314,6 +337,7 @@ pub(crate) fn window_border_elements<R>(
     state: &RubixState,
     renderer: &mut R,
     id: u32,
+    style: &WindowStyle,
     window_rect: Rectangle<i32, Logical>,
     hdr: bool,
 ) -> Option<BorderRingElement>
@@ -325,19 +349,13 @@ where
     if state.fullscreen_windows.contains(&id) {
         return None;
     }
-    let (app_id, title) = state.window_identity(id);
-    let style = deco.style_for(
-        app_id.as_deref(),
-        title.as_deref(),
-        state.focused_window_id() == Some(id),
-    );
     let glow = style.glow_margin as i32;
     // Nothing to draw: no ring and no glow, or fully transparent.
     if (width <= 0 && glow <= 0) || style.color.a() <= 0.0 {
         return None;
     }
     let program = ring_program(renderer.gles_renderer())?;
-    let color = resolved_color(&style, hdr, state.sdr_white_nits);
+    let color = resolved_color(style, hdr, state.sdr_white_nits);
 
     // The element covers the window inflated by ring + glow; the shader
     // measures everything from the centre of that area, so the two must agree.
@@ -373,12 +391,13 @@ mod tests {
         Rectangle::new((x, y).into(), (w, h).into())
     }
 
-    fn style(nits: Option<f32>) -> BorderStyle {
-        BorderStyle {
+    fn style(nits: Option<f32>) -> WindowStyle {
+        WindowStyle {
             color: Color32F::new(0.4, 0.6, 0.9, 1.0),
             luminance_nits: nits,
             glow_margin: 0,
             glow_falloff: 2.0,
+            opacity: 1.0,
         }
     }
 

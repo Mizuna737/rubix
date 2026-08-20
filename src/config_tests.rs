@@ -481,3 +481,70 @@
         "##);
         assert_eq!(deco.style_for(Some("signal"), None, true).luminance_nits, Some(600.0));
     }
+
+    // ---- opacity ----
+
+    #[test]
+    fn opacity_defaults_to_fully_opaque() {
+        let deco = decoration_from("");
+        assert_eq!(deco.active.opacity, 1.0);
+        assert_eq!(deco.inactive.opacity, 1.0);
+    }
+
+    #[test]
+    fn opacity_is_clamped_into_range() {
+        let deco = decoration_from("active_opacity = 1.7\ninactive_opacity = -0.4");
+        assert_eq!(deco.active.opacity, 1.0);
+        assert_eq!(deco.inactive.opacity, 0.0);
+    }
+
+    #[test]
+    fn a_nan_opacity_falls_back_to_opaque_rather_than_poisoning_the_blend() {
+        let deco = decoration_from("active_opacity = nan");
+        assert_eq!(deco.active.opacity, 1.0);
+    }
+
+    #[test]
+    fn focused_and_unfocused_opacity_are_independent() {
+        let deco = decoration_from("active_opacity = 1.0\ninactive_opacity = 0.85");
+        assert_eq!(deco.style_for(None, None, true).opacity, 1.0);
+        assert_eq!(deco.style_for(None, None, false).opacity, 0.85);
+    }
+
+    #[test]
+    fn a_rule_can_set_opacity_per_class() {
+        let deco = decoration_from(r##"
+            active_opacity = 1.0
+            [[rule]]
+            app_id = "alacritty"
+            active_color = "#89b4fa"
+            active_opacity = 0.9
+        "##);
+        assert_eq!(deco.style_for(Some("Alacritty"), None, true).opacity, 0.9);
+        assert_eq!(deco.style_for(Some("firefox"), None, true).opacity, 1.0);
+    }
+
+    // A rule supplies a style only when it names a colour, so a rule setting
+    // opacity alone must not silently take over -- same contract as the
+    // colours, and the reason it is worth pinning.
+    #[test]
+    fn a_rule_without_a_colour_does_not_apply_its_opacity() {
+        let deco = decoration_from(r##"
+            active_opacity = 1.0
+            [[rule]]
+            app_id = "alacritty"
+            active_opacity = 0.5
+        "##);
+        assert_eq!(deco.style_for(Some("alacritty"), None, true).opacity, 1.0);
+    }
+
+    #[test]
+    fn a_rule_inherits_section_opacity_when_it_sets_only_a_colour() {
+        let deco = decoration_from(r##"
+            active_opacity = 0.8
+            [[rule]]
+            app_id = "alacritty"
+            active_color = "#89b4fa"
+        "##);
+        assert_eq!(deco.style_for(Some("alacritty"), None, true).opacity, 0.8);
+    }

@@ -503,7 +503,19 @@ where
     RubixRenderElement<R>: RenderElement<R>,
 {
     let radius = state.config.decoration.corner_radius as f32;
-    let has_borders = state.config.decoration.border_width > 0;
+    let deco = &state.config.decoration;
+    // Any of these is per-window state the batched call cannot express.
+    let has_borders = deco.border_width > 0
+        || deco.active.glow_margin > 0
+        || deco.inactive.glow_margin > 0
+        || deco.active.opacity < 1.0
+        || deco.inactive.opacity < 1.0
+        || deco.rules.iter().any(|r| {
+            [r.active.as_ref(), r.inactive.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|s| s.opacity < 1.0 || s.glow_margin > 0)
+        });
     let hdr = matches!(mode, RoundMode::Decode(_));
     let Some(region) = state.space.output_geometry(output) else {
         return Vec::new();
@@ -546,19 +558,23 @@ where
             local_rect.size.to_physical_precise_round(scale),
         );
 
-        if let Some(id) = id {
-            if let Some(ring) =
-                crate::decoration::window_border_elements(state, renderer, id, local_rect, hdr)
-            {
+        // Resolved once and shared by the border and the window's own surfaces,
+        // so the two cannot disagree about which rule matched.
+        let style = id.map(|id| crate::decoration::style_for_window(state, id));
+        if let (Some(id), Some(style)) = (id, style.as_ref()) {
+            if let Some(ring) = crate::decoration::window_border_elements(
+                state, renderer, id, style, local_rect, hdr,
+            ) {
                 elements.push(RubixRenderElement::BorderRing(ring));
             }
         }
 
+        let opacity = style.as_ref().map_or(1.0, |s| s.opacity);
         let surfaces = window.render_elements::<WaylandSurfaceRenderElement<R>>(
             renderer,
             render_location.to_physical_precise_round(scale),
             Scale::from(scale),
-            1.0,
+            opacity,
         );
         match (&round, fullscreen) {
             (Some(shaders), false) => elements.extend(surfaces.into_iter().map(|e| {

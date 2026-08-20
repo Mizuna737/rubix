@@ -1866,11 +1866,15 @@ fn gather_tagged_elements<'a>(
             // client HDR content, so they take the SDR decode. Their per-rule
             // luminance rides on the colour itself, pre-compensated for exactly
             // the solid-colour transform that decode installs.
-            if let Some(id) = window_id {
+            // Resolved once and shared by the border and the window's own
+            // surfaces, so the two cannot disagree about which rule matched.
+            let style = window_id.map(|id| crate::decoration::style_for_window(state, id));
+            let opacity = style.as_ref().map_or(1.0, |s| s.opacity);
+            if let (Some(id), Some(style)) = (window_id, style.as_ref()) {
                 let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);
-                if let Some(ring) =
-                    crate::decoration::window_border_elements(state, renderer, id, local_rect, true)
-                {
+                if let Some(ring) = crate::decoration::window_border_elements(
+                    state, renderer, id, style, local_rect, true,
+                ) {
                     // The DecodeKind is irrelevant for a pixel shader -- it
                     // bypasses the texture decode entirely and writes
                     // working-space values directly -- but the z-run partition
@@ -1883,7 +1887,7 @@ fn gather_tagged_elements<'a>(
                 renderer,
                 render_location.to_physical_precise_round(scale),
                 Scale::from(scale),
-                1.0,
+                opacity,
             );
             match (&round, fullscreen) {
                 // Rounded elements carry the rounding variant of the decode

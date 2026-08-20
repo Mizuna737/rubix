@@ -389,12 +389,19 @@ fn parse_chord(chord: &str, action: NavAction) -> Option<Keybind> {
 
 // ---- decoration (HDR Phase 5b) ----
 
-/// One border appearance: the color as authored, plus an optional absolute
-/// luminance for HDR outputs. `luminance_nits: None` means "no opinion" --
-/// the border sits at SDR white like every other SDR element, which is also
-/// what happens on any non-HDR output regardless of what this says.
+/// How one window is dressed in one focus state: its border's appearance and
+/// its own opacity.
+///
+/// Named for the window rather than the border because it no longer describes
+/// only the border -- `opacity` applies to the window's own surface. Both are
+/// selected by the same rules (class, title, focus), so they share a struct
+/// rather than duplicating the matching.
+///
+/// `luminance_nits: None` means "no opinion" -- the border sits at SDR white
+/// like every other SDR element, which is also what happens on any non-HDR
+/// output regardless of what this says.
 #[derive(Debug, Clone, PartialEq)]
-pub struct BorderStyle {
+pub struct WindowStyle {
     pub color: Color32F,
     pub luminance_nits: Option<f32>,
     /// How far the glow reaches beyond the ring, in logical pixels. `0`
@@ -403,6 +410,10 @@ pub struct BorderStyle {
     /// Shapes how quickly the glow gives out. `1.0` is linear; higher values
     /// keep the glow tight to the border, lower values spread it.
     pub glow_falloff: f32,
+    /// The window's own opacity, `0.0`-`1.0`. `1.0` (the default) leaves the
+    /// window untouched and preserves every optimization an opaque window
+    /// gets.
+    pub opacity: f32,
 }
 
 /// Resolved `[decoration]`. `active`/`inactive` are the fallbacks; `rules` are
@@ -415,8 +426,8 @@ pub struct DecorationConfig {
     /// entirely and keeps the batched, un-attributed element path every
     /// backend used before rounding existed.
     pub corner_radius: u32,
-    pub active: BorderStyle,
-    pub inactive: BorderStyle,
+    pub active: WindowStyle,
+    pub inactive: WindowStyle,
     pub rules: Vec<BorderRule>,
 }
 
@@ -426,8 +437,8 @@ pub struct DecorationConfig {
 pub struct BorderRule {
     pub app_id: Option<String>,
     pub title: Option<String>,
-    pub active: Option<BorderStyle>,
-    pub inactive: Option<BorderStyle>,
+    pub active: Option<WindowStyle>,
+    pub inactive: Option<WindowStyle>,
 }
 
 impl BorderRule {
@@ -450,7 +461,7 @@ impl DecorationConfig {
     /// over the inactive appearance -- it falls through to the next rule and
     /// ultimately to the default, so a rule can restyle just the focused case
     /// without silently owning both.
-    pub fn style_for(&self, app_id: Option<&str>, title: Option<&str>, focused: bool) -> BorderStyle {
+    pub fn style_for(&self, app_id: Option<&str>, title: Option<&str>, focused: bool) -> WindowStyle {
         for rule in &self.rules {
             if !rule.matches(app_id, title) {
                 continue;
@@ -484,6 +495,10 @@ struct RawDecoration {
     inactive_glow_margin: u32,
     #[serde(default = "default_glow_falloff")]
     glow_falloff: f32,
+    #[serde(default = "default_opacity")]
+    active_opacity: f32,
+    #[serde(default = "default_opacity")]
+    inactive_opacity: f32,
     // Singular to match the `[[decoration.rule]]` array-of-tables header
     // exactly, same convention as `[[output]]`.
     #[serde(default)]
@@ -502,6 +517,8 @@ impl Default for RawDecoration {
             active_glow_margin: 0,
             inactive_glow_margin: 0,
             glow_falloff: default_glow_falloff(),
+            active_opacity: default_opacity(),
+            inactive_opacity: default_opacity(),
             rule: Vec::new(),
         }
     }
@@ -527,6 +544,10 @@ struct RawBorderRule {
     inactive_glow_margin: Option<u32>,
     #[serde(default)]
     glow_falloff: Option<f32>,
+    #[serde(default)]
+    active_opacity: Option<f32>,
+    #[serde(default)]
+    inactive_opacity: Option<f32>,
 }
 
 fn default_border_width() -> u32 {
@@ -537,6 +558,10 @@ fn default_border_width() -> u32 {
 /// washing across the gap. Subtlety in HDR comes from headroom, not spread.
 fn default_glow_falloff() -> f32 {
     2.0
+}
+
+fn default_opacity() -> f32 {
+    1.0
 }
 
 fn default_active_color() -> String {
@@ -553,7 +578,7 @@ fn default_inactive_color() -> String {
 ///
 /// Note the components stay sRGB-*encoded* here. Linearization happens in the
 /// render path, where it can be paired with the luminance scaling -- doing it
-/// at parse time would make `BorderStyle::color` mean something different from
+/// at parse time would make `WindowStyle::color` mean something different from
 /// what the user typed.
 pub(crate) fn parse_color(text: &str) -> Option<Color32F> {
     let hex = text.strip_prefix('#').unwrap_or(text);
@@ -582,6 +607,13 @@ fn resolve_luminance(nits: Option<f32>) -> Option<f32> {
     nits.filter(|n| *n > 0.0)
 }
 
+/// Opacity outside 0..=1 is meaningless rather than interesting: below zero is
+/// the same as zero, above one is the same as one, and a NaN would poison the
+/// blend. Clamped here so the render path never has to think about it.
+fn resolve_opacity(value: f32) -> f32 {
+    if value.is_nan() { 1.0 } else { value.clamp(0.0, 1.0) }
+}
+
 fn resolve_color(text: &str, fallback: Color32F) -> Color32F {
     match parse_color(text) {
         Some(color) => color,
@@ -608,12 +640,15 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
                          nits: Option<f32>,
                          glow: Option<u32>,
                          default_glow: u32,
+                         opacity: Option<f32>,
+                         default_opacity: f32,
                          fallback: Color32F| {
-                color.map(|c| BorderStyle {
+                color.map(|c| WindowStyle {
                     color: resolve_color(&c, fallback),
                     luminance_nits: resolve_luminance(nits),
                     glow_margin: glow.unwrap_or(default_glow),
                     glow_falloff: falloff,
+                    opacity: resolve_opacity(opacity.unwrap_or(default_opacity)),
                 })
             };
             BorderRule {
@@ -622,6 +657,8 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
                     r.active_luminance_nits,
                     r.active_glow_margin,
                     raw.active_glow_margin,
+                    r.active_opacity,
+                    raw.active_opacity,
                     active_fallback,
                 ),
                 inactive: style(
@@ -629,6 +666,8 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
                     r.inactive_luminance_nits,
                     r.inactive_glow_margin,
                     raw.inactive_glow_margin,
+                    r.inactive_opacity,
+                    raw.inactive_opacity,
                     inactive_fallback,
                 ),
                 app_id: r.app_id,
@@ -640,17 +679,19 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
     DecorationConfig {
         border_width: raw.border_width,
         corner_radius: raw.corner_radius,
-        active: BorderStyle {
+        active: WindowStyle {
             color: resolve_color(&raw.active_color, active_fallback),
             luminance_nits: resolve_luminance(raw.active_luminance_nits),
             glow_margin: raw.active_glow_margin,
             glow_falloff: raw.glow_falloff,
+            opacity: resolve_opacity(raw.active_opacity),
         },
-        inactive: BorderStyle {
+        inactive: WindowStyle {
             color: resolve_color(&raw.inactive_color, inactive_fallback),
             luminance_nits: resolve_luminance(raw.inactive_luminance_nits),
             glow_margin: raw.inactive_glow_margin,
             glow_falloff: raw.glow_falloff,
+            opacity: resolve_opacity(raw.inactive_opacity),
         },
         rules,
     }
