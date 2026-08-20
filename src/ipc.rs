@@ -90,6 +90,11 @@ enum Reply {
     // in a named field is what keeps this representable at all.
     ScreenStatus { outputs: Vec<OutputPowerView> },
     Ok,
+    // Pushed unsolicited to every subscriber when the config is loaded or
+    // reloaded with problems in it (see `broadcast_config_errors`). A bar
+    // reading this stream must therefore match on `type` rather than assuming
+    // every line is a `state` -- this is the first message that is not one.
+    ConfigError { messages: Vec<String> },
     Error { message: String },
 }
 
@@ -273,6 +278,31 @@ pub(crate) fn broadcast_snapshot(state: &RubixState, registry: &ClientRegistry) 
     }
     let snapshot = build_snapshot(state);
     let Ok(mut line) = serde_json::to_string(&Reply::State(snapshot)) else {
+        return;
+    };
+    line.push('\n');
+    clients.retain_mut(|client| {
+        if !client.subscribed.get() {
+            return true;
+        }
+        client.write_stream.write_all(line.as_bytes()).is_ok()
+    });
+}
+
+/// Push config problems to every subscriber, out of band from the snapshot
+/// stream. Unlike `broadcast_snapshot` this is not coalesced: config errors are
+/// discrete events tied to a specific edit, and collapsing two edits' problems
+/// into one message would misattribute them.
+pub(crate) fn broadcast_config_errors(registry: &ClientRegistry, messages: &[String]) {
+    if messages.is_empty() {
+        return;
+    }
+    let mut clients = registry.borrow_mut();
+    if !clients.iter().any(|c| c.subscribed.get()) {
+        return;
+    }
+    let reply = Reply::ConfigError { messages: messages.to_vec() };
+    let Ok(mut line) = serde_json::to_string(&reply) else {
         return;
     };
     line.push('\n');

@@ -412,6 +412,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = crate::config::Config::load();
     let mut data = RubixState::new(&mut event_loop, display, config);
 
+    // Problems noticed while parsing the config above. Deliberately deferred
+    // rather than reported inline: at this point neither sink can receive
+    // anything. The notification daemon is usually itself in the `startup` list
+    // (fired from the XWayland-ready hook below), and no IPC client has had a
+    // chance to connect, let alone subscribe. Reporting now would mean the one
+    // diagnostic a user most needs -- "your config did not parse" -- is the one
+    // guaranteed to be dropped. A few seconds is enough for both sinks to exist.
+    let startup_problems = crate::config::take_config_diagnostics();
+    if !startup_problems.is_empty() {
+        let mut pending = Some(startup_problems);
+        let timer = smithay::reexports::calloop::timer::Timer::from_duration(
+            std::time::Duration::from_secs(5),
+        );
+        let _ = event_loop
+            .handle()
+            .insert_source(timer, move |_, _, data: &mut RubixState| {
+                if let Some(problems) = pending.take() {
+                    data.report_config_diagnostics(problems);
+                }
+                smithay::reexports::calloop::timer::TimeoutAction::Drop
+            });
+    }
+
     match detect_backend() {
         Backend::Winit => {
             tracing::info!("starting winit (nested) backend");
@@ -463,6 +486,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Same signal, second audience: the status bar over IPC, window
             // lists (rofi, taskbars) over wlr-foreign-toplevel.
             crate::foreign_toplevel::refresh(data);
+        }
+        // Separate from the snapshot push above: config problems are discrete
+        // events tied to one edit, not cube state, so they are neither coalesced
+        // nor gated on `ipc_dirty`.
+        if !data.pending_config_errors.is_empty() {
+            let problems = std::mem::take(&mut data.pending_config_errors);
+            if let Some(clients) = &ipc_clients {
+                crate::ipc::broadcast_config_errors(clients, &problems);
+            }
         }
     })?;
 

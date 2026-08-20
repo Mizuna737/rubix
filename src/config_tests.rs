@@ -597,3 +597,93 @@
         "##);
         assert_eq!(deco.style_for(Some("alacritty"), None, true).opacity, 0.8);
     }
+
+    // ---- diagnostics ----
+
+    #[test]
+    fn config_omitting_diagnostics_section_defaults_to_osd() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [diagnostics] parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.diagnostics.config_errors, ConfigErrorSink::Osd);
+        assert!(cfg.diagnostics.wants_osd());
+        assert!(!cfg.diagnostics.wants_ipc());
+    }
+
+    #[test]
+    fn diagnostics_section_selects_the_sink() {
+        for (value, expected) in [
+            ("Osd", ConfigErrorSink::Osd),
+            ("Ipc", ConfigErrorSink::Ipc),
+            ("Both", ConfigErrorSink::Both),
+            ("Silent", ConfigErrorSink::Silent),
+        ] {
+            let text = format!(
+                r#"
+                [diagnostics]
+                config_errors = "{value}"
+
+                [layout]
+                visible_columns = 3
+
+                [keybinds]
+                "Alt+h" = "RotateColumnsLeft"
+                "#
+            );
+            let raw: RawConfig = toml::from_str(&text).expect("config with [diagnostics] parses");
+            let cfg = Config::resolve(raw);
+            assert_eq!(cfg.diagnostics.config_errors, expected, "sink {value}");
+        }
+    }
+
+    #[test]
+    fn both_sink_wants_each_channel_and_silent_wants_neither() {
+        assert!(ConfigErrorSink::Both.osd() && ConfigErrorSink::Both.ipc());
+        assert!(!ConfigErrorSink::Silent.osd() && !ConfigErrorSink::Silent.ipc());
+        assert!(ConfigErrorSink::Osd.osd() && !ConfigErrorSink::Osd.ipc());
+        assert!(ConfigErrorSink::Ipc.ipc() && !ConfigErrorSink::Ipc.osd());
+    }
+
+    // A typo'd chord is the motivating case: it drops the bind, and used to do so
+    // with nothing but a log line. The diagnostic has to actually be collected.
+    #[test]
+    fn a_dropped_bind_is_collected_as_a_diagnostic() {
+        let _ = take_config_diagnostics();
+        assert!(parse_chord("Alt+nosuchkey", NavAction::RotateColumnsLeft).is_none());
+        let problems = take_config_diagnostics();
+        assert_eq!(problems.len(), 1, "the dropped bind must be reported");
+        assert!(
+            problems[0].contains("nosuchkey") && problems[0].contains("Alt+nosuchkey"),
+            "diagnostic should name the offending key and chord: {:?}",
+            problems[0]
+        );
+    }
+
+    #[test]
+    fn taking_diagnostics_drains_them() {
+        let _ = take_config_diagnostics();
+        note_config_problem("first".to_string());
+        note_config_problem("second".to_string());
+        assert_eq!(take_config_diagnostics(), vec!["first", "second"]);
+        assert!(
+            take_config_diagnostics().is_empty(),
+            "a second drain must not repeat the same problems"
+        );
+    }
+
+    #[test]
+    fn a_clean_config_produces_no_diagnostics() {
+        let _ = take_config_diagnostics();
+        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let _ = Config::resolve(raw);
+        assert!(
+            take_config_diagnostics().is_empty(),
+            "the shipped default config must not warn about itself"
+        );
+    }

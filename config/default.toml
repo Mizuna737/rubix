@@ -26,6 +26,26 @@ sdr_white_nits = 203.0
 # while any client holds an idle-inhibit (idle-inhibit-unstable-v1) lock, e.g.
 # a fullscreen video player or a Teams call.
 # Live/hot-reloadable: editing and saving re-arms the timer immediately.
+[diagnostics]
+# Where config problems go, on top of always being written to the log.
+#
+# A typo used to vanish silently: an unknown key in a chord drops that bind, a
+# malformed mode falls back to preferred, an unparseable color falls back to the
+# default -- all of it logged and nowhere else. This decides who else hears
+# about it.
+#
+#   "Osd"     desktop notification via notify-send (default -- a bar is not
+#             guaranteed to exist, let alone to have room for a notification)
+#   "Ipc"     a `config_error` message to every IPC subscriber, for a status
+#             bar that wants to render it itself (see ipc.rs)
+#   "Both"
+#   "Silent"  log only -- the original behavior
+#
+# Startup problems are held back a few seconds before being reported, since the
+# notification daemon is usually itself in `startup` and the bar has not
+# connected yet.
+config_errors = "Osd"
+
 [idle]
 # Master switch. Optional section: omitting [idle] entirely takes these
 # defaults (a fresh install blanks its screen out of the box).

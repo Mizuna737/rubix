@@ -190,6 +190,12 @@ pub struct RubixState {
     // subscriber push (see ipc.rs).
     pub ipc_dirty: bool,
 
+    // Config problems waiting to go out to IPC subscribers. Drained by the
+    // run-loop callback in main.rs alongside the snapshot broadcast, because the
+    // client registry lives there rather than on the state. Only ever populated
+    // when the resolved sink includes Ipc.
+    pub pending_config_errors: Vec<String>,
+
     // wlr-foreign-toplevel-management: bound managers plus what each window's
     // handles were last told, so `foreign_toplevel::refresh` can send deltas.
     pub(crate) foreign_toplevel: crate::foreign_toplevel::ForeignToplevelState,
@@ -476,6 +482,7 @@ impl RubixState {
             next_id: 1,
             unmapped: HashMap::new(),
             ipc_dirty: false,
+            pending_config_errors: Vec::new(),
             foreign_toplevel: Default::default(),
             reserved_bounds: None,
             animations: HashMap::new(),
@@ -979,6 +986,74 @@ impl RubixState {
         self.ipc_dirty = true;
     }
 
+    /// Surface config problems through the configured sink.
+    ///
+    /// `note_config_problem` has already logged every one of these; this is the
+    /// half that reaches someone who is not tailing the journal. `Silent` is
+    /// therefore not "no diagnostics" -- it restores exactly the old behavior,
+    /// log line and all.
+    pub fn report_config_diagnostics(&mut self, problems: Vec<String>) {
+        if problems.is_empty() {
+            return;
+        }
+        if self.config.diagnostics.wants_ipc() {
+            // Drained by the run-loop callback in main.rs, which owns the client
+            // registry. Deliberately does NOT set `ipc_dirty`: cube state did not
+            // change, and a config typo should not force a snapshot push.
+            self.pending_config_errors.extend_from_slice(&problems);
+        }
+        if self.config.diagnostics.wants_osd() {
+            Self::notify_config_problems(&problems);
+        }
+    }
+
+    /// Fire a desktop notification for config problems. Best-effort by design.
+    ///
+    /// `notify-send` may not be installed, and a notification daemon may not be
+    /// running -- notably at startup, where the daemon is usually itself in the
+    /// `startup` list and so races this. A failure here must never take the
+    /// compositor down or block the event loop, hence fire-and-forget.
+    fn notify_config_problems(problems: &[String]) {
+        const MAX_LINES: usize = 6;
+        let shown = problems.len().min(MAX_LINES);
+        let mut body = problems[..shown]
+            .iter()
+            .map(|p| escape_markup(p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if problems.len() > shown {
+            body.push_str(&format!(
+                "\n... and {} more (see the log)",
+                problems.len() - shown
+            ));
+        }
+        let summary = if problems.len() == 1 {
+            "Rubix: config problem".to_string()
+        } else {
+            format!("Rubix: {} config problems", problems.len())
+        };
+        // Args are passed directly, never through `sh -c`, so a config value
+        // echoed back into the message cannot turn into a shell command.
+        let spawned = std::process::Command::new("notify-send")
+            .arg("--app-name=rubix")
+            .arg("--urgency=normal")
+            .arg("--icon=dialog-warning")
+            .arg(summary)
+            .arg(body)
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                // Nothing in the compositor handles SIGCHLD, so an unreaped
+                // notify-send would sit as a zombie for the life of the session.
+                // Rare per event, but it accumulates across an editing session.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => tracing::warn!("could not run notify-send for config problems: {e}"),
+        }
+    }
+
     /// Hot-reload keybinds from the user config file. Only the keybind set is
     /// swapped; `visible_columns` is structural (it seeds the monitor's fixed
     /// column slots at startup), so a live change is logged and ignored until a
@@ -987,7 +1062,13 @@ impl RubixState {
     /// next keypress -- `process_input_event` reads `config.keybinds` fresh each
     /// time, so no re-registration is needed.
     pub fn reload_config(&mut self) {
-        let Some(new) = Config::reload() else {
+        let reloaded = Config::reload();
+        // Drained here, not inside the `Some` arm: a config that fails to parse
+        // outright is the single most important case to surface, and that is
+        // exactly the case where `reload` returns None.
+        let problems = crate::config::take_config_diagnostics();
+        let Some(new) = reloaded else {
+            self.report_config_diagnostics(problems);
             return;
         };
         if new.visible_columns != self.config.visible_columns {
@@ -1017,6 +1098,9 @@ impl RubixState {
         // Covers colors, rules and per-rule luminance in one go.
         self.config.decoration = new.decoration;
         self.config.focus_follows_mouse = new.focus_follows_mouse;
+        // Swapped before the report below, so an edit that changes the sink is
+        // itself announced through the sink it just asked for.
+        self.config.diagnostics = new.diagnostics;
         // Re-seeded like sdr_white_nits: a config edit wins over a runtime
         // toggle, so saving the file is always the way back to a known state.
         self.focus_follows_mouse = self.config.focus_follows_mouse;
@@ -1028,6 +1112,9 @@ impl RubixState {
         self.config.idle = new.idle;
         self.rearm_idle_timer();
         tracing::info!("reloaded config: {count} keybinds active");
+        // Last, so every field is already swapped and the report goes out through
+        // the sink this edit asked for.
+        self.report_config_diagnostics(problems);
         // Force a repaint so an sdr_white_nits edit is visible immediately,
         // same reasoning as the keybind path in dispatch_nav below.
         self.nudge_render();
@@ -2067,4 +2154,16 @@ pub(crate) fn next_maximize(
         (_, true) => group_or(MaximizeState::Monitor(id)),
         (_, false) => MaximizeState::Monitor(id),
     }
+}
+
+/// Escape the three characters Pango treats as markup.
+///
+/// Most notification daemons parse the body as Pango markup. Config diagnostics
+/// quote the offending value back at the user verbatim, so an unbalanced `<` in a
+/// config string would otherwise swallow the rest of the message -- the failure
+/// mode being that the notification explaining a typo is itself mangled by it.
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

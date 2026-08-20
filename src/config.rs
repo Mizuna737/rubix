@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,11 +17,91 @@ use crate::input::NavAction;
 /// Also serves as the copy-paste reference at `config/default.toml`.
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 
+thread_local! {
+    /// Problems noticed while parsing the config, drained by the caller after a
+    /// `load`/`reload` so they can be surfaced to the user rather than only logged.
+    ///
+    /// A thread-local rather than a threaded-through `&mut Vec` because the parse
+    /// helpers (`parse_chord`, `parse_mode`, `parse_color_or`, ...) are free
+    /// functions called from deep inside `resolve`, and every one of them is a
+    /// place where a typo silently drops a setting. Both `load` and `reload` run
+    /// entirely on the compositor thread, so there is no cross-thread interleaving
+    /// to worry about.
+    static DIAGNOSTICS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record a config problem: logged exactly as before, *and* kept for the user.
+///
+/// Every caller is a spot where the config asked for something we could not honor
+/// and we fell back instead -- which is precisely the class of failure that used
+/// to vanish into the log.
+pub(crate) fn note_config_problem(message: String) {
+    tracing::warn!("{message}");
+    DIAGNOSTICS.with(|d| d.borrow_mut().push(message));
+}
+
+/// Take everything noted since the last drain. Call once after `load`/`reload`.
+pub(crate) fn take_config_diagnostics() -> Vec<String> {
+    DIAGNOSTICS.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+
+/// Where config problems are surfaced, beyond always being logged.
+///
+/// Defaults to `Osd` because a status bar is not guaranteed to exist, let alone to
+/// have somewhere to put a notification -- whereas a desktop notification is the
+/// one channel a fresh install can reasonably assume.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConfigErrorSink {
+    /// `notify-send`, if it and a notification daemon are present.
+    #[default]
+    Osd,
+    /// A `config_error` message pushed to every IPC subscriber (see ipc.rs).
+    Ipc,
+    Both,
+    /// Log only -- the pre-existing behavior.
+    Silent,
+}
+
+impl ConfigErrorSink {
+    fn osd(self) -> bool {
+        matches!(self, ConfigErrorSink::Osd | ConfigErrorSink::Both)
+    }
+    fn ipc(self) -> bool {
+        matches!(self, ConfigErrorSink::Ipc | ConfigErrorSink::Both)
+    }
+}
+
+/// Resolved `[diagnostics]` section.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiagnosticsConfig {
+    pub config_errors: ConfigErrorSink,
+}
+
+impl DiagnosticsConfig {
+    pub fn wants_osd(&self) -> bool {
+        self.config_errors.osd()
+    }
+    pub fn wants_ipc(&self) -> bool {
+        self.config_errors.ipc()
+    }
+}
+
+// Optional section: a config omitting `[diagnostics]` parses fine and gets `Osd`.
+#[derive(Default, Deserialize)]
+struct RawDiagnostics {
+    #[serde(default)]
+    config_errors: ConfigErrorSink,
+}
+
 /// Runtime configuration, resolved from `config.toml` (or the built-in default).
 /// Chords have already been parsed into concrete modifier/keysym matches here --
 /// the raw string form only exists during deserialization.
 pub struct Config {
     pub visible_columns: usize,
+    /// How config problems reach the user. Live/hot-reloadable, and deliberately
+    /// swapped *before* the diagnostics from that same reload are reported, so
+    /// changing the sink takes effect on the edit that changes it.
+    pub diagnostics: DiagnosticsConfig,
     pub outer_gap: u32,
     pub inner_gap: u32,
     pub keybinds: Vec<Keybind>,
@@ -123,6 +204,10 @@ struct RawConfig {
     animation: RawAnimation,
     #[serde(default)]
     input: RawInput,
+    // Optional section: a config omitting `[diagnostics]` surfaces config problems
+    // as desktop notifications (see `ConfigErrorSink`).
+    #[serde(default)]
+    diagnostics: RawDiagnostics,
     // Optional section: a config omitting `[decoration]` gets the built-in
     // border defaults (2px, Catppuccin blue/surface1, no HDR luminance).
     #[serde(default)]
@@ -255,7 +340,7 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
 
         toml::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!("failed to parse config ({e}); using built-in defaults");
+            note_config_problem(format!("failed to parse config ({e}); using built-in defaults"));
             toml::from_str(DEFAULT_CONFIG).expect("built-in default config must parse")
         })
     }
@@ -282,6 +367,7 @@ impl Config {
 
         Config {
             visible_columns: raw.layout.visible_columns,
+            diagnostics: DiagnosticsConfig { config_errors: raw.diagnostics.config_errors },
             outer_gap: raw.layout.outer_gap,
             inner_gap: raw.layout.inner_gap,
             keybinds,
@@ -307,7 +393,7 @@ impl Config {
     pub fn reload() -> Option<Config> {
         let text = std::fs::read_to_string(config_path()?).ok()?;
         let raw: RawConfig = toml::from_str(&text)
-            .map_err(|e| tracing::warn!("config reload failed to parse ({e}); keeping current config"))
+            .map_err(|e| note_config_problem(format!("config reload failed to parse ({e}); keeping current config")))
             .ok()?;
         Some(Config::resolve(raw))
     }
@@ -366,13 +452,13 @@ pub fn should_reload(event: &calloop_notify::notify::Event, file_name: &std::ffi
 /// than failing config resolution.
 fn parse_mode(mode: &str) -> Option<(i32, i32)> {
     let Some((w, h)) = mode.split_once('x') else {
-        tracing::warn!("malformed output mode '{mode}'; falling back to preferred mode");
+        note_config_problem(format!("malformed output mode '{mode}'; falling back to preferred mode"));
         return None;
     };
     match (w.trim().parse::<i32>(), h.trim().parse::<i32>()) {
         (Ok(w), Ok(h)) => Some((w, h)),
         _ => {
-            tracing::warn!("malformed output mode '{mode}'; falling back to preferred mode");
+            note_config_problem(format!("malformed output mode '{mode}'; falling back to preferred mode"));
             None
         }
     }
@@ -398,7 +484,7 @@ fn parse_transform(transform: &str) -> Option<Transform> {
         "left" => Some(Transform::_90),
         "right" => Some(Transform::_270),
         _ => {
-            tracing::warn!("unrecognized output transform '{transform}'; falling back to normal");
+            note_config_problem(format!("unrecognized output transform '{transform}'; falling back to normal"));
             None
         }
     }
@@ -420,7 +506,7 @@ fn parse_chord(chord: &str, action: NavAction) -> Option<Keybind> {
             _ => {
                 let sym = keysym_from_name(token, KEYSYM_NO_FLAGS).raw();
                 if sym == 0 {
-                    tracing::warn!("unknown key '{token}' in chord '{chord}'; ignoring bind");
+                    note_config_problem(format!("unknown key '{token}' in chord '{chord}'; ignoring bind"));
                     return None;
                 }
                 keysym = Some(sym);
@@ -726,7 +812,7 @@ fn resolve_color(text: &str, fallback: Color32F) -> Color32F {
     match parse_color(text) {
         Some(color) => color,
         None => {
-            tracing::warn!("unparseable border color {text:?}; falling back");
+            note_config_problem(format!("unparseable border color {text:?}; falling back"));
             fallback
         }
     }
