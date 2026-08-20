@@ -101,6 +101,37 @@ float roundRectSdf(vec2 p, vec2 halfSize, float r) {
 // window's antialiasing is weakest, and the seam closes.
 #define RING_INNER_OVERLAP 1.0
 
+// Coverage at one point, in element-centred pixel coordinates.
+float ringCoverage(vec2 centred, vec2 winHalf, float r) {
+    float dInner = roundRectSdf(centred, winHalf, r);
+    float dOuter = roundRectSdf(centred, winHalf + vec2(rubix_border), r + rubix_border);
+
+    float ring = (1.0 - smoothstep(-0.5, 0.5, dOuter))
+        * smoothstep(-0.5, 0.5, dInner + RING_INNER_OVERLAP);
+
+    float glow = 0.0;
+    if (rubix_glow > 0.0) {
+        float t = clamp(dOuter / rubix_glow, 0.0, 1.0);
+        // Gated by a smoothstep rather than step(): a hard cut here is a
+        // discontinuity right where the glow is brightest.
+        glow = pow(1.0 - t, rubix_falloff) * smoothstep(-0.5, 0.5, dOuter);
+    }
+
+    // Union, not max(). max() creases where the two curves cross -- the
+    // derivative jumps -- and because the crossing region widens with
+    // curvature, that crease is worst exactly at the corners. Compositing the
+    // glow under the ring is continuous everywhere.
+    return ring + glow * (1.0 - ring);
+}
+
+// Cheap hash, used to dither the final alpha. The glow is a long smooth ramp
+// from a high absolute luminance down to nothing, which is precisely the shape
+// that contours into visible bands; a fraction of a step of noise breaks the
+// bands up without being visible as grain.
+float dither(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+}
+
 void main() {
     // The element covers the window inflated by border + glow, so the window
     // itself is centred within it.
@@ -112,30 +143,19 @@ void main() {
     // a capsule would do, which is the sane reading of "rounder than possible".
     float r = min(rubix_radius, min(winHalf.x, winHalf.y));
 
-    float dInner = roundRectSdf(centred, winHalf, r);
-    float dOuter = roundRectSdf(centred, winHalf + vec2(rubix_border), r + rubix_border);
+    // 2x2 supersample. The analytic smoothstep assumes the distance field's
+    // gradient has unit magnitude, which holds along the straight edges but not
+    // through a corner arc, so a single sample antialiases the corners more
+    // harshly than the sides. Four sub-pixel samples cost three extra distance
+    // evaluations on a thin ring and even that out.
+    float a = 0.0;
+    a += ringCoverage(centred + vec2(-0.25, -0.25), winHalf, r);
+    a += ringCoverage(centred + vec2(0.25, -0.25), winHalf, r);
+    a += ringCoverage(centred + vec2(-0.25, 0.25), winHalf, r);
+    a += ringCoverage(centred + vec2(0.25, 0.25), winHalf, r);
+    a *= 0.25;
 
-    // Inside the outer edge and outside the window edge, both antialiased over
-    // one pixel, with the inner edge biased under the window.
-    float ring = (1.0 - smoothstep(-0.5, 0.5, dOuter))
-        * smoothstep(-0.5, 0.5, dInner + RING_INNER_OVERLAP);
-
-    float glow = 0.0;
-    if (rubix_glow > 0.0) {
-        float t = clamp(dOuter / rubix_glow, 0.0, 1.0);
-        // Gated by a smoothstep rather than step(): a hard cut here is a
-        // discontinuity right where the glow is brightest, and it aliases
-        // along the curve for the same reason the seam above did.
-        glow = pow(1.0 - t, rubix_falloff) * smoothstep(-0.5, 0.5, dOuter);
-    }
-
-    float a = max(ring, glow);
-
-#if defined(DEBUG_FLAGS)
-    if (tint == 1.0) {
-        a = ring;
-    }
-#endif
+    a = clamp(a + dither(v_coords * size) * (1.0 / 512.0), 0.0, 1.0);
 
     // Premultiplied, which is what the renderer blends for.
     gl_FragColor = vec4(rubix_color.rgb * rubix_color.a * a, rubix_color.a * a) * alpha;
@@ -416,6 +436,45 @@ mod tests {
                 "{name} is declared but never read"
             );
         }
+    }
+
+    // GLSL requires declaration before use, and a violation here fails at
+    // shader-compile time on a machine with a GPU -- which no test has. Pinning
+    // the order is the only place this can be caught early.
+    #[test]
+    fn shader_declares_things_before_it_uses_them() {
+        let mut last = 0;
+        for token in [
+            "uniform vec2 size;",
+            "uniform float rubix_border;",
+            "uniform float rubix_glow;",
+            "uniform float rubix_falloff;",
+            "float roundRectSdf",
+            "float ringCoverage",
+            "float dither",
+            "void main",
+        ] {
+            let at = BORDER_RING.find(token).unwrap_or_else(|| panic!("{token} missing"));
+            assert!(at > last, "{token} appears before something that uses it");
+            last = at;
+        }
+    }
+
+    // The glow is a long ramp from a high absolute luminance to nothing, and
+    // max() would crease where it meets the ring. Both mitigations are easy to
+    // undo by accident while editing the shader.
+    #[test]
+    fn coverage_is_a_union_and_is_supersampled() {
+        assert!(
+            BORDER_RING.contains("ring + glow * (1.0 - ring)"),
+            "glow must composite under the ring, not max() with it"
+        );
+        assert_eq!(
+            BORDER_RING.matches("ringCoverage(centred").count(),
+            4,
+            "coverage should be sampled at four sub-pixel offsets"
+        );
+        assert!(BORDER_RING.contains("dither("), "banding mitigation removed");
     }
 
     #[test]
