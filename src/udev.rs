@@ -1832,6 +1832,9 @@ fn gather_tagged_elements<'a>(
 
     let output_geo = state.space.output_geometry(output);
 
+    // Computed once per output: each window is tested against the ones above
+    // it, which cannot be done from inside the loop without re-walking.
+    let occlusion = crate::decoration::occlusion_map(state, output);
     let mut space_tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
     // Compiled before the loop so the renderer borrow is released; `None`
     // means either rounding is off or its shaders failed to build, and either
@@ -1868,7 +1871,11 @@ fn gather_tagged_elements<'a>(
             // the solid-colour transform that decode installs.
             // Resolved once and shared by the border and the window's own
             // surfaces, so the two cannot disagree about which rule matched.
-            let style = window_id.map(|id| crate::decoration::style_for_window(state, id));
+            let style = window_id.map(|id| crate::decoration::style_for_window(
+                state,
+                id,
+                occlusion.get(&id).copied().unwrap_or(0.0),
+            ));
             let opacity = style.as_ref().map_or(1.0, |s| s.opacity);
             if let (Some(id), Some(style)) = (window_id, style.as_ref()) {
                 let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);

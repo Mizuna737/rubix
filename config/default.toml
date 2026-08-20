@@ -152,6 +152,28 @@ inactive_color = "#45475a"
 # active_opacity = 1.0
 # inactive_opacity = 0.92
 
+# Opacity for a window that is covered by other windows. 1.0 (the default)
+# switches the whole occlusion check off, including its per-frame geometry.
+#
+# This exists because of translucency, not in spite of it. Promote a window over
+# its neighbours and, at anything under full opacity, those neighbours bleed
+# through it and the result is muddy. Fading what is underneath means what shows
+# through a promoted window is mostly wallpaper instead of a pile of other
+# windows.
+#
+# Windows above count as occluders whatever their own opacity: if the window on
+# top were opaque, the one below would already be culled and none of this would
+# matter.
+#
+# Fading only ever goes one way -- a window a rule already made more transparent
+# stays that way, and being covered can only fade it further.
+# obscured_opacity = 0.25
+
+# How covered a window must be, 0.0-1.0, before it counts as obscured. The 0.9
+# default means a window peeking out by a few pixels behind a maximized
+# neighbour still fades.
+# obscured_threshold = 0.9
+
 # Per-window rules, applied in file order over the defaults above.
 #
 # `app_id` and `title` are case-insensitive SUBSTRING matches. When both are

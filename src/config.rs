@@ -429,6 +429,11 @@ pub struct DecorationConfig {
     pub active: WindowStyle,
     pub inactive: WindowStyle,
     pub rules: Vec<BorderRule>,
+    /// Opacity for a window covered by others. `1.0` (the default) disables
+    /// the whole occlusion check, including its per-frame geometry work.
+    pub obscured_opacity: f32,
+    /// How covered a window must be, 0.0-1.0, before it counts as obscured.
+    pub obscured_threshold: f32,
 }
 
 /// A conditional override. Both matchers are case-insensitive substring tests,
@@ -538,6 +543,10 @@ struct RawDecoration {
     active_opacity: f32,
     #[serde(default = "default_opacity")]
     inactive_opacity: f32,
+    #[serde(default = "default_opacity")]
+    obscured_opacity: f32,
+    #[serde(default = "default_obscured_threshold")]
+    obscured_threshold: f32,
     // Singular to match the `[[decoration.rule]]` array-of-tables header
     // exactly, same convention as `[[output]]`.
     #[serde(default)]
@@ -558,6 +567,8 @@ impl Default for RawDecoration {
             glow_falloff: default_glow_falloff(),
             active_opacity: default_opacity(),
             inactive_opacity: default_opacity(),
+            obscured_opacity: default_opacity(),
+            obscured_threshold: default_obscured_threshold(),
             rule: Vec::new(),
         }
     }
@@ -601,6 +612,12 @@ fn default_glow_falloff() -> f32 {
 
 fn default_opacity() -> f32 {
     1.0
+}
+
+/// Nearly-covered rather than entirely covered, so a window peeking out by a
+/// few pixels behind a maximized neighbour still fades.
+fn default_obscured_threshold() -> f32 {
+    0.9
 }
 
 fn default_active_color() -> String {
@@ -713,6 +730,8 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
             opacity: resolve_opacity(raw.inactive_opacity),
         },
         rules,
+        obscured_opacity: resolve_opacity(raw.obscured_opacity),
+        obscured_threshold: resolve_opacity(raw.obscured_threshold),
     }
 }
 

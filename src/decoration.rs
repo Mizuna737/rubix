@@ -28,6 +28,7 @@
 //! monitor sees ordinary borders and pays nothing.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use smithay::backend::renderer::element::{
     Element, Id, Kind, RenderElement, UnderlyingStorage,
@@ -42,6 +43,8 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{
     Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Transform,
 };
+
+use smithay::output::Output;
 
 use crate::config::WindowStyle;
 use crate::rounding::GlesAccess;
@@ -271,6 +274,66 @@ pub(crate) fn resolved_color(style: &WindowStyle, hdr: bool, sdr_white_nits: f32
     crate::hdr_shaders::srgb_to_bt2020_abs10k(style.color, nits)
 }
 
+/// What fraction of `target` is covered by `occluders`, 0.0 to 1.0.
+///
+/// Exact rather than estimated: the occluders are subtracted from the target
+/// and what survives is the uncovered area. Overlapping occluders therefore
+/// cannot double-count, which a naive sum of intersection areas would do --
+/// and would report a window as more covered than it is, making it flicker
+/// between faded and not as windows move.
+pub(crate) fn covered_fraction(
+    target: Rectangle<i32, Logical>,
+    occluders: &[Rectangle<i32, Logical>],
+) -> f32 {
+    let total = target.size.w as i64 * target.size.h as i64;
+    if total <= 0 {
+        return 0.0;
+    }
+    let uncovered: i64 = target
+        .subtract_rects(occluders.iter().copied())
+        .iter()
+        .map(|r| r.size.w as i64 * r.size.h as i64)
+        .sum();
+    (1.0 - uncovered as f32 / total as f32).clamp(0.0, 1.0)
+}
+
+/// How covered each window on `output` is, keyed by window id.
+///
+/// Walks front-to-back accumulating the windows already passed, so each window
+/// is tested only against the ones stacked above it.
+///
+/// Occluders count regardless of their own opacity, which is deliberate. The
+/// point of fading a covered window is not that it cannot be seen -- if the
+/// window above were opaque it could not be seen anyway, and the renderer
+/// would already be culling it. The point is that the window above is
+/// *translucent*, so a covered window bleeds through it and makes it muddy.
+pub(crate) fn occlusion_map(state: &RubixState, output: &Output) -> HashMap<u32, f32> {
+    let mut map = HashMap::new();
+    if state.config.decoration.obscured_opacity >= 1.0 {
+        return map;
+    }
+    let Some(region) = state.space.output_geometry(output) else {
+        return map;
+    };
+    let mut occluders: Vec<Rectangle<i32, Logical>> = Vec::new();
+    for window in state.space.elements().rev() {
+        let Some(location) = state.space.element_location(window) else { continue };
+        let rect = Rectangle::new(location, window.geometry().size);
+        if !region.overlaps(rect) {
+            continue;
+        }
+        if let Some(id) = state
+            .windows
+            .iter()
+            .find_map(|(id, w)| (w == window).then_some(*id))
+        {
+            map.insert(id, covered_fraction(rect, &occluders));
+        }
+        occluders.push(rect);
+    }
+    map
+}
+
 /// The style in force for one window right now.
 ///
 /// Resolved once per window per frame and shared by the window's own surfaces
@@ -281,13 +344,24 @@ pub(crate) fn resolved_color(style: &WindowStyle, hdr: bool, sdr_white_nits: f32
 /// A translucent window cannot take direct primary-plane scanout, which is the
 /// path a fullscreen window exists to get -- the same trade borders and
 /// rounding already make.
-pub(crate) fn style_for_window(state: &RubixState, id: u32) -> WindowStyle {
+pub(crate) fn style_for_window(state: &RubixState, id: u32, covered: f32) -> WindowStyle {
+    let deco = &state.config.decoration;
     let (app_id, title) = state.window_identity(id);
-    let mut style = state.config.decoration.style_for(
+    let mut style = deco.style_for(
         app_id.as_deref(),
         title.as_deref(),
         state.focused_window_id() == Some(id),
     );
+    // `min`, not assignment: a window a rule already made more transparent
+    // stays that way, and being covered can only ever fade it further. That
+    // keeps the interaction monotone, so no rule can be surprised into becoming
+    // *more* visible by being obscured.
+    if covered >= deco.obscured_threshold {
+        style.opacity = style.opacity.min(deco.obscured_opacity);
+    }
+    // Applied last so it wins over everything: a translucent window cannot take
+    // direct primary-plane scanout, which is the path a fullscreen window
+    // exists to get.
     if state.fullscreen_windows.contains(&id) {
         style.opacity = 1.0;
     }
@@ -370,7 +444,9 @@ where
             area,
             // No opaque regions: a ring is a band and a glow over a hole.
             None,
-            1.0,
+            // The ring fades with its window: the shader multiplies by this,
+            // so a dimmed window does not keep a full-strength border.
+            style.opacity,
             vec![
                 Uniform::new("rubix_color", (color.r(), color.g(), color.b(), color.a())),
                 Uniform::new("rubix_radius", radius),
@@ -402,6 +478,78 @@ mod tests {
     }
 
     // The shader deflates by exactly this margin to recover the window rect.
+    // ---- occlusion ----
+
+    #[test]
+    fn nothing_above_means_nothing_covered() {
+        assert_eq!(covered_fraction(rect(0, 0, 100, 100), &[]), 0.0);
+    }
+
+    #[test]
+    fn an_exactly_matching_occluder_covers_everything() {
+        let w = rect(10, 10, 100, 100);
+        assert_eq!(covered_fraction(w, &[w]), 1.0);
+    }
+
+    #[test]
+    fn a_larger_occluder_covers_everything() {
+        assert_eq!(
+            covered_fraction(rect(10, 10, 100, 100), &[rect(0, 0, 500, 500)]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_disjoint_occluder_covers_nothing() {
+        assert_eq!(
+            covered_fraction(rect(0, 0, 100, 100), &[rect(200, 200, 50, 50)]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn half_covering_reports_half() {
+        let covered = covered_fraction(rect(0, 0, 100, 100), &[rect(0, 0, 50, 100)]);
+        assert!((covered - 0.5).abs() < 1e-5, "got {covered}");
+    }
+
+    // The reason this is computed by subtraction rather than by summing
+    // intersection areas: overlapping occluders would double-count, report more
+    // than 100% coverage, and make a window flicker in and out of the faded
+    // state as its neighbours move.
+    #[test]
+    fn overlapping_occluders_are_not_double_counted() {
+        let covered = covered_fraction(
+            rect(0, 0, 100, 100),
+            &[rect(0, 0, 60, 100), rect(40, 0, 60, 100)],
+        );
+        assert!((covered - 1.0).abs() < 1e-5, "got {covered}");
+    }
+
+    #[test]
+    fn two_partial_occluders_sum_to_their_union() {
+        // Left quarter and right quarter, not touching: half in total.
+        let covered = covered_fraction(
+            rect(0, 0, 100, 100),
+            &[rect(0, 0, 25, 100), rect(75, 0, 25, 100)],
+        );
+        assert!((covered - 0.5).abs() < 1e-5, "got {covered}");
+    }
+
+    #[test]
+    fn a_degenerate_window_reports_no_coverage_rather_than_dividing_by_zero() {
+        assert_eq!(covered_fraction(rect(0, 0, 0, 0), &[rect(0, 0, 10, 10)]), 0.0);
+    }
+
+    // A window peeking out from behind a maximized neighbour by a few pixels
+    // should still fade -- which is why the default threshold is 0.9 and not
+    // 1.0.
+    #[test]
+    fn a_nearly_covered_window_passes_the_default_threshold() {
+        let covered = covered_fraction(rect(0, 0, 100, 100), &[rect(0, 0, 100, 96)]);
+        assert!(covered >= 0.9, "got {covered}");
+    }
+
     #[test]
     fn ring_area_inflates_by_border_plus_glow_on_every_side() {
         let area = ring_area(rect(10, 20, 100, 50), 2, 8);

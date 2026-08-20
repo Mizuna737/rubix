@@ -510,6 +510,7 @@ where
         || deco.inactive.glow_margin > 0
         || deco.active.opacity < 1.0
         || deco.inactive.opacity < 1.0
+        || deco.obscured_opacity < 1.0
         || deco.rules.iter().any(|r| {
             [&r.active, &r.inactive].into_iter().any(|s| {
                 s.opacity.is_some_and(|o| o < 1.0) || s.glow_margin.is_some_and(|g| g > 0)
@@ -532,6 +533,10 @@ where
     let round = (radius > 0.0)
         .then(|| round_shaders(renderer.gles_renderer()))
         .flatten();
+
+    // Computed once per output: each window is tested against the ones above
+    // it, which cannot be done from inside the loop without re-walking.
+    let occlusion = crate::decoration::occlusion_map(state, output);
 
     let mut elements = Vec::new();
     for window in state.space.elements().rev() {
@@ -559,7 +564,11 @@ where
 
         // Resolved once and shared by the border and the window's own surfaces,
         // so the two cannot disagree about which rule matched.
-        let style = id.map(|id| crate::decoration::style_for_window(state, id));
+        let style = id.map(|id| crate::decoration::style_for_window(
+                state,
+                id,
+                occlusion.get(&id).copied().unwrap_or(0.0),
+            ));
         if let (Some(id), Some(style)) = (id, style.as_ref()) {
             if let Some(ring) = crate::decoration::window_border_elements(
                 state, renderer, id, style, local_rect, hdr,
