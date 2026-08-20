@@ -112,11 +112,16 @@ pub fn surface_description_present(surface: &WlSurface) -> bool {
 /// image description, so it is being treated as SDR.
 ///
 /// This is the shape of the KCD2 failure: the game reads our HDR output
-/// description, enables its HDR setting, then has no advertised way to tag its
-/// own surface -- `create_windows_scrgb` is the request DXGI titles reach for
-/// and we do not advertise `Feature::WindowsScrgb` -- so it submits HDR-range
-/// content untagged. We then drive the connector to SDR underneath it. Nothing
-/// errors; the picture is simply wrong, and the log said nothing at all.
+/// description, enables its HDR setting, then submits HDR-range content without
+/// tagging its own surface. We then drive the connector to SDR underneath it.
+/// Nothing errors; the picture is simply wrong, and the log said nothing at all.
+///
+/// The original diagnosis -- that the client had no advertised way to tag itself --
+/// no longer holds: `init` now advertises `Feature::WindowsScrgb` and
+/// `Feature::WindowsBt2100`, the two requests DXGI titles reach for. An untagged
+/// surface today means the client had a way to speak and did not use it, most
+/// likely because it never bound `wp_color_manager_v1` at all. The condition is
+/// still worth reporting; only the explanation changed.
 pub fn note_untagged_fullscreen(surface: &WlSurface, output_name: &str) {
     if surface_description_present(surface) {
         return;
@@ -126,9 +131,10 @@ pub fn note_untagged_fullscreen(surface: &WlSurface, output_name: &str) {
     }
     tracing::warn!(
         "fullscreen surface on HDR-capable output {output_name} committed NO color-management \
-         image description -- treating as SDR and dropping the connector out of HDR. If this \
-         client believes it is producing HDR, it had no advertised way to say so (see \
-         color_management::init: no Feature::WindowsScrgb / WindowsBt2100)."
+         image description -- treating as SDR and dropping the connector out of HDR. Rubix \
+         advertises WindowsScrgb and WindowsBt2100, so a client that believes it is producing \
+         HDR had a way to say so and did not use it -- most likely it never bound \
+         wp_color_manager_v1."
     );
 }
 

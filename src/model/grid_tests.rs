@@ -821,3 +821,54 @@
         mon.columns[1].groups.clear();
         assert!(matches!(mon.reveal_window(7), Some(RevealKind::Swapped)));
     }
+
+    // ---- visible-band cursor clamping ----
+    // compute_layout emits columns[0..visible_columns), so active_column has to stay
+    // inside that band or nav drives a column that is not on screen.
+
+    #[test]
+    fn shrinking_the_visible_band_pulls_the_cursor_back_on_screen() {
+        let mut mon = monitor_from(&[&[1], &[2], &[3]], &[0, 0, 0]);
+        mon.active_column = 2;
+        mon.increment_visible_columns(-1);
+        assert_eq!(mon.visible_columns, 2);
+        assert_eq!(
+            mon.active_column, 1,
+            "cursor must not sit on a column compute_layout no longer emits"
+        );
+    }
+
+    #[test]
+    fn shrinking_leaves_an_already_visible_cursor_alone() {
+        let mut mon = monitor_from(&[&[1], &[2], &[3]], &[0, 0, 0]);
+        mon.active_column = 0;
+        mon.increment_visible_columns(-1);
+        assert_eq!(mon.active_column, 0);
+    }
+
+    #[test]
+    fn growing_the_visible_band_never_moves_the_cursor() {
+        let mut mon = monitor_from(&[&[1], &[2], &[3]], &[0, 0, 0]);
+        mon.increment_visible_columns(-2);
+        assert_eq!(mon.active_column, 0);
+        mon.increment_visible_columns(2);
+        assert_eq!(mon.visible_columns, 3);
+        assert_eq!(
+            mon.active_column, 0,
+            "widening reveals columns; it does not chase the cursor"
+        );
+    }
+
+    #[test]
+    fn collapsing_to_one_column_leaves_the_cursor_addressable() {
+        let mut mon = monitor_from(&[&[1], &[2], &[3]], &[0, 0, 0]);
+        mon.active_column = 2;
+        mon.increment_visible_columns(-5);
+        assert_eq!(mon.visible_columns, 1, "band clamps to 1, never 0");
+        assert_eq!(mon.active_column, 0);
+        assert_eq!(
+            mon.active_window(),
+            Some(1),
+            "the cursor must address the one visible column"
+        );
+    }

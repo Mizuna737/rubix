@@ -259,6 +259,11 @@ pub struct HdrShaders {
     pub decode_windows_scrgb: GlesTexProgram,
     pub encode: GlesTexProgram,
     /// Tone-mapping encode for capture targets. See [`ENCODE_LINEAR_TO_SDR`].
+    ///
+    /// Compiled but not yet wired: screencopy and the ScreenCast portal both still
+    /// re-render surfaces in SDR rather than tone-mapping the HDR composite, so
+    /// nothing reads this yet. It is the shader HDR Phase 4a needs.
+    #[allow(dead_code)]
     pub encode_sdr: GlesTexProgram,
 }
 

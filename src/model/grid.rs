@@ -107,6 +107,10 @@ impl CountWindows for Group {
 }
 
 pub struct Column {
+    /// Reserved for manual column-band widths (roadmap Tier 1). compute_layout still
+    /// divides the monitor into equal bands and ignores this, so it is written by
+    /// `new` and never read. Kept as the hook that feature will use.
+    #[allow(dead_code)]
     width: u32,
     active_row: usize,
     groups: Vec<Group>
@@ -170,6 +174,12 @@ impl Monitor {
     pub fn increment_visible_columns(&mut self, change: isize) {
         let new = self.visible_columns as isize + change;
         self.visible_columns = new.clamp(1,self.columns.len().max(1) as isize) as usize;
+        // compute_layout emits columns[0..visible_columns), so the cursor has to stay
+        // inside that band. Shrinking used to leave active_column pointing at a column
+        // that had just gone off screen, and nav (scroll_active_column, grow_active_column,
+        // active_window) kept operating on it until the cursor happened to move back.
+        // The clamp above guarantees visible_columns >= 1, so the subtraction is sound.
+        self.active_column = self.active_column.min(self.visible_columns - 1);
     }
 
     pub fn active_window(&self) -> Option<u32> {
