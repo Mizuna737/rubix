@@ -42,21 +42,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xcursor = "0.3"
 zbus = "5"
 
-# HDR Phase 1a: pin the dividebysandwich/smithay fork, which adds connector
-# color-state support (Colorspace/HDR metadata/max_bpc commit) not yet upstream.
-# smithay and smithay-drm-extras are one workspace in the fork and must move
-# together. The fork still reports version 0.7.0, so this patch is accepted
-# against the "0.7"/"0.1" version requirements above.
+# Rubix pins a fork of Smithay. Two deltas, in order:
 #
-# Phase 5d added a SECOND delta on top of that fork: `MultiFrame::render_frame_mut`,
-# exposing the inner backend frame so a render element can set a per-element shader
-# program on the udev path (see decoration.rs). Upstream keeps that field private with
-# no accessor, which makes rounded corners unimplementable on the multi-GPU renderer.
-# The patch lives on the `rubix-patches` branch of the local checkout below.
+#   Smithay/smithay  ->  dividebysandwich/smithay  ->  Mizuna737/smithay (rubix-patches)
 #
-# LOCAL PATH, NOT A GIT REV -- this does not build on another machine as-is.
-# Before any release the `rubix-patches` branch has to be pushed somewhere public
-# and this repointed at a git rev, exactly like the pin it replaces.
+# 1. dividebysandwich/smithay adds connector color-state support (Colorspace, HDR
+#    metadata, max_bpc) plus the color-management protocol work, none of it upstream.
+#    This is what makes Rubix's HDR path possible at all. (HDR Phase 1a)
+# 2. `rubix-patches` adds one 17-line commit on top: `MultiFrame::render_frame_mut`,
+#    exposing the inner backend frame so a render element can set a per-element shader
+#    program on the udev path (see decoration.rs). Upstream keeps that field private
+#    with no accessor, which makes rounded corners unimplementable on the multi-GPU
+#    renderer. (HDR Phase 5d)
+#
+# smithay and smithay-drm-extras are one workspace in the fork and must move together;
+# both entries point at the same repo and rev. The fork still reports version 0.7.0, so
+# this patch is accepted against the "0.7"/"0.1" version requirements above.
+#
+# The pin is a fixed rev, bumped deliberately -- not tracked. Do not switch this to a
+# branch: a branch moves under anyone who cloned earlier, which defeats the point.
 [patch.crates-io]
-smithay = { path = "/home/max/Projects/smithay" }
-smithay-drm-extras = { path = "/home/max/Projects/smithay/smithay-drm-extras" }
+smithay = { git = "https://github.com/Mizuna737/smithay.git", rev = "f2cada559a91050ba1095c30e1d5f46af1eda397" }
+smithay-drm-extras = { git = "https://github.com/Mizuna737/smithay.git", rev = "f2cada559a91050ba1095c30e1d5f46af1eda397" }

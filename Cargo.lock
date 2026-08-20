@@ -1948,6 +1948,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smithay"
 version = "0.7.0"
+source = "git+https://github.com/Mizuna737/smithay.git?rev=f2cada559a91050ba1095c30e1d5f46af1eda397#f2cada559a91050ba1095c30e1d5f46af1eda397"
 dependencies = [
  "aliasable",
  "appendlist",
@@ -2028,6 +2029,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
+source = "git+https://github.com/Mizuna737/smithay.git?rev=f2cada559a91050ba1095c30e1d5f46af1eda397#f2cada559a91050ba1095c30e1d5f46af1eda397"
 dependencies = [
  "drm",
 ]
