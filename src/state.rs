@@ -311,6 +311,17 @@ pub struct RubixState {
     // way: it is either current or it is a bug with a visible cause.
     pub(crate) hdr_outputs: HashSet<String>,
 
+    /// What each connected display says its luminance range is, from its EDID's
+    /// CTA-861 HDR Static Metadata Block (see `crate::edid`).
+    ///
+    /// Separate from `hdr_outputs` on purpose, and not a sync hazard: whether an
+    /// output is *running* HDR is dynamic (`toggle_hdr` flips it), while what the
+    /// panel is *capable* of is fixed for as long as it stays plugged in. Keyed
+    /// by output name, populated on connect and dropped on disconnect. A missing
+    /// entry means the display said nothing usable, and callers fall back to
+    /// `HdrLuminance::FALLBACK`.
+    pub(crate) hdr_luminance: HashMap<String, crate::edid::HdrLuminance>,
+
     // wp_presentation: lets clients learn when a frame actually hit the
     // display, which is what VK_KHR_present_wait / present_id are built on and
     // what video players use for frame pacing. Feedback is collected per frame
@@ -523,6 +534,7 @@ impl RubixState {
             pending_screencopy: Vec::new(),
 
             hdr_outputs: HashSet::new(),
+            hdr_luminance: HashMap::new(),
             presentation_state,
             color_management_state,
             loop_handle,

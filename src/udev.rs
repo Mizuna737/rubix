@@ -964,6 +964,38 @@ fn connector_connected(
         },
     );
 
+    // What this panel can actually do, straight off its EDID. Cached before the
+    // first frame because a client can query `description_for_output` at any
+    // time, and this is what decides the `target_luminance` it is told.
+    match crate::edid::read_edid(backend.drm_output_manager.device(), connector.handle())
+        .as_deref()
+        .and_then(crate::edid::hdr_luminance)
+    {
+        Some(lum) => {
+            tracing::info!(
+                "{cached_output_name}: EDID reports peak {} cd/m2, frame-average {} cd/m2, \
+                 black {} (0.0001 cd/m2)",
+                lum.max_cd_m2,
+                lum.max_frame_average_cd_m2,
+                lum.min_0001_cd_m2,
+            );
+            data.hdr_luminance.insert(cached_output_name.clone(), lum);
+        }
+        None => {
+            data.hdr_luminance.remove(&cached_output_name);
+            if output_hdr {
+                // Only worth saying when we are about to advertise HDR anyway:
+                // an SDR output having no HDR block is entirely unremarkable.
+                tracing::warn!(
+                    "{cached_output_name}: HDR enabled but the EDID carries no usable HDR \
+                     static metadata; advertising the {} cd/m2 fallback, which may overstate \
+                     this display",
+                    crate::edid::HdrLuminance::FALLBACK.max_cd_m2,
+                );
+            }
+        }
+    }
+
     // Keep the description cache in step from the moment the output exists --
     // a client can query `description_for_output` before the first frame.
     if output_hdr {
@@ -1186,6 +1218,13 @@ fn connector_disconnected(
     // is now dangling hardware -- fail it per protocol ("The output
     // disappeared") rather than leaving it silently stale.
     crate::output_power::output_removed(data, &surface.output.name());
+    // Both description caches are keyed by output name, so a stale entry would
+    // be inherited by whatever reconnects under that name next -- an SDR display
+    // plugged into the port an HDR one just left would be described as HDR, with
+    // the departed panel's luminance range. Neither was being cleaned before.
+    let name = surface.output.name();
+    data.hdr_outputs.remove(&name);
+    data.hdr_luminance.remove(&name);
     tracing::info!("connector on {crtc:?} disconnected from {node}");
 }
 

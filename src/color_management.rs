@@ -142,7 +142,7 @@ pub fn note_untagged_fullscreen(surface: &WlSurface, output_name: &str) {
 /// clients detect display HDR headroom. `ref_white` ties the advertised
 /// reference white to the live SDR-white slider so SDR content sits at the same
 /// level clients expect.
-fn hdr_output_description(ref_white: u32) -> ImageDescription {
+fn hdr_output_description(ref_white: u32, lum: crate::edid::HdrLuminance) -> ImageDescription {
     ImageDescription {
         transfer: TransferFunction::St2084Pq,
         primaries: PrimariesOption { named: Some(Primaries::Bt2020), values: None },
@@ -150,9 +150,16 @@ fn hdr_output_description(ref_white: u32) -> ImageDescription {
         max_fall: None,
         mastering_luminance: None,
         mastering_primaries: None,
-        // (min 0.0001 cd/m², max cd/m², reference white cd/m²). 1000-nit peak
-        // matches our Phase 1a mastering metadata; ref white follows the slider.
-        luminances: Some((50, 1000, ref_white)),
+        // (min 0.0001 cd/m², max cd/m², reference white cd/m²). Peak and black
+        // come from the display's own EDID (see `crate::edid`); ref white
+        // follows the slider.
+        //
+        // This was a hardcoded 1000-nit peak for every HDR output. Clients use
+        // `target_luminance` to decide how hard to tone-map, so on a panel that
+        // does 604 that told a well-behaved client to grade for a display 65%
+        // brighter than the real one -- and everything above the true peak
+        // clipped to flat white, with us having said it was fine.
+        luminances: Some((lum.min_0001_cd_m2, lum.max_cd_m2, ref_white)),
         windows_scrgb: false,
         windows_bt2100: false,
     }
@@ -332,7 +339,15 @@ impl ColorManagementHandler for RubixState {
             if is_hdr { "PQ/BT.2020 HDR" } else { "sRGB" },
         );
         if is_hdr {
-            hdr_output_description(self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32)
+            // The panel's own range, or the fallback if its EDID said nothing.
+            let luminance = output_name
+                .as_deref()
+                .and_then(|name| self.hdr_luminance.get(name).copied())
+                .unwrap_or(crate::edid::HdrLuminance::FALLBACK);
+            hdr_output_description(
+                self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32,
+                luminance,
+            )
         } else {
             ImageDescription::SRGB
         }
@@ -360,7 +375,15 @@ impl ColorManagementHandler for RubixState {
             self.hdr_outputs,
         );
         if is_hdr {
-            hdr_output_description(self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32)
+            let luminance = self
+                .hdr_luminance
+                .get(output.name().as_str())
+                .copied()
+                .unwrap_or(crate::edid::HdrLuminance::FALLBACK);
+            hdr_output_description(
+                self.sdr_white_nits.round().clamp(1.0, 10_000.0) as u32,
+                luminance,
+            )
         } else {
             ImageDescription::SRGB
         }
@@ -415,7 +438,7 @@ mod tests {
 
     #[test]
     fn hdr_output_description_is_pq_bt2020_with_ref_white() {
-        let desc = hdr_output_description(203);
+        let desc = hdr_output_description(203, crate::edid::HdrLuminance::FALLBACK);
         assert_eq!(desc.transfer, TransferFunction::St2084Pq);
         assert_eq!(desc.primaries.named, Some(Primaries::Bt2020));
         assert_eq!(desc.luminances, Some((50, 1000, 203)));

@@ -6,6 +6,7 @@ mod color_management;
 mod config;
 mod cursor;
 mod decoration;
+mod edid;
 mod focus;
 mod grabs;
 mod hdr;
