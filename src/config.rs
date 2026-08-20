@@ -437,8 +437,48 @@ pub struct DecorationConfig {
 pub struct BorderRule {
     pub app_id: Option<String>,
     pub title: Option<String>,
-    pub active: Option<WindowStyle>,
-    pub inactive: Option<WindowStyle>,
+    pub active: StyleOverride,
+    pub inactive: StyleOverride,
+}
+
+/// The fields one rule sets, each independently optional.
+///
+/// Every field is separate so a rule can change exactly one thing -- setting
+/// only `active_opacity` should dim a window without also deciding its border
+/// colour. An earlier design required a rule to name a colour before any of its
+/// other fields applied, which meant an opacity-only rule silently did nothing.
+///
+/// `luminance_nits` is doubly optional on purpose: the outer layer is "did the
+/// rule mention it", the inner is "did it ask for no opinion" (a zero or
+/// negative value). Collapsing them would make `= 0` indistinguishable from
+/// omitting the key.
+#[derive(Default)]
+pub struct StyleOverride {
+    pub color: Option<Color32F>,
+    pub luminance_nits: Option<Option<f32>>,
+    pub glow_margin: Option<u32>,
+    pub glow_falloff: Option<f32>,
+    pub opacity: Option<f32>,
+}
+
+impl StyleOverride {
+    fn apply(&self, style: &mut WindowStyle) {
+        if let Some(color) = self.color {
+            style.color = color;
+        }
+        if let Some(nits) = self.luminance_nits {
+            style.luminance_nits = nits;
+        }
+        if let Some(glow) = self.glow_margin {
+            style.glow_margin = glow;
+        }
+        if let Some(falloff) = self.glow_falloff {
+            style.glow_falloff = falloff;
+        }
+        if let Some(opacity) = self.opacity {
+            style.opacity = opacity;
+        }
+    }
 }
 
 impl BorderRule {
@@ -454,24 +494,23 @@ impl BorderRule {
 }
 
 impl DecorationConfig {
-    /// The style for one window. First matching rule that actually supplies a
-    /// style for this focus state wins; otherwise the section default.
+    /// The style for one window: the section defaults, with every matching
+    /// rule layered over them in file order.
     ///
-    /// A rule that sets only `active_color` deliberately does NOT also take
-    /// over the inactive appearance -- it falls through to the next rule and
-    /// ultimately to the default, so a rule can restyle just the focused case
-    /// without silently owning both.
+    /// Rules accumulate rather than the first match winning, and each rule
+    /// touches only the fields it names. That makes a broad rule plus a narrow
+    /// exception work the obvious way -- dim every window, then a later rule
+    /// pins one class back to fully opaque without having to restate its
+    /// colours.
     pub fn style_for(&self, app_id: Option<&str>, title: Option<&str>, focused: bool) -> WindowStyle {
+        let mut style = if focused { self.active.clone() } else { self.inactive.clone() };
         for rule in &self.rules {
-            if !rule.matches(app_id, title) {
-                continue;
-            }
-            let candidate = if focused { &rule.active } else { &rule.inactive };
-            if let Some(style) = candidate {
-                return style.clone();
+            if rule.matches(app_id, title) {
+                let over = if focused { &rule.active } else { &rule.inactive };
+                over.apply(&mut style);
             }
         }
-        if focused { self.active.clone() } else { self.inactive.clone() }
+        style
     }
 }
 
@@ -632,44 +671,24 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
         .rule
         .into_iter()
         .map(|r| {
-            // A rule supplies a style for a focus state only if it named a
-            // color for it; a bare luminance with no color would otherwise
-            // silently restyle windows the user never mentioned a color for.
-            let falloff = r.glow_falloff.unwrap_or(raw.glow_falloff);
-            let style = |color: Option<String>,
-                         nits: Option<f32>,
-                         glow: Option<u32>,
-                         default_glow: u32,
-                         opacity: Option<f32>,
-                         default_opacity: f32,
-                         fallback: Color32F| {
-                color.map(|c| WindowStyle {
-                    color: resolve_color(&c, fallback),
-                    luminance_nits: resolve_luminance(nits),
-                    glow_margin: glow.unwrap_or(default_glow),
-                    glow_falloff: falloff,
-                    opacity: resolve_opacity(opacity.unwrap_or(default_opacity)),
-                })
+            let color = |text: Option<String>, fallback: Color32F| {
+                text.map(|c| resolve_color(&c, fallback))
             };
             BorderRule {
-                active: style(
-                    r.active_color,
-                    r.active_luminance_nits,
-                    r.active_glow_margin,
-                    raw.active_glow_margin,
-                    r.active_opacity,
-                    raw.active_opacity,
-                    active_fallback,
-                ),
-                inactive: style(
-                    r.inactive_color,
-                    r.inactive_luminance_nits,
-                    r.inactive_glow_margin,
-                    raw.inactive_glow_margin,
-                    r.inactive_opacity,
-                    raw.inactive_opacity,
-                    inactive_fallback,
-                ),
+                active: StyleOverride {
+                    color: color(r.active_color, active_fallback),
+                    luminance_nits: r.active_luminance_nits.map(|n| resolve_luminance(Some(n))),
+                    glow_margin: r.active_glow_margin,
+                    glow_falloff: r.glow_falloff,
+                    opacity: r.active_opacity.map(resolve_opacity),
+                },
+                inactive: StyleOverride {
+                    color: color(r.inactive_color, inactive_fallback),
+                    luminance_nits: r.inactive_luminance_nits.map(|n| resolve_luminance(Some(n))),
+                    glow_margin: r.inactive_glow_margin,
+                    glow_falloff: r.glow_falloff,
+                    opacity: r.inactive_opacity.map(resolve_opacity),
+                },
                 app_id: r.app_id,
                 title: r.title,
             }

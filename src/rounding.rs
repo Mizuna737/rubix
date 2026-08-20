@@ -511,10 +511,9 @@ where
         || deco.active.opacity < 1.0
         || deco.inactive.opacity < 1.0
         || deco.rules.iter().any(|r| {
-            [r.active.as_ref(), r.inactive.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|s| s.opacity < 1.0 || s.glow_margin > 0)
+            [&r.active, &r.inactive].into_iter().any(|s| {
+                s.opacity.is_some_and(|o| o < 1.0) || s.glow_margin.is_some_and(|g| g > 0)
+            })
         });
     let hdr = matches!(mode, RoundMode::Decode(_));
     let Some(region) = state.space.output_geometry(output) else {

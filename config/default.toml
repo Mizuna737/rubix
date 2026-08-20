@@ -152,23 +152,27 @@ inactive_color = "#45475a"
 # active_opacity = 1.0
 # inactive_opacity = 0.92
 
-# Per-window overrides, consulted in file order; the first rule that matches AND
-# supplies a color for the relevant focus state wins, otherwise the defaults
-# above apply. `app_id` and `title` are case-insensitive SUBSTRING matches; when
-# both are given both must match, and a rule with neither matches every window
-# (useful as a catch-all placed last).
+# Per-window rules, applied in file order over the defaults above.
 #
-# A rule that sets only `active_color` does not also take over the inactive
-# appearance -- it falls through, so a rule can restyle just the focused case.
+# `app_id` and `title` are case-insensitive SUBSTRING matches. When both are
+# given both must match; a rule with neither matches every window, which makes a
+# useful catch-all. Matching is on the Wayland app_id or the X11 WM_CLASS.
 #
-# A rule supplies a style for a focus state only when it names a COLOUR for
-# that state -- so a rule setting only `active_opacity` does nothing. Give it an
-# active_color too.
+# Rules ACCUMULATE rather than the first match winning, and each rule changes
+# only the fields it names. So a broad rule followed by a narrow exception works
+# the obvious way: dim everything, then pin one class or title back.
 #
 # [[decoration.rule]]
 # app_id = "signal"
 # active_color = "#f38ba8"
 # active_luminance_nits = 600.0
+#
+# Exempt video from a global dim, by title:
+#
+# [[decoration.rule]]
+# title = "youtube"
+# active_opacity = 1.0
+# inactive_opacity = 1.0
 #
 # [[decoration.rule]]
 # app_id = "alacritty"

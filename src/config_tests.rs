@@ -408,8 +408,10 @@
         );
     }
 
+    // Rules accumulate in file order, so a later rule wins for the fields it
+    // names -- the "broad rule, narrow exception" shape.
     #[test]
-    fn the_first_matching_rule_wins() {
+    fn a_later_matching_rule_overrides_an_earlier_one() {
         let deco = decoration_from(r##"
             [[rule]]
             app_id = "signal"
@@ -420,7 +422,26 @@
         "##);
         assert_eq!(
             deco.style_for(Some("signal"), None, true).color,
-            parse_color("#333333").unwrap()
+            parse_color("#444444").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_later_rule_leaves_fields_it_does_not_name_alone() {
+        let deco = decoration_from(r##"
+            [[rule]]
+            active_color = "#333333"
+            active_opacity = 0.5
+            [[rule]]
+            app_id = "signal"
+            active_opacity = 1.0
+        "##);
+        let style = deco.style_for(Some("signal"), None, true);
+        assert_eq!(style.opacity, 1.0, "the narrow rule pins opacity back");
+        assert_eq!(
+            style.color,
+            parse_color("#333333").unwrap(),
+            "and leaves the broad rule's colour in place"
         );
     }
 
@@ -524,18 +545,46 @@
         assert_eq!(deco.style_for(Some("firefox"), None, true).opacity, 1.0);
     }
 
-    // A rule supplies a style only when it names a colour, so a rule setting
-    // opacity alone must not silently take over -- same contract as the
-    // colours, and the reason it is worth pinning.
+    // Each field of a rule stands on its own: a rule may set opacity without
+    // also having to decide the window's border colour. This is the specific
+    // trap the override rework removed.
     #[test]
-    fn a_rule_without_a_colour_does_not_apply_its_opacity() {
+    fn a_rule_can_set_opacity_without_naming_a_colour() {
         let deco = decoration_from(r##"
             active_opacity = 1.0
+            active_color = "#111111"
             [[rule]]
             app_id = "alacritty"
             active_opacity = 0.5
         "##);
-        assert_eq!(deco.style_for(Some("alacritty"), None, true).opacity, 1.0);
+        let style = deco.style_for(Some("alacritty"), None, true);
+        assert_eq!(style.opacity, 0.5);
+        assert_eq!(
+            style.color,
+            parse_color("#111111").unwrap(),
+            "an opacity-only rule must not disturb the colour"
+        );
+    }
+
+    // The case Max actually wants: dim everything, then exempt video by title.
+    #[test]
+    fn a_title_rule_can_exempt_one_window_from_a_global_dim() {
+        let deco = decoration_from(r##"
+            active_opacity = 0.95
+            inactive_opacity = 0.85
+            [[rule]]
+            title = "youtube"
+            active_opacity = 1.0
+            inactive_opacity = 1.0
+        "##);
+        assert_eq!(
+            deco.style_for(Some("firefox"), Some("YouTube - Home"), false).opacity,
+            1.0
+        );
+        assert_eq!(
+            deco.style_for(Some("firefox"), Some("Hacker News"), false).opacity,
+            0.85
+        );
     }
 
     #[test]
