@@ -439,6 +439,11 @@ impl Config {
             })
             .collect();
 
+        // Clamped once and reused: `decoration`'s backdrop ceiling defaults to
+        // window white, and must track the *clamped* value rather than the raw
+        // one so an out-of-range `sdr_white_nits` cannot drag the backdrop
+        // reference somewhere the display never goes.
+        let sdr_white_nits = raw.sdr_white_nits.clamp(80.0, 300.0);
         Config {
             visible_columns: raw.layout.visible_columns,
             diagnostics: DiagnosticsConfig { config_errors: raw.diagnostics.config_errors },
@@ -459,9 +464,9 @@ impl Config {
                 interval_seconds: raw.wallpaper.interval_seconds.max(1),
                 sdr_reference_nits: raw.wallpaper.sdr_reference_nits.clamp(80.0, 10000.0),
             },
-            sdr_white_nits: raw.sdr_white_nits.clamp(80.0, 300.0),
+            sdr_white_nits,
             focus_follows_mouse: raw.input.focus_follows_mouse,
-            decoration: resolve_decoration(raw.decoration),
+            decoration: resolve_decoration(raw.decoration, sdr_white_nits),
             idle: IdleConfig {
                 enabled: raw.idle.enabled,
                 screen_off_seconds: raw.idle.screen_off_seconds,
@@ -637,6 +642,21 @@ pub struct WindowStyle {
     /// window untouched and preserves every optimization an opaque window
     /// gets.
     pub opacity: f32,
+    /// Cap the backdrop quad's highlights at `sdr_reference_nits` instead of
+    /// letting the raw HDR wallpaper show through. `false` (the default)
+    /// preserves existing behaviour.
+    pub backdrop_tonemap: bool,
+    /// Sample the pre-blurred backdrop buffer instead of the sharp wallpaper.
+    /// `false` (the default) preserves existing behaviour.
+    pub backdrop_blur: bool,
+}
+
+impl Default for DecorationConfig {
+    /// The resolved defaults, for callers (tests, mostly) that want a
+    /// baseline `DecorationConfig` without going through TOML parsing.
+    fn default() -> Self {
+        resolve_decoration(RawDecoration::default(), default_sdr_white_nits())
+    }
 }
 
 /// Resolved `[decoration]`. `active`/`inactive` are the fallbacks; `rules` are
@@ -657,6 +677,23 @@ pub struct DecorationConfig {
     pub obscured_opacity: f32,
     /// How covered a window must be, 0.0-1.0, before it counts as obscured.
     pub obscured_threshold: f32,
+    /// Blur radius for the backdrop, in logical pixels. Global rather than
+    /// per-rule: each distinct radius needs its own precomputed buffer, and a
+    /// 4K 16-bit RGBA wallpaper is already ~66 MB. `0` disables blur
+    /// entirely and skips the blur work at decode time.
+    pub backdrop_blur_radius: u32,
+    /// Ceiling, in nits, for the backdrop quad's highlights. Separate from
+    /// `sdr_reference_nits`, which normalises the *whole* wallpaper for an SDR
+    /// output and is deliberately large; this one answers a different
+    /// question -- "how bright may what shows through a window get" -- and its
+    /// natural answer is window white. Defaults to the live `sdr_white_nits`.
+    ///
+    /// The roll-off knee sits at `0.8x` this value, so a setting above the
+    /// wallpaper's actual peak luminance makes the cap an exact no-op.
+    /// Clamped to `[10.0, 10000.0]` -- the floor is far below
+    /// `sdr_white_nits`'s own `[80, 300]` because useful values here are
+    /// expected to sit well *under* window white.
+    pub backdrop_luminance_nits: f32,
 }
 
 /// A conditional override. Both matchers are case-insensitive substring tests,
@@ -687,6 +724,8 @@ pub struct StyleOverride {
     pub glow_margin: Option<u32>,
     pub glow_falloff: Option<f32>,
     pub opacity: Option<f32>,
+    pub backdrop_tonemap: Option<bool>,
+    pub backdrop_blur: Option<bool>,
 }
 
 impl StyleOverride {
@@ -705,6 +744,12 @@ impl StyleOverride {
         }
         if let Some(opacity) = self.opacity {
             style.opacity = opacity;
+        }
+        if let Some(tonemap) = self.backdrop_tonemap {
+            style.backdrop_tonemap = tonemap;
+        }
+        if let Some(blur) = self.backdrop_blur {
+            style.backdrop_blur = blur;
         }
     }
 }
@@ -770,6 +815,21 @@ struct RawDecoration {
     obscured_opacity: f32,
     #[serde(default = "default_obscured_threshold")]
     obscured_threshold: f32,
+    #[serde(default)]
+    active_backdrop_tonemap: bool,
+    #[serde(default)]
+    inactive_backdrop_tonemap: bool,
+    #[serde(default)]
+    active_backdrop_blur: bool,
+    #[serde(default)]
+    inactive_backdrop_blur: bool,
+    #[serde(default = "default_backdrop_blur_radius")]
+    backdrop_blur_radius: u32,
+    // `None` rather than a default fn: the fallback is the live
+    // `sdr_white_nits`, which lives on a different struct and is not knowable
+    // here. Resolved in `resolve_decoration`.
+    #[serde(default)]
+    backdrop_luminance_nits: Option<f32>,
     // Singular to match the `[[decoration.rule]]` array-of-tables header
     // exactly, same convention as `[[output]]`.
     #[serde(default)]
@@ -792,6 +852,12 @@ impl Default for RawDecoration {
             inactive_opacity: default_opacity(),
             obscured_opacity: default_opacity(),
             obscured_threshold: default_obscured_threshold(),
+            active_backdrop_tonemap: false,
+            inactive_backdrop_tonemap: false,
+            active_backdrop_blur: false,
+            inactive_backdrop_blur: false,
+            backdrop_blur_radius: default_backdrop_blur_radius(),
+            backdrop_luminance_nits: None,
             rule: Vec::new(),
         }
     }
@@ -821,6 +887,14 @@ struct RawBorderRule {
     active_opacity: Option<f32>,
     #[serde(default)]
     inactive_opacity: Option<f32>,
+    #[serde(default)]
+    active_backdrop_tonemap: Option<bool>,
+    #[serde(default)]
+    inactive_backdrop_tonemap: Option<bool>,
+    #[serde(default)]
+    active_backdrop_blur: Option<bool>,
+    #[serde(default)]
+    inactive_backdrop_blur: Option<bool>,
 }
 
 fn default_border_width() -> u32 {
@@ -835,6 +909,10 @@ fn default_glow_falloff() -> f32 {
 
 fn default_opacity() -> f32 {
     1.0
+}
+
+fn default_backdrop_blur_radius() -> u32 {
+    32
 }
 
 /// Nearly-covered rather than entirely covered, so a window peeking out by a
@@ -919,7 +997,7 @@ fn resolve_color(text: &str, fallback: Color32F) -> Color32F {
     }
 }
 
-fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
+fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConfig {
     let active_fallback = parse_color(&default_active_color()).expect("built-in color parses");
     let inactive_fallback = parse_color(&default_inactive_color()).expect("built-in color parses");
 
@@ -937,6 +1015,8 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
                     glow_margin: r.active_glow_margin,
                     glow_falloff: r.glow_falloff,
                     opacity: r.active_opacity.map(resolve_opacity),
+                    backdrop_tonemap: r.active_backdrop_tonemap,
+                    backdrop_blur: r.active_backdrop_blur,
                 },
                 inactive: StyleOverride {
                     color: color(r.inactive_color, inactive_fallback),
@@ -944,6 +1024,8 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
                     glow_margin: r.inactive_glow_margin,
                     glow_falloff: r.glow_falloff,
                     opacity: r.inactive_opacity.map(resolve_opacity),
+                    backdrop_tonemap: r.inactive_backdrop_tonemap,
+                    backdrop_blur: r.inactive_backdrop_blur,
                 },
                 app_id: r.app_id,
                 title: r.title,
@@ -960,6 +1042,8 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
             glow_margin: raw.active_glow_margin,
             glow_falloff: raw.glow_falloff,
             opacity: resolve_opacity(raw.active_opacity),
+            backdrop_tonemap: raw.active_backdrop_tonemap,
+            backdrop_blur: raw.active_backdrop_blur,
         },
         inactive: WindowStyle {
             color: resolve_color(&raw.inactive_color, inactive_fallback),
@@ -967,10 +1051,19 @@ fn resolve_decoration(raw: RawDecoration) -> DecorationConfig {
             glow_margin: raw.inactive_glow_margin,
             glow_falloff: raw.glow_falloff,
             opacity: resolve_opacity(raw.inactive_opacity),
+            backdrop_tonemap: raw.inactive_backdrop_tonemap,
+            backdrop_blur: raw.inactive_backdrop_blur,
         },
         rules,
         obscured_opacity: resolve_opacity(raw.obscured_opacity),
         obscured_threshold: resolve_opacity(raw.obscured_threshold),
+        backdrop_blur_radius: raw.backdrop_blur_radius,
+        // Falls back to window white: what shows through a window should not
+        // out-shine the window itself.
+        backdrop_luminance_nits: raw
+            .backdrop_luminance_nits
+            .unwrap_or(sdr_white_nits)
+            .clamp(10.0, 10000.0),
     }
 }
 

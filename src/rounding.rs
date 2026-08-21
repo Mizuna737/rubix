@@ -178,6 +178,11 @@ pub struct RoundShaders {
     /// `RoundMode::Tonemap`.
     tonemap_pq: GlesTexProgram,
     tonemap_scrgb: GlesTexProgram,
+    /// HDR-pass backdrop luminance cap: decode and rolloff fused, staying in
+    /// the abs10k working space instead of collapsing to sRGB. See
+    /// `RoundMode::TonemapAbs10k`.
+    tonemap_abs10k_pq: GlesTexProgram,
+    tonemap_abs10k_scrgb: GlesTexProgram,
 }
 
 impl RoundShaders {
@@ -206,6 +211,17 @@ impl RoundShaders {
                 with_rounding(&crate::hdr_shaders::tonemap_scrgb_to_sdr()),
                 &sdr_names,
             )?,
+            // Same uniform set as the sRGB tone-map variants: the reference
+            // luminance rides the `sdr_white_nits` name (overloaded -- see
+            // `Wallpaper::backdrop_element`).
+            tonemap_abs10k_pq: renderer.compile_custom_texture_shader(
+                with_rounding(&crate::hdr_shaders::tonemap_pq_to_abs10k()),
+                &sdr_names,
+            )?,
+            tonemap_abs10k_scrgb: renderer.compile_custom_texture_shader(
+                with_rounding(&crate::hdr_shaders::tonemap_scrgb_to_abs10k()),
+                &sdr_names,
+            )?,
         })
     }
 
@@ -225,6 +241,10 @@ impl RoundShaders {
             RoundMode::Decode(DecodeKind::Sdr)
                 | RoundMode::Tonemap(DecodeKind::HdrPq)
                 | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
+                // All three abs10k variants declare the uniform -- including
+                // `Sdr`, which resolves to `decode_sdr` below and needs it for
+                // the same reason `Decode(Sdr)` does.
+                | RoundMode::TonemapAbs10k(_)
         )
     }
 
@@ -239,6 +259,15 @@ impl RoundShaders {
             RoundMode::Tonemap(DecodeKind::Sdr) => &self.plain,
             RoundMode::Tonemap(DecodeKind::HdrPq) => &self.tonemap_pq,
             RoundMode::Tonemap(DecodeKind::WindowsScrgb) => &self.tonemap_scrgb,
+            // Unreachable in practice: `Wallpaper::backdrop_element` only ever
+            // builds `TonemapAbs10k` when the wallpaper's own decode is HDR
+            // (`kind.is_hdr()`), so `Sdr` never actually gets constructed.
+            // Resolved to `decode_sdr` for exhaustiveness -- that program
+            // already lands SDR content in this same abs10k working space
+            // with no rolloff, which is what a never-HDR source should get.
+            RoundMode::TonemapAbs10k(DecodeKind::Sdr) => &self.decode_sdr,
+            RoundMode::TonemapAbs10k(DecodeKind::HdrPq) => &self.tonemap_abs10k_pq,
+            RoundMode::TonemapAbs10k(DecodeKind::WindowsScrgb) => &self.tonemap_abs10k_scrgb,
         }
     }
 }
@@ -285,6 +314,13 @@ pub(crate) enum RoundMode {
     /// a pass, this is resolved per window: a capture routinely contains one
     /// HDR window and an otherwise SDR desktop.
     Tonemap(DecodeKind),
+    /// The **HDR composite pass**'s backdrop luminance cap. Same soft-knee
+    /// rolloff as `Tonemap`, but the destination is the linear BT.2020 abs10k
+    /// offscreen, not an 8-bit sRGB buffer -- so this stays in that working
+    /// space instead of collapsing to sRGB. Used only for a per-window
+    /// backdrop quad whose style requests `backdrop_tonemap` on an HDR
+    /// output; see `Wallpaper::backdrop_element`.
+    TonemapAbs10k(DecodeKind),
 }
 
 /// How `space_elements` picks a [`RoundMode`] for each window.
@@ -621,16 +657,29 @@ where
     ))
 }
 
+/// `wallpaper_sdr_tonemap` is the same "destination is 8-bit sRGB, source is
+/// not" flag the caller already computes for the wallpaper element itself
+/// (`sdr_tonemap_needed`). A per-window backdrop quad sampling HDR wallpaper
+/// pixels needs the identical tone-map program whenever that flag is set,
+/// independent of whether the window's own `backdrop_tonemap` rule also asks
+/// for it -- the destination, not the rule, is what makes raw PQ texels wrong
+/// to scan out untouched.
+///
+/// Returns `(window elements, backdrop quads)` rather than one list so the
+/// caller can splice the quads in exactly between the windows and the layers
+/// below them (see `src/wallpaper.rs`'s "Backdrop element" docs for why that
+/// slot, and the accepted consequence of it).
 pub(crate) fn space_elements<R>(
     state: &RubixState,
     renderer: &mut R,
     output: &Output,
     scale: f64,
     mode: SpaceMode,
-) -> Vec<RubixRenderElement<R>>
+    wallpaper_sdr_tonemap: bool,
+) -> (Vec<RubixRenderElement<R>>, Vec<RubixRenderElement<R>>)
 where
     R: Renderer + ImportAll + ImportMem + GlesAccess,
-    R::TextureId: Clone + 'static,
+    R::TextureId: Send + Clone + 'static,
     RubixRenderElement<R>: RenderElement<R>,
 {
     let radius = state.config.decoration.corner_radius as f32;
@@ -654,15 +703,21 @@ where
     // configured at all, which is exactly the bare-desktop-plus-HDR-game case.
     let per_window_program = matches!(mode, SpaceMode::TonemapSdr);
     let Some(region) = state.space.output_geometry(output) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if radius <= 0.0 && !has_borders && !per_window_program {
-        return state
-            .space
-            .render_elements_for_region(renderer, &region, scale, 1.0)
-            .into_iter()
-            .map(RubixRenderElement::Surface)
-            .collect();
+        // No window can be translucent on this path (`has_borders` already
+        // covers every opacity < 1.0 case), so there is nothing a backdrop
+        // quad could ever be drawn for.
+        return (
+            state
+                .space
+                .render_elements_for_region(renderer, &region, scale, 1.0)
+                .into_iter()
+                .map(RubixRenderElement::Surface)
+                .collect(),
+            Vec::new(),
+        );
     }
     // `None` means rounding is off or its shaders failed to compile; borders
     // still work either way, windows are just drawn square.
@@ -679,6 +734,7 @@ where
     let occlusion = crate::decoration::occlusion_map(state, output);
 
     let mut elements = Vec::new();
+    let mut backdrops = Vec::new();
     for window in state.space.elements().rev() {
         let Some(bbox) = state.space.element_bbox(window) else { continue };
         if !region.overlaps(bbox) {
@@ -714,6 +770,36 @@ where
                 state, renderer, id, style, local_rect, hdr,
             ) {
                 elements.push(RubixRenderElement::BorderRing(ring));
+            }
+        }
+
+        // A frosted/tone-mapped backdrop only makes sense for a window that is
+        // actually letting the wallpaper show through. `style.opacity < 1.0`
+        // is also what already excludes a fullscreen window here without a
+        // separate check -- `style_for_window` forces it back to `1.0` for
+        // exactly this reason.
+        if let Some(style) = style.as_ref().filter(|s| {
+            s.opacity < 1.0 && (s.backdrop_tonemap || s.backdrop_blur)
+        }) {
+            let tonemap = style.backdrop_tonemap || wallpaper_sdr_tonemap;
+            // `hdr_pass: false` -- this destination is either a genuinely SDR
+            // output or a capture (`SpaceMode::TonemapSdr`/`Fixed(Plain)`), or
+            // an HDR-capable output with no HDR content at all, in which case
+            // `kind.is_hdr()` inside `backdrop_element` is false and this flag
+            // is never even consulted. See `RoundMode::TonemapAbs10k`'s doc
+            // comment for the pass that DOES need `hdr_pass: true`
+            // (`gather_tagged_elements`, an entirely separate call site).
+            if let Some((_, quad)) = state.wallpaper.backdrop_element(
+                renderer,
+                &output.name(),
+                region.size,
+                local_rect,
+                scale,
+                tonemap,
+                style.backdrop_blur,
+                false,
+            ) {
+                backdrops.push(quad);
             }
         }
 
@@ -762,7 +848,7 @@ where
         }
     }
     crate::decoration::prune_ring_cache(state);
-    elements
+    (elements, backdrops)
 }
 
 #[cfg(test)]
@@ -849,6 +935,19 @@ mod tests {
         assert_eq!(modes.len(), 4, "a new mode needs a program in RoundShaders");
     }
 
+    #[test]
+    fn tonemap_abs10k_covers_every_decode_kind() {
+        // Same sentinel as `every_decode_kind_maps_to_a_distinct_variant`: a new
+        // `DecodeKind` needs a `TonemapAbs10k` arm in `RoundShaders::program`
+        // too, or it silently falls through to a stale match arm.
+        let modes = [
+            RoundMode::TonemapAbs10k(DecodeKind::Sdr),
+            RoundMode::TonemapAbs10k(DecodeKind::HdrPq),
+            RoundMode::TonemapAbs10k(DecodeKind::WindowsScrgb),
+        ];
+        assert_eq!(modes.len(), 3, "a new DecodeKind needs a TonemapAbs10k arm in RoundShaders::program");
+    }
+
     // Pins `wants_sdr_white_nits` against the shader sources it speaks for.
     //
     // This is the bug that made an HDR wallpaper render as a white rectangle on
@@ -861,7 +960,7 @@ mod tests {
     fn every_mode_that_references_sdr_white_nits_is_given_it() {
         // The mode -> source mapping, duplicated from `RoundShaders::program`
         // on purpose: this test exists to catch the two drifting apart.
-        let sources: [(RoundMode, String); 7] = [
+        let sources: [(RoundMode, String); 10] = [
             (RoundMode::Plain, PLAIN_TEXTURE.to_string()),
             (RoundMode::Decode(DecodeKind::Sdr), DECODE_SDR.to_string()),
             (RoundMode::Decode(DecodeKind::HdrPq), DECODE_HDR_PQ.to_string()),
@@ -877,6 +976,17 @@ mod tests {
             (
                 RoundMode::Tonemap(DecodeKind::WindowsScrgb),
                 crate::hdr_shaders::tonemap_scrgb_to_sdr(),
+            ),
+            // `TonemapAbs10k(Sdr)` resolves to `decode_sdr` (see
+            // `RoundShaders::program`), so it shares that source too.
+            (RoundMode::TonemapAbs10k(DecodeKind::Sdr), DECODE_SDR.to_string()),
+            (
+                RoundMode::TonemapAbs10k(DecodeKind::HdrPq),
+                crate::hdr_shaders::tonemap_pq_to_abs10k(),
+            ),
+            (
+                RoundMode::TonemapAbs10k(DecodeKind::WindowsScrgb),
+                crate::hdr_shaders::tonemap_scrgb_to_abs10k(),
             ),
         ];
         for (mode, source) in sources {
@@ -898,6 +1008,9 @@ mod tests {
             RoundMode::Decode(DecodeKind::Sdr),
             RoundMode::Tonemap(DecodeKind::HdrPq),
             RoundMode::Tonemap(DecodeKind::WindowsScrgb),
+            RoundMode::TonemapAbs10k(DecodeKind::Sdr),
+            RoundMode::TonemapAbs10k(DecodeKind::HdrPq),
+            RoundMode::TonemapAbs10k(DecodeKind::WindowsScrgb),
         ] {
             assert!(
                 RoundShaders::wants_sdr_white_nits(mode),

@@ -1203,7 +1203,7 @@ impl RubixState {
         self.config.wallpaper = new.wallpaper;
         problems.extend(
             self.wallpaper
-                .resolve(&self.config.wallpaper, &self.config.outputs),
+                .resolve(&self.config.wallpaper, &self.config.outputs, &self.config.decoration),
         );
         // The interval, or the presence of a slideshow at all, may have changed.
         self.rearm_wallpaper_timer();

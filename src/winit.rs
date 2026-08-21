@@ -131,12 +131,16 @@ pub fn init_winit(
                     // RoundMode::Plain: no colour conversion is in play on this path, so a
                     // rounded element takes the plain texture program rather than a decode
                     // variant. Falls back to the batched call at corner_radius = 0.
-                    let space_elements = crate::rounding::space_elements(
+                    // winit is the dev backend: no HDR output, so the
+                    // destination-forced tonemap flag is always false here, same
+                    // as the wallpaper element below.
+                    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
                         data,
                         renderer,
                         &output,
                         scale,
                         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain),
+                        false,
                     );
 
                     // Ghost elements for any in-flight rotation wrap, built from
@@ -190,6 +194,7 @@ pub fn init_winit(
                     elements.extend(ghost_elements.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(scaled_elements.into_iter().map(RubixRenderElement::Rescaled));
                     elements.extend(space_elements);
+                    elements.extend(backdrop_elements);
                     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
                     // winit is the dev backend: no HDR output, no capture, so

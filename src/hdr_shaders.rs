@@ -499,6 +499,209 @@ void main() {{
     )
 }
 
+/// Shared tail for the HDR-pass **backdrop luminance cap**
+/// (`RoundMode::TonemapAbs10k`): the same soft-knee rolloff as
+/// [`TONEMAP_TAIL_GLSL`], but staying in the linear BT.2020 abs10k working
+/// space instead of encoding to sRGB.
+///
+/// This exists because the capture tone-map programs above are wrong for
+/// this destination: they end in `rubixLinearToSrgb`, so their output is
+/// 8-bit-display-referred 0..1. Writing that straight into the 16F abs10k
+/// offscreen means a 0.77 pixel reads back as 7700 cd/m^2 -- a blown-out
+/// rectangle, not a capped backdrop. `tonemap_pq_to_abs10k` and
+/// `tonemap_scrgb_to_abs10k` use this tail instead: no OETF, no primaries
+/// collapse back to BT.709, and the rolloff anchor is the backdrop's own
+/// reference luminance (in nits, passed through the `sdr_white_nits` uniform
+/// -- the same overload `Wallpaper::backdrop_element` already uses for the
+/// sRGB `Tonemap` wrapper) rather than SDR white.
+///
+/// The curve itself -- `RUBIX_KNEE`, the `1.0 - exp(-excess / ...)` rolloff
+/// -- is copied from `TONEMAP_TAIL_GLSL` rather than derived from it: these
+/// are GLSL string constants, so there is no compile-time composition to
+/// reuse. Kept from drifting apart by `abs10k_curve_matches_capture_curve`
+/// below, which asserts the two formulas are byte-identical.
+const ABS10K_TONE_TAIL_GLSL: &str = r#"
+const float RUBIX_KNEE = 0.8;
+
+// Multiples of the reference luminance in, multiples of the reference
+// luminance out -- identity below RUBIX_KNEE, asymptotic to 1.0 above it.
+vec3 rubixToneCurveAbs10k(vec3 v) {
+    vec3 excess = max(v - RUBIX_KNEE, 0.0);
+    vec3 rolled = RUBIX_KNEE + (1.0 - RUBIX_KNEE) * (1.0 - exp(-excess / (1.0 - RUBIX_KNEE)));
+    return clamp(mix(v, rolled, step(RUBIX_KNEE, v)), 0.0, 1.0);
+}
+"#;
+
+/// PQ decode straight into abs10k, capped at the backdrop reference
+/// luminance instead of collapsed to sRGB. Wraps a per-window backdrop quad
+/// on the **HDR composite pass** (`gather_tagged_elements` /
+/// `render_surface_hdr_zrun`), where the destination is already the linear
+/// BT.2020 abs10k working space -- see [`ABS10K_TONE_TAIL_GLSL`].
+pub fn tonemap_pq_to_abs10k() -> String {
+    format!(
+        r#"{TONEMAP_HEAD_GLSL}
+// SMPTE ST 2084 / Rec. 2100 PQ inverse EOTF -- identical to DECODE_HDR_PQ's.
+vec3 pq_eotf(vec3 e) {{
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 ep = pow(e, vec3(1.0 / m2));
+    vec3 num = max(ep - c1, 0.0);
+    vec3 den = c2 - c3 * ep;
+    return pow(num / den, vec3(1.0 / m1));   // 0..1 == 0..10000 nits
+}}
+{ABS10K_TONE_TAIL_GLSL}
+void main() {{
+    vec4 c = texture2D(tex, v_coords);
+    // Straight alpha before the nonlinear curve -- see DECODE_SDR.
+#if defined(NO_ALPHA)
+    vec3 straight = c.rgb;
+#else
+    vec3 straight = c.rgb / max(c.a, 1e-5);
+#endif
+    // PQ decodes directly to abs10k in BT.2020 -- already the working
+    // space's own primaries, unlike the sRGB `Tonemap` variant, which has to
+    // convert BT.2020 -> BT.709 for its sRGB destination. No matrix here.
+    vec3 abs10k = pq_eotf(straight);
+    vec3 ref_frac = abs10k * (10000.0 / max(sdr_white_nits, 1.0));
+    vec3 capped = rubixToneCurveAbs10k(ref_frac) * (max(sdr_white_nits, 1.0) / 10000.0);
+#if defined(NO_ALPHA)
+    gl_FragColor = vec4(capped, 1.0) * alpha;
+#else
+    gl_FragColor = vec4(capped * c.a, c.a) * alpha;
+#endif
+}}
+"#
+    )
+}
+
+/// Windows-scRGB straight into abs10k, capped at the backdrop reference
+/// luminance. Same destination and reasoning as [`tonemap_pq_to_abs10k`];
+/// unlike the sRGB capture variant, this keeps the BT.709->BT.2020 matrix
+/// (the working space's primaries), since there is no collapse back to
+/// BT.709 at the end.
+pub fn tonemap_scrgb_to_abs10k() -> String {
+    format!(
+        r#"{TONEMAP_HEAD_GLSL}
+// Identical column-major BT.709 -> BT.2020 matrix as DECODE_SDR /
+// DECODE_WINDOWS_SCRGB.
+const mat3 BT709_TO_BT2020 = mat3(
+    0.627403896, 0.069097289, 0.016391439,   // column 0
+    0.329283038, 0.919540395, 0.088013308,   // column 1
+    0.043313066, 0.011362316, 0.895595253);  // column 2
+
+// Windows-scRGB: nominal 1.0 == 80 cd/m^2. Same constant as DECODE_WINDOWS_SCRGB.
+const float SCRGB_WHITE_NITS = 80.0;
+{ABS10K_TONE_TAIL_GLSL}
+void main() {{
+    vec4 c = texture2D(tex, v_coords);
+    // scRGB needs no EOTF -- but the tone curve below is still nonlinear, so
+    // the un-premultiply is required all the same. See DECODE_SDR.
+#if defined(NO_ALPHA)
+    vec3 straight = c.rgb;
+#else
+    vec3 straight = c.rgb / max(c.a, 1e-5);
+#endif
+    // NO EOTF: already linear. Primaries into BT.2020 (same matrix as the
+    // ordinary scRGB decode), clipped before scaling -- negatives escape the
+    // sRGB gamut but not BT.2020's.
+    vec3 lin2020 = max(BT709_TO_BT2020 * straight, 0.0);
+    vec3 abs10k = lin2020 * (SCRGB_WHITE_NITS / 10000.0);
+    vec3 ref_frac = abs10k * (10000.0 / max(sdr_white_nits, 1.0));
+    vec3 capped = rubixToneCurveAbs10k(ref_frac) * (max(sdr_white_nits, 1.0) / 10000.0);
+#if defined(NO_ALPHA)
+    gl_FragColor = vec4(capped, 1.0) * alpha;
+#else
+    gl_FragColor = vec4(capped * c.a, c.a) * alpha;
+#endif
+}}
+"#
+    )
+}
+
+#[cfg(test)]
+mod abs10k_tests {
+    use super::*;
+
+    // Guards the "reuse the curve" requirement mechanically: the rolloff
+    // formula in the abs10k tail must be byte-identical to the capture tail's,
+    // since GLSL string constants can't share code by reference.
+    #[test]
+    fn abs10k_curve_matches_capture_curve() {
+        // Compares the rolloff line and the knee constant, not the whole
+        // function body verbatim -- the two curves take differently-named
+        // arguments (`lin709` for the capture path, `v` here, since this one
+        // is no longer specifically BT.709), but the formula and its knee
+        // must be identical.
+        for src in [TONEMAP_TAIL_GLSL, ABS10K_TONE_TAIL_GLSL] {
+            assert!(src.contains("const float RUBIX_KNEE = 0.8;"), "knee constant must match");
+            assert!(
+                src.contains(
+                    "RUBIX_KNEE + (1.0 - RUBIX_KNEE) * (1.0 - exp(-excess / (1.0 - RUBIX_KNEE)));"
+                ),
+                "rolloff formula must match exactly"
+            );
+        }
+    }
+
+    // The whole point of this shader: the output must stay in absolute
+    // luminance (abs10k), never collapse to sRGB 0..1 the way the capture
+    // variants do. A stray `rubixLinearToSrgb` or `pq_oetf` call here would
+    // silently reintroduce the exact bug this shader exists to fix.
+    #[test]
+    fn abs10k_shaders_never_encode_to_srgb_or_pq() {
+        for (name, src) in [
+            ("pq", tonemap_pq_to_abs10k()),
+            ("scrgb", tonemap_scrgb_to_abs10k()),
+        ] {
+            assert!(
+                !src.contains("rubixLinearToSrgb"),
+                "{name}: must not encode to sRGB -- destination is abs10k"
+            );
+            assert!(!src.contains("pq_oetf("), "{name}: must not re-encode to PQ");
+        }
+    }
+
+    // Reference luminance, not SDR white: the rolloff anchor must be the
+    // backdrop's own reference (`sdr_white_nits` uniform, overloaded -- see
+    // `Wallpaper::backdrop_element`), not a hardcoded constant.
+    #[test]
+    fn abs10k_shaders_scale_by_the_backdrop_reference() {
+        for (name, src) in [
+            ("pq", tonemap_pq_to_abs10k()),
+            ("scrgb", tonemap_scrgb_to_abs10k()),
+        ] {
+            assert!(
+                src.contains("uniform float sdr_white_nits;"),
+                "{name}: uniform not declared"
+            );
+            assert!(
+                src.contains("max(sdr_white_nits, 1.0)"),
+                "{name}: reference luminance never applied (or unguarded against zero)"
+            );
+        }
+    }
+
+    // Same external-texture / alpha-variant plumbing every other custom
+    // texture shader needs.
+    #[test]
+    fn abs10k_shaders_handle_external_textures_and_the_defines_marker() {
+        for (name, src) in [
+            ("pq", tonemap_pq_to_abs10k()),
+            ("scrgb", tonemap_scrgb_to_abs10k()),
+        ] {
+            assert!(src.contains("//_DEFINES_"), "{name}: defines marker missing");
+            assert!(
+                src.contains("samplerExternalOES"),
+                "{name}: external-texture sampler missing"
+            );
+            assert!(src.contains("NO_ALPHA"), "{name}: alpha variant missing");
+        }
+    }
+}
+
 #[cfg(test)]
 mod scrgb_tests {
     use super::*;
@@ -760,6 +963,8 @@ mod premultiply_tests {
             ("decode_sdr", DECODE_SDR.to_string()),
             ("tonemap_pq", tonemap_pq_to_sdr()),
             ("tonemap_scrgb", tonemap_scrgb_to_sdr()),
+            ("tonemap_abs10k_pq", tonemap_pq_to_abs10k()),
+            ("tonemap_abs10k_scrgb", tonemap_scrgb_to_abs10k()),
         ] {
             let undo = src
                 .find("c.rgb / max(c.a, 1e-5)")

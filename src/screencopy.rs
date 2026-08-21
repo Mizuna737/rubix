@@ -526,12 +526,15 @@ where
     } else {
         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
     };
-    let space_elements = crate::rounding::space_elements(
+    // A capture destination is always 8-bit sRGB, so this is the same
+    // `tonemap` flag used for layer surfaces and the wallpaper element below.
+    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
         state,
         renderer,
         output,
         scale,
         space_mode,
+        tonemap,
     );
 
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
@@ -546,6 +549,7 @@ where
     elements.extend(overlay);
     elements.extend(top);
     elements.extend(space_elements);
+    elements.extend(backdrop_elements);
     elements.extend(bottom);
     elements.extend(background);
     // A capture destination is always 8-bit sRGB, so `tonemap` is the same flag

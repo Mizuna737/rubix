@@ -295,6 +295,60 @@ inactive_color = "#45475a"
 # neighbour still fades.
 # obscured_threshold = 0.9
 
+# Backdrop for translucent windows: what shows through a window at less than
+# full opacity. By default that is the raw wallpaper -- which, composited in
+# absolute linear light, means a window catches whatever nits the wallpaper
+# happens to peak at. An HDR wallpaper graded well above `sdr_white_nits`
+# (above) will visibly wash out a translucent window's text; these two knobs
+# fix that without touching opacity itself. Both default to false, so nobody
+# who hasn't opted in sees any change.
+#
+# active_backdrop_tonemap / inactive_backdrop_tonemap: cap the backdrop's
+# highlights at this wallpaper's own `sdr_reference_nits` (see [wallpaper]
+# above), the same tone-map program that already renders the HDR wallpaper
+# correctly on a non-HDR output -- here aimed at just the area under one
+# window instead of the whole screen.
+# active_backdrop_tonemap = false
+# inactive_backdrop_tonemap = false
+#
+# active_backdrop_blur / inactive_backdrop_blur: frost the backdrop -- sample
+# a pre-blurred copy of the wallpaper instead of the sharp one, at
+# `backdrop_blur_radius` below.
+# active_backdrop_blur = false
+# inactive_backdrop_blur = false
+#
+# Blur radius in logical pixels. Global, not per-rule: each distinct radius
+# needs its own precomputed buffer, and a 4K 16-bit wallpaper is already ~66
+# MB, so letting every rule pick its own radius would multiply that. `0`
+# disables blur outright and skips the one-time decode-time cost entirely.
+#
+# Tuning note: the blur runs in linear light, so it raises the local mean
+# wherever a specular highlight sits -- a frosted pane reads BRIGHTER than the
+# sharp wallpaper immediately around it, not dimmer, because averaging in
+# nits (not in gamma-encoded values) lets a bright highlight drag its
+# neighbours up. `backdrop_luminance_nits` below is the knob that keeps that
+# brightened result under window text luminance; pair blur with tonemap
+# rather than using blur alone on a bright HDR wallpaper.
+# backdrop_blur_radius = 32
+
+# Ceiling in nits for what a backdrop's highlights may reach, used by
+# `*_backdrop_tonemap`. Defaults to the live `sdr_white_nits`, on the
+# principle that what shows through a window should not out-shine the window.
+#
+# THE TRAP: the roll-off knee sits at 0.8x this value, so setting it above the
+# wallpaper's actual peak luminance makes the cap an exact no-op -- toggling
+# tonemap then changes literally nothing, which is indistinguishable from the
+# feature being unwired. This knob exists because the backdrop originally
+# borrowed `sdr_reference_nits`, which is deliberately large (it normalises
+# the whole wallpaper for an SDR output), putting the knee above every pixel
+# in the image.
+#
+# Useful values sit well BELOW `sdr_white_nits` -- around 40 is a reasonable
+# starting point for a backdrop that recedes behind text. Clamped to
+# [10.0, 10000.0]. Live: a shader uniform only, so it retunes on save with no
+# re-decode.
+# backdrop_luminance_nits = 40.0
+
 # Per-window rules, applied in file order over the defaults above.
 #
 # `app_id` and `title` are case-insensitive SUBSTRING matches. When both are
@@ -323,6 +377,18 @@ inactive_color = "#45475a"
 # inactive_color = "#45475a"
 # active_opacity = 0.95
 # inactive_opacity = 0.85
+#
+# A translucent terminal over an HDR wallpaper: frosted and capped at
+# sdr_reference_nits rather than showing raw wallpaper nits through the text.
+#
+# [[decoration.rule]]
+# app_id = "obsidian"
+# active_opacity = 0.92
+# inactive_opacity = 0.85
+# active_backdrop_tonemap = true
+# inactive_backdrop_tonemap = true
+# active_backdrop_blur = true
+# inactive_backdrop_blur = true
 
 # Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
 # variant name -- serde deserializes it straight into the enum, so there is no

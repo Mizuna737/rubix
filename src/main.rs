@@ -430,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // problems above and ride the same deferred report.
     startup_problems.extend(
         data.wallpaper
-            .resolve(&data.config.wallpaper, &data.config.outputs),
+            .resolve(&data.config.wallpaper, &data.config.outputs, &data.config.decoration),
     );
     // Slideshow plumbing: a channel for images decoded on worker threads, and
     // the timer that asks for the next swap. Both are inert when the wallpaper

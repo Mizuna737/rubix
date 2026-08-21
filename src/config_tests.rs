@@ -409,9 +409,39 @@
 
     // ---- decoration ----
 
+    #[test]
+    fn backdrop_luminance_nits_defaults_to_live_sdr_white_nits() {
+        // The fallback is window white, and it must track the *clamped*
+        // `sdr_white_nits` rather than the raw key.
+        let text = r#"
+            sdr_white_nits = 250.0
+
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.sdr_white_nits, 250.0);
+        assert_eq!(cfg.decoration.backdrop_luminance_nits, 250.0);
+    }
+
+    #[test]
+    fn backdrop_luminance_nits_parses_and_clamps() {
+        // The floor sits far below `sdr_white_nits`'s own [80, 300] because a
+        // useful backdrop ceiling is expected to be well under window white.
+        let deco = decoration_from("backdrop_luminance_nits = 40.0\n");
+        assert_eq!(deco.backdrop_luminance_nits, 40.0);
+        let low = decoration_from("backdrop_luminance_nits = 1.0\n");
+        assert_eq!(low.backdrop_luminance_nits, 10.0);
+        let high = decoration_from("backdrop_luminance_nits = 999999.0\n");
+        assert_eq!(high.backdrop_luminance_nits, 10000.0);
+    }
+
     fn decoration_from(toml_body: &str) -> DecorationConfig {
         let raw: RawDecoration = toml::from_str(toml_body).expect("decoration section parses");
-        resolve_decoration(raw)
+        resolve_decoration(raw, crate::hdr_shaders::SDR_WHITE_NITS)
     }
 
     #[test]
@@ -690,6 +720,116 @@
             active_color = "#89b4fa"
         "##);
         assert_eq!(deco.style_for(Some("alacritty"), None, true).opacity, 0.8);
+    }
+
+    // ---- backdrop (frosted glass) ----
+
+    #[test]
+    fn backdrop_knobs_default_to_off_and_radius_defaults_to_32() {
+        let deco = decoration_from("");
+        assert!(!deco.active.backdrop_tonemap);
+        assert!(!deco.inactive.backdrop_tonemap);
+        assert!(!deco.active.backdrop_blur);
+        assert!(!deco.inactive.backdrop_blur);
+        assert_eq!(deco.backdrop_blur_radius, 32);
+    }
+
+    #[test]
+    fn backdrop_knobs_parse_and_focus_states_are_independent() {
+        let deco = decoration_from(
+            "active_backdrop_tonemap = true\ninactive_backdrop_blur = true\nbackdrop_blur_radius = 48",
+        );
+        assert!(deco.active.backdrop_tonemap);
+        assert!(!deco.inactive.backdrop_tonemap);
+        assert!(!deco.active.backdrop_blur);
+        assert!(deco.inactive.backdrop_blur);
+        assert_eq!(deco.backdrop_blur_radius, 48);
+    }
+
+    #[test]
+    fn backdrop_blur_radius_is_global_not_per_rule() {
+        // There is deliberately no `active_backdrop_blur_radius` /
+        // `[[decoration.rule]]`-level radius key -- only the section-level one.
+        let deco = decoration_from(
+            r##"
+            backdrop_blur_radius = 64
+            [[rule]]
+            app_id = "obsidian"
+            active_backdrop_blur = true
+            "##,
+        );
+        assert_eq!(deco.backdrop_blur_radius, 64, "radius stays a single global value");
+        assert!(deco.style_for(Some("obsidian"), None, true).backdrop_blur);
+    }
+
+    #[test]
+    fn a_rule_can_enable_backdrop_tonemap_and_blur_independently() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            app_id = "obsidian"
+            active_backdrop_tonemap = true
+            "##,
+        );
+        let style = deco.style_for(Some("obsidian"), None, true);
+        assert!(style.backdrop_tonemap);
+        assert!(!style.backdrop_blur, "blur was never asked for by this rule");
+    }
+
+    // The same trap opacity-only rules avoid: setting one backdrop field must
+    // not disturb the other, nor anything unrelated the rule didn't name.
+    #[test]
+    fn a_rule_setting_only_backdrop_blur_does_not_disturb_other_fields() {
+        let deco = decoration_from(
+            r##"
+            active_color = "#111111"
+            active_opacity = 0.8
+            [[rule]]
+            app_id = "obsidian"
+            active_backdrop_blur = true
+            "##,
+        );
+        let style = deco.style_for(Some("obsidian"), None, true);
+        assert!(style.backdrop_blur);
+        assert!(!style.backdrop_tonemap);
+        assert_eq!(style.color, parse_color("#111111").unwrap());
+        assert_eq!(style.opacity, 0.8);
+    }
+
+    #[test]
+    fn a_later_rule_can_turn_backdrop_tonemap_back_off() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            title = "glass"
+            active_backdrop_tonemap = true
+            [[rule]]
+            title = "glass"
+            active_backdrop_tonemap = false
+            "##,
+        );
+        assert!(!deco.style_for(None, Some("glass pane"), true).backdrop_tonemap);
+    }
+
+    #[test]
+    fn style_override_apply_sets_backdrop_fields_independently() {
+        let mut style = WindowStyle {
+            color: parse_color("#111111").unwrap(),
+            luminance_nits: None,
+            glow_margin: 0,
+            glow_falloff: 2.0,
+            opacity: 1.0,
+            backdrop_tonemap: false,
+            backdrop_blur: false,
+        };
+        let before = style.clone();
+        let over = StyleOverride { backdrop_blur: Some(true), ..StyleOverride::default() };
+        over.apply(&mut style);
+        assert!(style.backdrop_blur, "the named field must change");
+        assert!(!style.backdrop_tonemap, "an unset field must not change");
+        assert_eq!(style.color, before.color);
+        assert_eq!(style.opacity, before.opacity);
+        assert_eq!(style.glow_margin, before.glow_margin);
     }
 
     // ---- diagnostics ----

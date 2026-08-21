@@ -178,18 +178,20 @@ where
     } else {
         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
     };
-    let space_elements = crate::rounding::space_elements(
+    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
         state,
         renderer,
         &output,
         scale,
         space_mode,
+        tonemap,
     );
 
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
     elements.extend(overlay);
     elements.extend(top);
     elements.extend(space_elements);
+    elements.extend(backdrop_elements);
     elements.extend(bottom);
     elements.extend(background);
 

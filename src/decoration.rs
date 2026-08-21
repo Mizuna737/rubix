@@ -530,6 +530,8 @@ mod tests {
             glow_margin: 0,
             glow_falloff: 2.0,
             opacity: 1.0,
+            backdrop_tonemap: false,
+            backdrop_blur: false,
         }
     }
 

@@ -91,6 +91,11 @@ pub(crate) struct Decoded {
     size: Size<i32, BufferCoords>,
     fourcc: Fourcc,
     decode: DecodeKind,
+    /// A pre-blurred copy of `frames[0].pixels`, same size and fourcc, built
+    /// at decode time when backdrop frosting is enabled. `None` when frosting
+    /// is off (`backdrop_blur_radius == 0` or no style enables it) -- see
+    /// `blur_frame`.
+    blurred: Option<Vec<u8>>,
 }
 
 /// A decoded image plus the GPU-side buffer it is uploaded through.
@@ -100,13 +105,19 @@ pub struct Wallpaper {
     /// When the current frame was shown. Unused while `frames.len() == 1`.
     shown_at: Instant,
     buffer: MemoryRenderBuffer,
+    /// The frosted variant of `buffer`, built once at decode time. `None`
+    /// when frosting is off; a backdrop quad that wants blur but finds this
+    /// `None` falls back to the sharp buffer rather than failing to draw.
+    /// Never re-derived on `advance` -- see `blur_frame`'s doc comment for why
+    /// that is fine for every wallpaper this compositor can currently decode.
+    blurred: Option<MemoryRenderBuffer>,
     size: Size<i32, BufferCoords>,
     decode: DecodeKind,
 }
 
 impl Wallpaper {
     fn new(decoded: Decoded) -> Self {
-        let Decoded { frames, size, fourcc, decode } = decoded;
+        let Decoded { frames, size, fourcc, decode, blurred } = decoded;
         // Declared fully opaque: a wallpaper is the bottom of the stack and its
         // alpha is forced to 1.0 at decode. This is what lets occlusion culling
         // skip it entirely behind a fullscreen window, which matters because it
@@ -116,13 +127,22 @@ impl Wallpaper {
             MemoryBuffer::from_slice(&frames[0].pixels, fourcc, size),
             1,
             Transform::Normal,
-            Some(opaque),
+            Some(opaque.clone()),
         );
+        let blurred = blurred.map(|pixels| {
+            MemoryRenderBuffer::from_memory(
+                MemoryBuffer::from_slice(&pixels, fourcc, size),
+                1,
+                Transform::Normal,
+                Some(opaque),
+            )
+        });
         Wallpaper {
             frames,
             current: 0,
             shown_at: Instant::now(),
             buffer,
+            blurred,
             size,
             decode,
         }
@@ -189,6 +209,10 @@ pub struct PrefetchedWallpaper {
     /// The gain it was decoded at, so a result that raced a config change can
     /// be discarded rather than shown at the wrong brightness.
     scale: f32,
+    /// The blur radius it was decoded at, for the same reason -- a radius
+    /// change between request and delivery would deliver a wallpaper frosted
+    /// at the wrong strength.
+    blur_radius: u32,
     result: Result<Decoded, String>,
 }
 
@@ -249,6 +273,16 @@ pub struct WallpaperManager {
     /// onto an SDR output -- measured before `scale` is applied, so the two are
     /// independent. See `config::WallpaperConfig::sdr_reference_nits`.
     sdr_reference_nits: f32,
+    /// Ceiling in nits for a backdrop quad's highlights. Distinct from
+    /// `sdr_reference_nits` on purpose -- that one normalises the whole
+    /// wallpaper for an SDR output, this one caps what bleeds through a
+    /// translucent window. See `config::DecorationConfig::backdrop_luminance_nits`.
+    backdrop_luminance_nits: f32,
+    /// The backdrop blur radius to decode at, already collapsed to `0` when no
+    /// style enables `backdrop_blur` -- see `WallpaperManager::resolve`. Baked
+    /// into the decoded pixels like `scale`, so a change invalidates the cache
+    /// the same way.
+    backdrop_blur_radius: u32,
     /// Handed to worker threads to send results back onto the event loop.
     /// `None` in tests and before `main` wires the channel up, in which case
     /// prefetching is simply skipped and swaps decode inline.
@@ -266,6 +300,8 @@ impl Default for WallpaperManager {
             // to black. Unity is the only sane starting point.
             scale: 1.0,
             sdr_reference_nits: crate::hdr_shaders::SDR_WHITE_NITS,
+            backdrop_luminance_nits: crate::hdr_shaders::SDR_WHITE_NITS,
+            backdrop_blur_radius: 0,
             slideshow: None,
             prefetch: None,
             inflight: None,
@@ -286,11 +322,14 @@ impl WallpaperManager {
         &mut self,
         wallpaper: &crate::config::WallpaperConfig,
         outputs: &[crate::config::OutputConfig],
+        decoration: &crate::config::DecorationConfig,
     ) -> Vec<String> {
         self.mode = wallpaper.mode;
         // Live: this only feeds a shader uniform, so unlike `luminance_scale`
         // it needs no re-decode.
         self.sdr_reference_nits = wallpaper.sdr_reference_nits;
+        // Live for the same reason: a shader uniform only, no re-decode.
+        self.backdrop_luminance_nits = decoration.backdrop_luminance_nits;
         // Baked into the decoded pixels, so a changed gain means re-decoding
         // rather than re-uploading. Cheap enough to do on a config save (one
         // table build plus one pass over the image) and it keeps the render
@@ -300,6 +339,21 @@ impl WallpaperManager {
             self.loaded.clear();
         }
         self.scale = wallpaper.luminance_scale;
+        // Collapsed to 0 unless some style can actually turn frosting on --
+        // skips the decode-time blur pass entirely on the overwhelmingly
+        // common case where nobody has opted in, same idea as `scale` above:
+        // baked into the pixels, so a change re-decodes.
+        let blur_enabled = decoration.active.backdrop_blur
+            || decoration.inactive.backdrop_blur
+            || decoration.rules.iter().any(|r| {
+                r.active.backdrop_blur == Some(true) || r.inactive.backdrop_blur == Some(true)
+            });
+        let backdrop_blur_radius = if blur_enabled { decoration.backdrop_blur_radius } else { 0 };
+        if backdrop_blur_radius != self.backdrop_blur_radius {
+            self.loaded.clear();
+            self.prefetch = None;
+        }
+        self.backdrop_blur_radius = backdrop_blur_radius;
         let mut problems = Vec::new();
         let mut wanted: Vec<PathBuf> = Vec::new();
 
@@ -358,7 +412,7 @@ impl WallpaperManager {
             if self.loaded.contains_key(path) {
                 continue;
             }
-            match load(path, self.scale) {
+            match load(path, self.scale, self.backdrop_blur_radius) {
                 Ok(wallpaper) => {
                     tracing::info!(
                         "wallpaper {}: {}x{} {:?}",
@@ -390,7 +444,8 @@ impl WallpaperManager {
         let path = path.to_path_buf();
         if !self.loaded.contains_key(&path) {
             let wallpaper =
-                load(&path, self.scale).map_err(|e| format!("{}: {e}", path.display()))?;
+                load(&path, self.scale, self.backdrop_blur_radius)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
             self.loaded.insert(path.clone(), wallpaper);
         }
         match output {
@@ -444,14 +499,15 @@ impl WallpaperManager {
         }
         let Some(tx) = self.decode_tx.clone() else { return };
         let scale = self.scale;
+        let blur_radius = self.backdrop_blur_radius;
         self.inflight = Some(next.clone());
         // A detached thread per image rather than a pool: one decode every
         // `interval` seconds, and the thread exits as soon as it has sent.
         std::thread::spawn(move || {
-            let result = decode_file(&next, scale);
+            let result = decode_file(&next, scale, blur_radius);
             // A send failure means the compositor is gone; there is nothing
             // useful to do about it and nothing to clean up.
-            let _ = tx.send(PrefetchedWallpaper { path: next, scale, result });
+            let _ = tx.send(PrefetchedWallpaper { path: next, scale, blur_radius, result });
         });
     }
 
@@ -460,9 +516,12 @@ impl WallpaperManager {
         if self.inflight.as_ref() == Some(&message.path) {
             self.inflight = None;
         }
-        // A gain change between request and delivery would show this image at
-        // the wrong brightness; drop it and let `prime_prefetch` reissue.
-        if (message.scale - self.scale).abs() > 1e-4 {
+        // A gain or blur-radius change between request and delivery would show
+        // this image at the wrong brightness or frost strength; drop it and
+        // let `prime_prefetch` reissue.
+        if (message.scale - self.scale).abs() > 1e-4
+            || message.blur_radius != self.backdrop_blur_radius
+        {
             self.prime_prefetch();
             return;
         }
@@ -638,6 +697,131 @@ impl WallpaperManager {
             )),
         ))
     }
+
+    /// A per-window backdrop quad: the wallpaper element again, but
+    /// source-cropped to `window_rect` and, when `blur` is set, sampling the
+    /// pre-blurred buffer instead of the sharp one.
+    ///
+    /// Reuses the exact tone-map wrapper `element` uses above rather than a
+    /// new path -- same `RoundMode::Tonemap` program that already renders the
+    /// HDR wallpaper correctly on a non-HDR output, just aimed at a cropped
+    /// source rect instead of the whole image.
+    ///
+    /// `window_rect` is in the same region-local logical space as `element`'s
+    /// `output_size` -- i.e. relative to this output's own origin, not global
+    /// compositor space.
+    ///
+    /// `hdr_pass` picks which wrapper program a tone-mapped quad gets:
+    /// `false` (an SDR output, or an SDR-showing-HDR-content output, or a
+    /// capture) wraps with `RoundMode::Tonemap`, which decodes and rolls off
+    /// straight to sRGB 0..1. `true` (a per-window backdrop on the **HDR
+    /// composite pass** -- see `udev::gather_tagged_elements`) wraps with
+    /// `RoundMode::TonemapAbs10k` instead, which stays in the abs10k working
+    /// space that pass's destination actually is. Writing the sRGB program's
+    /// 0..1 output into that offscreen would read a 0.77 pixel back as 7700
+    /// cd/m^2 -- a blown-out backdrop, not a capped one.
+    ///
+    /// Returns the wallpaper's own `DecodeKind` alongside the element, same
+    /// shape as `element` above, so a caller tagging a z-run partition (the
+    /// HDR composite pass) can tag this quad exactly like the wallpaper
+    /// element itself.
+    // `tonemap` and `blur` stay two separate flags rather than one bundled
+    // struct: they are deliberately orthogonal knobs (a capped-but-sharp
+    // backdrop is a real look), and collapsing them to satisfy the arity lint
+    // would hide that from the signature.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn backdrop_element<R>(
+        &self,
+        renderer: &mut R,
+        output: &str,
+        output_size: Size<i32, Logical>,
+        window_rect: Rectangle<i32, Logical>,
+        scale: f64,
+        tonemap: bool,
+        blur: bool,
+        hdr_pass: bool,
+    ) -> Option<(DecodeKind, RubixRenderElement<R>)>
+    where
+        R: Renderer + ImportAll + ImportMem + GlesAccess,
+        R::TextureId: Send + Clone + 'static,
+    {
+        let wallpaper = self.for_output(output)?;
+        let placement = place(self.mode, wallpaper.size, output_size);
+        let crop = crop_for_window(&placement, window_rect);
+
+        // Falls back to the sharp buffer if there is no blurred one -- either
+        // frosting is off globally, or this particular wallpaper's fourcc
+        // isn't one `blur_frame` covers. Better a sharp backdrop than none.
+        let buffer = if blur {
+            wallpaper.blurred.as_ref().unwrap_or(&wallpaper.buffer)
+        } else {
+            &wallpaper.buffer
+        };
+
+        let element = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            window_rect.loc.to_f64().to_physical(scale),
+            buffer,
+            None,
+            Some(crop),
+            Some(window_rect.size),
+            Kind::Unspecified,
+        )
+        .map_err(|e| tracing::warn!("backdrop import failed on {output}: {e:?}"))
+        .ok()?;
+
+        let kind = wallpaper.decode;
+        if !tonemap || !kind.is_hdr() {
+            return Some((kind, RubixRenderElement::Memory(element)));
+        }
+        let Some(shaders) = round_shaders(renderer.gles_renderer()) else {
+            return Some((kind, RubixRenderElement::Memory(element)));
+        };
+        let mode = if hdr_pass {
+            RoundMode::TonemapAbs10k(kind)
+        } else {
+            RoundMode::Tonemap(kind)
+        };
+        Some((
+            kind,
+            RubixRenderElement::RoundedMemory(RoundedElement::new(
+                element,
+                &shaders,
+                mode,
+                0.0,
+                Rectangle::default(),
+                Scale::from(scale),
+                // Still multiplied by the decode gain: `luminance_scale` is
+                // baked into the texels, so the reference has to carry the
+                // same gain for it to cancel -- (nits * gain) / (ref * gain).
+                // Same reasoning as `element`, different absolute knob.
+                self.backdrop_luminance_nits * self.scale,
+            )),
+        ))
+    }
+}
+
+/// The crop of a placed wallpaper's source rect that lands under `window_rect`
+/// (region-local logical, same space as `Placement::loc`/`size`).
+///
+/// `placement.src.size / placement.size` is buffer pixels per output pixel --
+/// the same ratio the whole image was scaled by -- so offsetting and scaling
+/// `window_rect` by it, relative to `placement.loc`, gives exactly the source
+/// rect that image content occupies under the window. Pure geometry, so it is
+/// tested the same way `place` is, without a renderer.
+pub(crate) fn crop_for_window(
+    placement: &Placement,
+    window_rect: Rectangle<i32, Logical>,
+) -> Rectangle<f64, Logical> {
+    let sx = placement.src.size.w / (placement.size.w.max(1) as f64);
+    let sy = placement.src.size.h / (placement.size.h.max(1) as f64);
+    Rectangle::new(
+        Point::from((
+            placement.src.loc.x + (window_rect.loc.x - placement.loc.x) as f64 * sx,
+            placement.src.loc.y + (window_rect.loc.y - placement.loc.y) as f64 * sy,
+        )),
+        Size::from((window_rect.size.w as f64 * sx, window_rect.size.h as f64 * sy)),
+    )
 }
 
 /// Where a decoded image lands on an output, in the terms
@@ -778,28 +962,188 @@ fn is_unity(scale: f32) -> bool {
     (scale - 1.0).abs() < 1e-4
 }
 
+// ---- backdrop frosting (decoration `backdrop_blur`) ----
+//
+// A separable box blur, run three times, approximates a Gaussian closely
+// enough for a frosted-glass look and costs O(w*h) per pass *regardless of
+// radius* via a running sum -- no kernel-size blow-up the way a direct
+// convolution would have. Dual-Kawase (mip-chain up/downsample) would be
+// cheaper still, but that algorithm exists to make blur affordable *every
+// frame*; this runs once per decode, so the extra complexity buys nothing
+// here.
+//
+// It runs in linear light, not on the encoded (PQ or sRGB) codes directly:
+// blur models optical scatter, which is a property of physical luminance, not
+// of however that luminance happens to be quantised for storage. Blurring the
+// codes would smear perceptual steps instead of light.
+
+/// One line (row or column) of a box blur via a running sum, edges extended
+/// by clamping the window to the line's bounds (mirrors what a convolution
+/// with a clamp-to-edge sampler would do). `radius == 0` is the identity.
+fn box_blur_line(src: &[f32], dst: &mut [f32], radius: usize) {
+    let n = src.len();
+    if n == 0 {
+        return;
+    }
+    if radius == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let clamp = |i: isize| -> usize { i.clamp(0, n as isize - 1) as usize };
+    let ir = radius as isize;
+    let mut sum = 0.0f32;
+    for k in -ir..=ir {
+        sum += src[clamp(k)];
+    }
+    let window = (2 * radius + 1) as f32;
+    dst[0] = sum / window;
+    for (x, out) in dst.iter_mut().enumerate().skip(1) {
+        let add = clamp(x as isize + ir);
+        let sub = clamp(x as isize - ir - 1);
+        sum += src[add] - src[sub];
+        *out = sum / window;
+    }
+}
+
+fn box_blur_horizontal(src: &[f32], dst: &mut [f32], w: usize, h: usize, radius: usize) {
+    for y in 0..h {
+        box_blur_line(&src[y * w..(y + 1) * w], &mut dst[y * w..(y + 1) * w], radius);
+    }
+}
+
+/// Same as the horizontal pass, transposed. A scratch column pair is reused
+/// across every column rather than allocated per-column, since `w` can be in
+/// the thousands.
+fn box_blur_vertical(src: &[f32], dst: &mut [f32], w: usize, h: usize, radius: usize) {
+    let mut column = vec![0.0f32; h];
+    let mut blurred = vec![0.0f32; h];
+    for x in 0..w {
+        for y in 0..h {
+            column[y] = src[y * w + x];
+        }
+        box_blur_line(&column, &mut blurred, radius);
+        for y in 0..h {
+            dst[y * w + x] = blurred[y];
+        }
+    }
+}
+
+/// Three passes of horizontal-then-vertical box blur, in place. `radius == 0`
+/// is a no-op (each line pass is the identity, so three of them still are).
+fn box_blur_plane(plane: &mut [f32], w: usize, h: usize, radius: usize) {
+    if radius == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let mut tmp = vec![0.0f32; plane.len()];
+    for _ in 0..3 {
+        box_blur_horizontal(plane, &mut tmp, w, h, radius);
+        box_blur_vertical(&tmp, plane, w, h, radius);
+    }
+}
+
+/// Blur a packed `Xbgr2101010` (PQ) frame: unpack each 10-bit channel, PQ EOTF
+/// to linear nits, blur, PQ OETF back, repack. Alpha is left at fully opaque
+/// (`0b11`) to match `pack_rgb10`.
+fn blur_pq_rgba(pixels: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    let n = w * h;
+    let mut r = vec![0.0f32; n];
+    let mut g = vec![0.0f32; n];
+    let mut b = vec![0.0f32; n];
+    for (i, chunk) in pixels.chunks_exact(4).enumerate() {
+        let packed = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
+        r[i] = pq_eotf(((packed & 0x3ff) as f64) / 1023.0) as f32;
+        g[i] = pq_eotf((((packed >> 10) & 0x3ff) as f64) / 1023.0) as f32;
+        b[i] = pq_eotf((((packed >> 20) & 0x3ff) as f64) / 1023.0) as f32;
+    }
+    box_blur_plane(&mut r, w, h, radius);
+    box_blur_plane(&mut g, w, h, radius);
+    box_blur_plane(&mut b, w, h, radius);
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let code = |nits: f32| (pq_oetf(nits as f64) * 1023.0).round().clamp(0.0, 1023.0) as u32;
+        let packed = code(r[i]) | (code(g[i]) << 10) | (code(b[i]) << 20) | (0b11 << 30);
+        out.extend_from_slice(&packed.to_le_bytes());
+    }
+    out
+}
+
+/// Blur a packed `Xbgr8888` (sRGB) frame. Blurred in normalised linear light
+/// rather than absolute nits -- an SDR wallpaper has no absolute scale to
+/// preserve the way the PQ path does.
+fn blur_srgb_rgba(pixels: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    fn to_linear(v: f64) -> f64 {
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    }
+    fn to_srgb(v: f64) -> f64 {
+        if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    }
+    let n = w * h;
+    let mut r = vec![0.0f32; n];
+    let mut g = vec![0.0f32; n];
+    let mut b = vec![0.0f32; n];
+    for (i, chunk) in pixels.chunks_exact(4).enumerate() {
+        r[i] = to_linear(chunk[0] as f64 / 255.0) as f32;
+        g[i] = to_linear(chunk[1] as f64 / 255.0) as f32;
+        b[i] = to_linear(chunk[2] as f64 / 255.0) as f32;
+    }
+    box_blur_plane(&mut r, w, h, radius);
+    box_blur_plane(&mut g, w, h, radius);
+    box_blur_plane(&mut b, w, h, radius);
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let code = |v: f32| (to_srgb(v.clamp(0.0, 1.0) as f64) * 255.0).round().clamp(0.0, 255.0) as u8;
+        out.extend_from_slice(&[code(r[i]), code(g[i]), code(b[i]), 0xff]);
+    }
+    out
+}
+
+/// The blurred variant of one decoded frame, or `None` when frosting is off
+/// (`radius == 0`) or the fourcc is not one blur knows how to unpack --
+/// currently every fourcc this module produces is covered.
+fn blur_frame(pixels: &[u8], size: Size<i32, BufferCoords>, fourcc: Fourcc, radius: u32) -> Option<Vec<u8>> {
+    if radius == 0 {
+        return None;
+    }
+    let (w, h) = (size.w.max(0) as usize, size.h.max(0) as usize);
+    match fourcc {
+        Fourcc::Xbgr2101010 => Some(blur_pq_rgba(pixels, w, h, radius as usize)),
+        Fourcc::Xbgr8888 => Some(blur_srgb_rgba(pixels, w, h, radius as usize)),
+        _ => None,
+    }
+}
+
 /// Decode an image file into a [`Wallpaper`], dispatching on extension.
 ///
 /// AVIF is the only format that carries a transfer function Rubix cares about,
 /// so it is the only one that can yield a `DecodeKind` other than `Sdr`. PNG
 /// and JPEG are always SDR by construction.
-fn load(path: &Path, scale: f32) -> Result<Wallpaper, String> {
-    Ok(Wallpaper::new(decode_file(path, scale)?))
+fn load(path: &Path, scale: f32, blur_radius: u32) -> Result<Wallpaper, String> {
+    Ok(Wallpaper::new(decode_file(path, scale, blur_radius)?))
 }
 
 /// The pure half of [`load`]: file in, pixels and colour metadata out.
-fn decode_file(path: &Path, scale: f32) -> Result<Decoded, String> {
+///
+/// `blur_radius` is applied here, after the format-specific decode, rather
+/// than threaded into `load_avif`/`load_sdr`: both already hand back the
+/// fully decoded first frame, and the blur itself does not care which decoder
+/// produced the pixels, only their fourcc.
+fn decode_file(path: &Path, scale: f32, blur_radius: u32) -> Result<Decoded, String> {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match extension.as_str() {
-        "avif" => load_avif(path, scale),
-        "png" | "jpg" | "jpeg" => load_sdr(path, scale),
-        "" => Err("no file extension; cannot tell what format this is".into()),
-        other => Err(format!("unsupported format .{other} (want .avif, .png, .jpg)")),
-    }
+    let mut decoded = match extension.as_str() {
+        "avif" => load_avif(path, scale)?,
+        "png" | "jpg" | "jpeg" => load_sdr(path, scale)?,
+        "" => return Err("no file extension; cannot tell what format this is".into()),
+        other => return Err(format!("unsupported format .{other} (want .avif, .png, .jpg)")),
+    };
+    decoded.blurred = decoded
+        .frames
+        .first()
+        .and_then(|frame| blur_frame(&frame.pixels, decoded.size, decoded.fourcc, blur_radius));
+    Ok(decoded)
 }
 
 /// PNG/JPEG via the `image` crate. Always 8-bit sRGB.
@@ -824,6 +1168,7 @@ fn load_sdr(path: &Path, scale: f32) -> Result<Decoded, String> {
         size,
         fourcc: Fourcc::Xbgr8888,
         decode: DecodeKind::Sdr,
+        blurred: None,
     })
 }
 
@@ -919,6 +1264,7 @@ fn load_avif(path: &Path, scale: f32) -> Result<Decoded, String> {
             size,
             fourcc,
             decode,
+            blurred: None,
         })
     }
 }
@@ -1131,17 +1477,36 @@ mod tests {
         // it safe to tune while a slideshow is running.
         let mut manager = WallpaperManager::default();
         let mut config = slideshow_config(&fixture("pq16.avif"), 300);
-        assert!(manager.resolve(&config, &[]).is_empty());
+        assert!(manager.resolve(&config, &[], &crate::config::DecorationConfig::default()).is_empty());
         let decoded = manager.for_output("DP-3").unwrap().frames[0].pixels.clone();
 
         config.sdr_reference_nits = 2000.0;
-        assert!(manager.resolve(&config, &[]).is_empty());
+        assert!(manager.resolve(&config, &[], &crate::config::DecorationConfig::default()).is_empty());
         assert_eq!(manager.sdr_reference_nits, 2000.0);
         assert_eq!(
             manager.for_output("DP-3").unwrap().frames[0].pixels,
             decoded,
             "changing the SDR reference must not re-decode",
         );
+    }
+
+    #[test]
+    fn backdrop_reference_comes_from_backdrop_luminance_nits_not_sdr_reference_nits() {
+        // The bug this guards: the backdrop borrowed `sdr_reference_nits`,
+        // which is deliberately large (it normalises the whole wallpaper for
+        // an SDR output). The tone curve is identity below 0.8x its
+        // reference, so borrowing it put the knee above the wallpaper's peak
+        // and the cap became an exact no-op. The two must stay independent.
+        let mut manager = WallpaperManager::default();
+        let mut config = slideshow_config(&fixture("pq16.avif"), 300);
+        config.sdr_reference_nits = 2000.0;
+        let decoration = crate::config::DecorationConfig {
+            backdrop_luminance_nits: 40.0,
+            ..crate::config::DecorationConfig::default()
+        };
+        assert!(manager.resolve(&config, &[], &decoration).is_empty());
+        assert_eq!(manager.backdrop_luminance_nits, 40.0);
+        assert_eq!(manager.sdr_reference_nits, 2000.0);
     }
 
     // --- slideshow --------------------------------------------------------
@@ -1224,13 +1589,13 @@ mod tests {
         dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        assert!(manager.resolve(&slideshow_config(&dir.0, 5), &[]).is_empty());
+        assert!(manager.resolve(&slideshow_config(&dir.0, 5), &[], &crate::config::DecorationConfig::default()).is_empty());
         assert!(manager.slideshow.is_some());
         assert!(manager.next_slideshow_at().is_some());
 
         let mut single = WallpaperManager::default();
         let file = fixture("pq16.avif");
-        assert!(single.resolve(&slideshow_config(&file, 5), &[]).is_empty());
+        assert!(single.resolve(&slideshow_config(&file, 5), &[], &crate::config::DecorationConfig::default()).is_empty());
         assert!(single.slideshow.is_none());
         // A single wallpaper must arm no timer at all -- a static desktop
         // should cost nothing.
@@ -1244,7 +1609,7 @@ mod tests {
         dir.put("a.avif", "pq16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 5), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 5), &[], &crate::config::DecorationConfig::default());
         // "a.avif" is the PQ one, so this also confirms the right file loaded.
         assert!(manager.output_has_hdr("DP-3"));
     }
@@ -1256,7 +1621,7 @@ mod tests {
         dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 300), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 300), &[], &crate::config::DecorationConfig::default());
         assert!(!manager.advance_slideshow(Instant::now()));
     }
 
@@ -1270,7 +1635,7 @@ mod tests {
         dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         let due = Instant::now() + Duration::from_secs(2);
         assert!(!manager.advance_slideshow(due));
         // Still on the PQ first image, and rescheduled for a short retry
@@ -1287,13 +1652,14 @@ mod tests {
         let b = dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         assert!(manager.output_has_hdr("DP-3"), "starts on the PQ image");
 
         manager.receive_prefetch(PrefetchedWallpaper {
             path: b,
             scale: 1.0,
-            result: decode_file(&fixture("sdr16.avif"), 1.0),
+            blur_radius: 0,
+            result: decode_file(&fixture("sdr16.avif"), 1.0, 0),
         });
         assert!(manager.advance_slideshow(Instant::now() + Duration::from_secs(2)));
         assert!(!manager.output_has_hdr("DP-3"), "now on the SDR image");
@@ -1308,11 +1674,12 @@ mod tests {
         let b = dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         manager.receive_prefetch(PrefetchedWallpaper {
             path: b,
             scale: 0.5, // manager is at 1.0
-            result: decode_file(&fixture("sdr16.avif"), 0.5),
+            blur_radius: 0,
+            result: decode_file(&fixture("sdr16.avif"), 0.5, 0),
         });
         assert!(manager.prefetch.is_none(), "stale gain must not be queued");
     }
@@ -1327,12 +1694,13 @@ mod tests {
         dir.put("c.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         assert_eq!(manager.slideshow.as_ref().unwrap().entries.len(), 3);
 
         manager.receive_prefetch(PrefetchedWallpaper {
             path: bad,
             scale: 1.0,
+            blur_radius: 0,
             result: Err("not an image".into()),
         });
         let slideshow = manager.slideshow.as_ref().unwrap();
@@ -1349,11 +1717,12 @@ mod tests {
         let b = dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         manager.receive_prefetch(PrefetchedWallpaper {
             path: b,
             scale: 1.0,
-            result: decode_file(&fixture("sdr16.avif"), 1.0),
+            blur_radius: 0,
+            result: decode_file(&fixture("sdr16.avif"), 1.0, 0),
         });
         manager.advance_slideshow(Instant::now() + Duration::from_secs(2));
         assert_eq!(manager.loaded.len(), 1, "the previous image must be evicted");
@@ -1365,7 +1734,7 @@ mod tests {
         dir.put("only.avif", "pq16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         assert!(manager.inflight.is_none());
         assert!(!manager.advance_slideshow(Instant::now() + Duration::from_secs(2)));
         assert!(manager.output_has_hdr("DP-3"));
@@ -1382,11 +1751,12 @@ mod tests {
         let b = dir.put("b.avif", "sdr16.avif");
 
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         manager.receive_prefetch(PrefetchedWallpaper {
             path: b.clone(),
             scale: 1.0,
-            result: decode_file(&fixture("sdr16.avif"), 1.0),
+            blur_radius: 0,
+            result: decode_file(&fixture("sdr16.avif"), 1.0, 0),
         });
         assert!(manager.advance_slideshow(Instant::now() + Duration::from_secs(2)));
         assert_eq!(manager.slideshow.as_ref().unwrap().index, 1);
@@ -1394,7 +1764,7 @@ mod tests {
         // A save that changes only the gain.
         let mut retuned = slideshow_config(&dir.0, 1);
         retuned.luminance_scale = 0.5;
-        manager.resolve(&retuned, &[]);
+        manager.resolve(&retuned, &[], &crate::config::DecorationConfig::default());
         assert_eq!(manager.slideshow.as_ref().unwrap().index, 1, "rotation restarted");
         assert_eq!(manager.default_path.as_ref(), Some(&b));
     }
@@ -1406,11 +1776,11 @@ mod tests {
         let dir = TempDir::new("added");
         dir.put("b.avif", "pq16.avif");
         let mut manager = WallpaperManager::default();
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         assert_eq!(manager.slideshow.as_ref().unwrap().entries.len(), 1);
 
         dir.put("a.avif", "sdr16.avif");
-        manager.resolve(&slideshow_config(&dir.0, 1), &[]);
+        manager.resolve(&slideshow_config(&dir.0, 1), &[], &crate::config::DecorationConfig::default());
         let slideshow = manager.slideshow.as_ref().unwrap();
         assert_eq!(slideshow.entries.len(), 2, "new file not picked up");
         // Still showing b.avif, now at index 1 rather than 0.
@@ -1493,8 +1863,8 @@ mod tests {
     #[test]
     fn decoding_at_a_lower_gain_darkens_the_image() {
         // End to end through the real decoder, on the real fixture.
-        let bright = decode_file(&fixture("pq16.avif"), 1.0).unwrap();
-        let dim = decode_file(&fixture("pq16.avif"), 0.25).unwrap();
+        let bright = decode_file(&fixture("pq16.avif"), 1.0, 0).unwrap();
+        let dim = decode_file(&fixture("pq16.avif"), 0.25, 0).unwrap();
         let red = |d: &Decoded| {
             u32::from_le_bytes(d.frames[0].pixels[0..4].try_into().unwrap()) & 0x3ff
         };
@@ -1513,11 +1883,11 @@ mod tests {
             interval_seconds: 300,
             sdr_reference_nits: 203.0,
         };
-        assert!(manager.resolve(&config, &[]).is_empty());
+        assert!(manager.resolve(&config, &[], &crate::config::DecorationConfig::default()).is_empty());
         let before = manager.for_output("DP-3").unwrap().frames[0].pixels.clone();
 
         let dimmed = crate::config::WallpaperConfig { luminance_scale: 0.25, ..config };
-        assert!(manager.resolve(&dimmed, &[]).is_empty());
+        assert!(manager.resolve(&dimmed, &[], &crate::config::DecorationConfig::default()).is_empty());
         let after = manager.for_output("DP-3").unwrap().frames[0].pixels.clone();
         assert_ne!(before, after, "a gain change must re-decode");
     }
@@ -1529,13 +1899,167 @@ mod tests {
         assert_eq!(WallpaperManager::default().scale, 1.0);
     }
 
+    // --- backdrop blur -----------------------------------------------------
+
+    #[test]
+    fn box_blur_line_radius_zero_is_identity() {
+        let src = [1.0f32, 5.0, -2.0, 9.0, 0.0];
+        let mut dst = [0.0f32; 5];
+        box_blur_line(&src, &mut dst, 0);
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn box_blur_line_matches_hand_computed_output() {
+        // [0,0,0,10,0,0,0] at radius 1: every window is 3 wide (clamped at the
+        // edges), so only the samples straddling the spike see anything.
+        let src = [0.0f32, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0];
+        let mut dst = [0.0f32; 7];
+        box_blur_line(&src, &mut dst, 1);
+        let expected = [0.0, 0.0, 10.0 / 3.0, 10.0 / 3.0, 10.0 / 3.0, 0.0, 0.0];
+        for (got, want) in dst.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-6, "{dst:?} != {expected:?}");
+        }
+    }
+
+    #[test]
+    fn box_blur_plane_radius_zero_is_identity() {
+        let mut plane = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let before = plane.clone();
+        box_blur_plane(&mut plane, 3, 2, 0);
+        assert_eq!(plane, before);
+    }
+
+    #[test]
+    fn box_blur_plane_is_separable_and_symmetric() {
+        // A symmetric input (a single spike dead centre of an odd x odd plane)
+        // must stay symmetric after blurring -- a horizontal/vertical pass
+        // order bug tends to show up as an asymmetric smear instead.
+        let (w, h) = (5usize, 5usize);
+        let mut plane = vec![0.0f32; w * h];
+        plane[(h / 2) * w + (w / 2)] = 100.0;
+        box_blur_plane(&mut plane, w, h, 1);
+        for y in 0..h {
+            for x in 0..w {
+                let mirrored = plane[(h - 1 - y) * w + (w - 1 - x)];
+                let value = plane[y * w + x];
+                assert!(
+                    (mirrored - value).abs() < 1e-4,
+                    "({x},{y})={value} != mirror {mirrored}"
+                );
+            }
+        }
+        // And a real blur, not a no-op: the centre must have spread outward.
+        assert!(plane[(h / 2) * w + (w / 2)] < 100.0);
+        assert!(plane[(h / 2) * w + (w / 2) - 1] > 0.0);
+    }
+
+    #[test]
+    fn blur_pq_rgba_with_zero_radius_round_trips_within_tolerance() {
+        // No blur happening (radius 0), so this isolates the PQ EOTF/OETF
+        // round trip plus the 10-bit repack -- a drift here would mean every
+        // frosted wallpaper is subtly discoloured even with radius 0 filtered
+        // out at the call site.
+        let w = 5usize;
+        let h = 1usize;
+        let mut pixels = Vec::new();
+        for code in [0u32, 200, 512, 800, 1023] {
+            let packed = code | (code << 10) | (code << 20) | (0b11 << 30);
+            pixels.extend_from_slice(&packed.to_le_bytes());
+        }
+        let out = blur_pq_rgba(&pixels, w, h, 0);
+        for i in 0..w {
+            let original = u32::from_le_bytes(pixels[i * 4..i * 4 + 4].try_into().unwrap());
+            let round_tripped = u32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
+            let orig_r = original & 0x3ff;
+            let rt_r = round_tripped & 0x3ff;
+            assert!(
+                orig_r.abs_diff(rt_r) <= 1,
+                "code {orig_r} round-tripped to {rt_r}"
+            );
+        }
+    }
+
+    #[test]
+    fn blur_frame_is_none_at_radius_zero() {
+        let pixels = vec![0u8; 4];
+        assert!(blur_frame(&pixels, buffer(1, 1), Fourcc::Xbgr2101010, 0).is_none());
+    }
+
+    #[test]
+    fn blur_frame_blurs_pq_and_srgb_but_not_other_fourccs() {
+        let pixels_pq = vec![0u8; 4 * 3 * 3];
+        assert!(blur_frame(&pixels_pq, buffer(3, 3), Fourcc::Xbgr2101010, 1).is_some());
+        let pixels_srgb = vec![0u8; 4 * 3 * 3];
+        assert!(blur_frame(&pixels_srgb, buffer(3, 3), Fourcc::Xbgr8888, 1).is_some());
+        assert!(blur_frame(&pixels_pq, buffer(3, 3), Fourcc::Argb8888, 1).is_none());
+    }
+
+    // --- backdrop crop -----------------------------------------------------
+
+    #[test]
+    fn crop_for_window_covering_the_whole_output_recovers_placements_src() {
+        for mode in [
+            WallpaperMode::Fill,
+            WallpaperMode::Fit,
+            WallpaperMode::Stretch,
+            WallpaperMode::Center,
+        ] {
+            let placement = place(mode, buffer(200, 100), output(200, 100));
+            let whole = Rectangle::<i32, Logical>::new(placement.loc, placement.size);
+            let crop = crop_for_window(&placement, whole);
+            assert!(
+                (crop.loc.x - placement.src.loc.x).abs() < 1e-6
+                    && (crop.loc.y - placement.src.loc.y).abs() < 1e-6,
+                "{mode:?}: {crop:?} != {:?}",
+                placement.src
+            );
+            assert!(
+                (crop.size.w - placement.src.size.w).abs() < 1e-6
+                    && (crop.size.h - placement.src.size.h).abs() < 1e-6,
+                "{mode:?}: {crop:?} != {:?}",
+                placement.src
+            );
+        }
+    }
+
+    #[test]
+    fn crop_for_window_scales_by_the_buffer_to_output_ratio() {
+        // Fill at 2x scale (100x100 buffer onto 200x100 output, cropped):
+        // src is 100x50 over a 200x100 destination, so a 50x50 output-space
+        // window rect (a quarter of the destination) should map to a 25x25
+        // slice of the source.
+        let placement = place(WallpaperMode::Fill, buffer(100, 100), output(200, 100));
+        let window_rect = Rectangle::<i32, Logical>::new(Point::from((0, 0)), Size::from((50, 50)));
+        let crop = crop_for_window(&placement, window_rect);
+        assert!((crop.size.w - 25.0).abs() < 1e-6, "{crop:?}");
+        assert!((crop.size.h - 25.0).abs() < 1e-6, "{crop:?}");
+        assert!((crop.loc.x - placement.src.loc.x).abs() < 1e-6);
+        assert!((crop.loc.y - placement.src.loc.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn crop_for_window_offsets_by_the_windows_own_location() {
+        let placement = place(WallpaperMode::Fit, buffer(100, 100), output(200, 100));
+        // Fit centres a 100x100 image inside a 200x100 output at 1:1, so
+        // placement.loc = (50, 0). A window at (75, 10) sized 20x20 is 25
+        // output-px right of and 10 below the image's own origin.
+        let window_rect =
+            Rectangle::<i32, Logical>::new(Point::from((75, 10)), Size::from((20, 20)));
+        let crop = crop_for_window(&placement, window_rect);
+        assert!((crop.loc.x - 25.0).abs() < 1e-6, "{crop:?}");
+        assert!((crop.loc.y - 10.0).abs() < 1e-6, "{crop:?}");
+        assert!((crop.size.w - 20.0).abs() < 1e-6);
+        assert!((crop.size.h - 20.0).abs() < 1e-6);
+    }
+
     // --- decode ----------------------------------------------------------
 
     #[test]
     fn a_pq_avif_decodes_as_hdr_at_ten_bits() {
         // The whole reason wallpaper decoding lives here rather than in a
         // client: this one CICP field is what makes an HDR wallpaper possible.
-        let decoded = decode_file(&fixture("pq16.avif"), 1.0).expect("fixture must decode");
+        let decoded = decode_file(&fixture("pq16.avif"), 1.0, 0).expect("fixture must decode");
         assert_eq!(decoded.decode, DecodeKind::HdrPq);
         assert_eq!(decoded.fourcc, Fourcc::Xbgr2101010);
         assert_eq!(decoded.size, buffer(16, 16));
@@ -1547,7 +2071,7 @@ mod tests {
     fn a_non_pq_avif_decodes_as_sdr_at_eight_bits() {
         // Same container, same code path -- only the transfer function differs.
         // An AVIF is not HDR by virtue of being an AVIF.
-        let decoded = decode_file(&fixture("sdr16.avif"), 1.0).expect("fixture must decode");
+        let decoded = decode_file(&fixture("sdr16.avif"), 1.0, 0).expect("fixture must decode");
         assert_eq!(decoded.decode, DecodeKind::Sdr);
         assert_eq!(decoded.fourcc, Fourcc::Xbgr8888);
         assert_eq!(decoded.size, buffer(16, 16));
@@ -1559,7 +2083,7 @@ mod tests {
         // `Wallpaper::new` declares the whole buffer opaque so occlusion
         // culling can skip it. If the decode left real alpha in, that claim
         // would be a lie and windows would composite against garbage.
-        let decoded = decode_file(&fixture("sdr16.avif"), 1.0).unwrap();
+        let decoded = decode_file(&fixture("sdr16.avif"), 1.0, 0).unwrap();
         assert!(
             decoded.frames[0].pixels.chunks_exact(4).all(|p| p[3] == 0xff),
             "every alpha byte must be 0xff",
@@ -1572,9 +2096,9 @@ mod tests {
         // have to name the problem rather than unwinding the compositor.
         // No files are created: the extension is checked before the file is
         // opened, so an unsupported or absent one fails without touching disk.
-        assert!(decode_file(&fixture("does-not-exist.avif"), 1.0).is_err());
-        assert!(decode_file(&fixture("unsupported.xcf"), 1.0).is_err());
-        assert!(decode_file(&fixture("no-extension"), 1.0).is_err());
+        assert!(decode_file(&fixture("does-not-exist.avif"), 1.0, 0).is_err());
+        assert!(decode_file(&fixture("unsupported.xcf"), 1.0, 0).is_err());
+        assert!(decode_file(&fixture("no-extension"), 1.0, 0).is_err());
     }
 
     // --- assignment ------------------------------------------------------

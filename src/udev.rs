@@ -1427,8 +1427,14 @@ fn render_surface(
     } else {
         crate::rounding::SpaceMode::Fixed(RoundMode::Plain)
     };
-    let space_elements =
-        crate::rounding::space_elements(state, renderer, &surface.output, scale, space_mode);
+    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
+        state,
+        renderer,
+        &surface.output,
+        scale,
+        space_mode,
+        sdr_tonemap,
+    );
 
     // Ghost elements for any in-flight rotation wrap, built from
     // `active_ghosts` (populated by `step_animations` right before this call,
@@ -1507,6 +1513,15 @@ fn render_surface(
     elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
     elements.extend(scaled.into_iter().map(RubixRenderElement::Rescaled));
     elements.extend(space_elements);
+    // Per-window backdrop quads (see src/wallpaper.rs). Deliberately below
+    // every window rather than interleaved per-window: the quad is opaque
+    // within its window's rect, so it occludes not just the wallpaper but
+    // anything else physically below that rect at this point in the list --
+    // layer-shell `bottom`/`background`, and (accepted simplification) any
+    // other window stacked further down that happens to overlap the same
+    // screen area. Frost only ever applies over wallpaper, never over another
+    // window's own content.
+    elements.extend(backdrop_elements);
     elements.extend(bottom);
     elements.extend(background);
     // Last, so it sits under every client. Only wrapped in a tone-map program
@@ -2062,6 +2077,15 @@ fn gather_tagged_elements<'a>(
     // it, which cannot be done from inside the loop without re-walking.
     let occlusion = crate::decoration::occlusion_map(state, output);
     let mut space_tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
+    // Per-window backdrop quads -- see `crate::rounding::space_elements`'s
+    // sibling loop, which this mirrors. Missing from here entirely was the
+    // bug: this function is the ONLY element-gathering path reached whenever
+    // this output has any HDR content (`output_has_hdr_content`, checked by
+    // the caller before choosing between this and `space_elements`), which
+    // routinely includes an HDR wallpaper -- so the backdrop quads a frosted
+    // window needs were built by `space_elements` and then discarded
+    // whenever `gather_tagged_elements` ran instead.
+    let mut backdrops: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
     // Compiled before the loop so the renderer borrow is released; `None`
     // means either rounding is off or its shaders failed to build, and either
     // way windows are drawn exactly as they were before rounding existed.
@@ -2114,6 +2138,34 @@ fn gather_tagged_elements<'a>(
                     // is keyed on it, so it takes its neighbours' Sdr tag to
                     // avoid splitting a run for no reason.
                     space_tagged.push((DecodeKind::Sdr, RubixRenderElement::BorderRing(ring)));
+                }
+
+                // A frosted/tone-mapped backdrop only makes sense for a window
+                // that is actually letting the wallpaper show through -- same
+                // gate as `space_elements`'s, resolved from the SAME `style`
+                // rather than re-matching rules, so the two paths can never
+                // disagree about which windows get a backdrop.
+                if style.opacity < 1.0 && (style.backdrop_tonemap || style.backdrop_blur) {
+                    // `hdr_pass: true` -- this function is only ever reached on
+                    // the HDR composite pass (see the comment on `backdrops`
+                    // above), so a tone-mapped quad must stay in the abs10k
+                    // working space rather than collapse to sRGB.
+                    if let Some((wallpaper_kind, quad)) = state.wallpaper.backdrop_element(
+                        renderer,
+                        &output.name(),
+                        region.size,
+                        local_rect,
+                        scale,
+                        style.backdrop_tonemap,
+                        style.backdrop_blur,
+                        true,
+                    ) {
+                        // Tagged with the wallpaper's own DecodeKind, exactly
+                        // like the wallpaper element itself below -- the z-run
+                        // partition needs to know which decode this quad's
+                        // program was built against.
+                        backdrops.push((wallpaper_kind, quad));
+                    }
                 }
             }
             let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
@@ -2203,6 +2255,10 @@ fn gather_tagged_elements<'a>(
     // group here -- grouped, every border floats above every window and a
     // maximized window is covered in the borders of the windows behind it.
     tagged.extend(space_tagged);
+    // Per-window backdrop quads, spliced in exactly where `render_surface`
+    // puts them relative to `space_elements`'s output -- below every window,
+    // above `bottom`/`background`. See the comment on `backdrops` above.
+    tagged.extend(backdrops);
     tagged.extend(
         bottom
             .into_iter()
