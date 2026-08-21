@@ -58,7 +58,7 @@ use smithay::utils::{Buffer as BufferCoords, Logical, Point, Rectangle, Scale, S
 
 use crate::color_management::DecodeKind;
 use crate::cursor::RubixRenderElement;
-use crate::rounding::{GlesAccess, RoundMode, RoundedElement, round_shaders};
+use crate::rounding::{GlesAccess, Refraction, RoundMode, RoundedElement, round_shaders};
 
 /// How an image is mapped onto an output whose aspect ratio it does not match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -694,6 +694,7 @@ impl WallpaperManager {
                 // silently re-broke the SDR output in the opposite direction.
                 // Multiplying it through cancels: (nits * gain) / (ref * gain).
                 self.sdr_reference_nits * self.scale,
+                Refraction::NONE,
             )),
         ))
     }
@@ -747,6 +748,7 @@ impl WallpaperManager {
         blur: bool,
         hdr_pass: bool,
         sdr_white_nits: f32,
+        refraction: Refraction,
     ) -> Option<(DecodeKind, RubixRenderElement<R>)>
     where
         R: Renderer + ImportAll + ImportMem + GlesAccess,
@@ -755,6 +757,25 @@ impl WallpaperManager {
         let wallpaper = self.for_output(output)?;
         let placement = place(self.mode, wallpaper.size, output_size);
         let crop = crop_for_window(&placement, window_rect);
+        // Only this function knows both the crop (the wallpaper's own space)
+        // and the buffer size, so `uv_per_px` is computed here rather than by
+        // the caller -- the caller owns the look (strength, facet size,
+        // dispersion), this owns the geometry. Guarded with `.max(1.0)`
+        // because a zero-size window rect is reachable mid-resize and must not
+        // produce a NaN offset that blanks the quad.
+        let buffer_w = (wallpaper.size.w as f64).max(1.0);
+        let buffer_h = (wallpaper.size.h as f64).max(1.0);
+        let dst_physical = window_rect.size.to_f64().to_physical(scale);
+        let dst_w = dst_physical.w.max(1.0);
+        let dst_h = dst_physical.h.max(1.0);
+        let refraction = Refraction {
+            uv_per_px: (
+                ((crop.size.w / buffer_w) / dst_w) as f32,
+                ((crop.size.h / buffer_h) / dst_h) as f32,
+            ),
+            ..refraction
+        };
+        let refract = refraction.strength > 0.0;
 
         // Falls back to the sharp buffer if there is no blurred one -- either
         // frosting is off globally, or this particular wallpaper's fourcc
@@ -792,7 +813,7 @@ impl WallpaperManager {
         // and that decode wants the *real* SDR white point, not the backdrop
         // ceiling. Reachable two ways: `backdrop_blur` on with
         // `backdrop_tonemap` off, and any SDR wallpaper on an HDR output.
-        let Some(mode) = backdrop_program(tonemap, kind, hdr_pass) else {
+        let Some(mode) = backdrop_program(tonemap, kind, hdr_pass, refract) else {
             return Some((kind, RubixRenderElement::Memory(element)));
         };
         // A plain decode's uniform is the real SDR white point; the two
@@ -830,6 +851,7 @@ impl WallpaperManager {
                 // a second time (40 nits became 8, putting the knee at the
                 // wallpaper's median and flattening half the image).
                 reference_nits,
+                refraction,
             )),
         ))
     }
@@ -845,6 +867,7 @@ pub(crate) fn backdrop_program(
     tonemap: bool,
     kind: DecodeKind,
     hdr_pass: bool,
+    refract: bool,
 ) -> Option<RoundMode> {
     match (tonemap && kind.is_hdr(), hdr_pass) {
         // Cap the backdrop's luminance without leaving the abs10k working
@@ -856,8 +879,11 @@ pub(crate) fn backdrop_program(
         // inherit -- every element installs its own program, so a quad with
         // none would draw with whatever the previous element left behind.
         (false, true) => Some(RoundMode::Decode(kind)),
-        // An SDR destination's pass default is already correct for this quad.
-        (false, false) => None,
+        // A refracting quad must carry a program even when the colour path
+        // wants none, because the refraction lives in the fragment shader. The
+        // plain program is the right one: it is what this quad would have been
+        // drawn with anyway, now with the sample site rewritten.
+        (false, false) => refract.then_some(RoundMode::Plain),
     }
 }
 
@@ -1558,7 +1584,7 @@ mod tests {
         for kind in [DecodeKind::Sdr, DecodeKind::HdrPq, DecodeKind::WindowsScrgb] {
             for tonemap in [false, true] {
                 assert!(
-                    backdrop_program(tonemap, kind, true).is_some(),
+                    backdrop_program(tonemap, kind, true, false).is_some(),
                     "{kind:?} tonemap={tonemap} on the HDR pass has no program"
                 );
             }
@@ -1570,11 +1596,11 @@ mod tests {
         // The two configs that reach this: blur on with tonemap off, and any
         // SDR wallpaper on an HDR output.
         assert_eq!(
-            backdrop_program(false, DecodeKind::HdrPq, true),
+            backdrop_program(false, DecodeKind::HdrPq, true, false),
             Some(RoundMode::Decode(DecodeKind::HdrPq))
         );
         assert_eq!(
-            backdrop_program(true, DecodeKind::Sdr, true),
+            backdrop_program(true, DecodeKind::Sdr, true, false),
             Some(RoundMode::Decode(DecodeKind::Sdr)),
             "an SDR wallpaper has nothing to tone-map, so it takes a plain decode"
         );
@@ -1585,12 +1611,12 @@ mod tests {
         // Backwards here reads on screen as the backdrop crushing to white --
         // shipped once already.
         assert_eq!(
-            backdrop_program(true, DecodeKind::HdrPq, true),
+            backdrop_program(true, DecodeKind::HdrPq, true, false),
             Some(RoundMode::TonemapAbs10k(DecodeKind::HdrPq)),
             "the HDR pass must stay in the abs10k working space"
         );
         assert_eq!(
-            backdrop_program(true, DecodeKind::HdrPq, false),
+            backdrop_program(true, DecodeKind::HdrPq, false, false),
             Some(RoundMode::Tonemap(DecodeKind::HdrPq)),
             "an sRGB destination must collapse to it"
         );
@@ -1598,8 +1624,23 @@ mod tests {
 
     #[test]
     fn an_sdr_destination_leaves_an_untonemapped_backdrop_alone() {
-        assert_eq!(backdrop_program(false, DecodeKind::HdrPq, false), None);
-        assert_eq!(backdrop_program(false, DecodeKind::Sdr, false), None);
+        assert_eq!(backdrop_program(false, DecodeKind::HdrPq, false, false), None);
+        assert_eq!(backdrop_program(false, DecodeKind::Sdr, false, false), None);
+    }
+
+    #[test]
+    fn a_refracting_backdrop_always_carries_a_program() {
+        // A refracting quad needs the sample rewrite even when the colour path
+        // wants nothing: the (false, false) arm returns `None` without
+        // refraction and `Some(RoundMode::Plain)` with it.
+        assert_eq!(
+            backdrop_program(false, DecodeKind::Sdr, false, false),
+            None
+        );
+        assert_eq!(
+            backdrop_program(false, DecodeKind::Sdr, false, true),
+            Some(RoundMode::Plain)
+        );
     }
 
     #[test]

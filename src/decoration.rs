@@ -532,6 +532,7 @@ mod tests {
             opacity: 1.0,
             backdrop_tonemap: false,
             backdrop_blur: false,
+            refract: false,
         }
     }
 

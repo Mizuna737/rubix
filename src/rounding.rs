@@ -96,6 +96,99 @@ float rubixCornerAlpha() {
 
 "#;
 
+/// GLSL for the crystal-facet refraction, spliced in alongside the rounding
+/// mask. Reads `rubix_elem_size` / `rubix_elem_offset` from `ROUNDING_GLSL`,
+/// so it must be concatenated *after* it.
+///
+/// The field is evaluated in **window** space, the same space the rounding
+/// mask uses and for the same reason: a window's subsurfaces are separate
+/// elements, and a facet pattern anchored per-element would visibly restart at
+/// every subsurface boundary. Window space also means the crystal travels with
+/// the window instead of the window sliding across a fixed field, which is the
+/// look being asked for -- the window *is* the crystal.
+///
+/// Dispersion is amplified towards the facet seams rather than applied flat.
+/// That is both what a cut gem actually does (colour separates along the cut
+/// lines, not across the face) and the reason no luminance is manufactured
+/// anywhere in here: the sparkle is entirely a sampling effect, so it composes
+/// with the HDR pipeline instead of fighting it.
+const REFRACT_GLSL: &str = r#"
+uniform float rubix_refract_strength;
+uniform vec2 rubix_refract_uv_per_px;
+uniform float rubix_refract_facet_size;
+uniform float rubix_refract_dispersion;
+
+// Two decorrelated dot products through the classic sin-fract hash. `highp` is
+// what keeps this stable over the cell counts a full-screen window reaches;
+// at mediump the pattern visibly repeats.
+vec2 rubixHash2(vec2 c) {
+    float a = dot(c, vec2(127.1, 311.7));
+    float b = dot(c, vec2(269.5, 183.3));
+    return fract(sin(vec2(a, b)) * 43758.5453);
+}
+
+// One Voronoi cell lookup. Returns the facet's bend direction in `xy` and, in
+// `z`, how far inside the facet the fragment sits (1.0 deep inside, 0.0 on a
+// seam).
+//
+// The bend is a constant per-cell tilt plus a radial term. Tilt alone gives
+// flat facets -- correct for a faceted solid, but it reads as random blocks.
+// The radial term makes each cell behave like a small lens as well, which is
+// what tips the look from "shattered" to "cut".
+vec3 rubixFacet(vec2 p) {
+    vec2 cell = floor(p);
+    vec2 f = p - cell;
+    vec2 winner = vec2(0.0);
+    vec2 site = vec2(0.0);
+    float best = 8.0;
+    float second = 8.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            vec2 g = vec2(float(i), float(j));
+            vec2 s = g + rubixHash2(cell + g);
+            float d = length(s - f);
+            if (d < best) {
+                second = best;
+                best = d;
+                site = s;
+                winner = g;
+            } else if (d < second) {
+                second = d;
+            }
+        }
+    }
+    vec2 tilt = rubixHash2(cell + winner + vec2(17.0, 23.0)) * 2.0 - 1.0;
+    vec2 radial = f - site;
+    vec2 bend = clamp(tilt + radial * 1.5, vec2(-1.5), vec2(1.5)) / 1.5;
+    // `second - best` is zero exactly on the boundary between two cells and
+    // grows inwards, which makes it a seam distance without needing the edge
+    // geometry itself.
+    return vec3(bend, smoothstep(0.0, 0.09, second - best));
+}
+
+vec4 rubixSampleRefracted() {
+    if (rubix_refract_strength <= 0.0) {
+        return texture2D(tex, v_coords);
+    }
+    vec2 p = v_coords * rubix_elem_size + rubix_elem_offset;
+    vec3 facet = rubixFacet(p / max(rubix_refract_facet_size, 1.0));
+    vec2 base = facet.xy * rubix_refract_strength * rubix_refract_uv_per_px;
+    // Wider splitting on the seams, none in the middle of a face.
+    float spread = rubix_refract_dispersion * (1.0 + 2.0 * (1.0 - facet.z));
+    // Clamped to the whole texture, not to this quad's crop: a backdrop is a
+    // source-crop of the shared wallpaper, so a bent ray leaving the window's
+    // own slice lands on the wallpaper next to it, which is exactly what
+    // refraction should show. Only the wallpaper's outer edge clamps.
+    vec4 cr = texture2D(tex, clamp(v_coords + base * (1.0 - spread), 0.0, 1.0));
+    vec4 cg = texture2D(tex, clamp(v_coords + base, 0.0, 1.0));
+    vec4 cb = texture2D(tex, clamp(v_coords + base * (1.0 + spread), 0.0, 1.0));
+    // Alpha rides the green tap. Mixing per-channel alpha would break
+    // premultiplication; a wallpaper is opaque, so there is nothing to mix.
+    return vec4(cr.r, cg.g, cb.b, cg.a);
+}
+
+"#;
+
 /// The stock texture shader, for outputs doing no colour conversion at all.
 ///
 /// Copied from smithay's `gles/shaders/implicit/texture.frag` rather than
@@ -141,15 +234,26 @@ void main() {
     gl_FragColor = color;
 }"#;
 
-/// Splice the rounding mask into a fragment shader.
+/// Splice the rounding mask and the refraction sample rewrite into a fragment
+/// shader.
 ///
-/// Two edits: the helper goes in just above `main` (so `v_coords` is in
-/// scope), and every final colour is scaled by the mask. The decode shaders all
-/// terminate in `* alpha;`, and the plain one assigns a pre-multiplied `color`
-/// -- both forms are handled, and both are asserted on by tests, because a
-/// silent miss here would compile fine and simply never round anything.
-fn with_rounding(source: &str) -> String {
-    let spliced = source.replace("void main() {", &format!("{ROUNDING_GLSL}void main() {{"));
+/// Three edits, in order: the sample site is rewritten first, then the two
+/// helpers go in just above `main` (so `v_coords` is in scope), then every
+/// final colour is scaled by the mask. The decode shaders all terminate in
+/// `* alpha;`, and the plain one assigns a pre-multiplied `color` -- both
+/// forms are handled, and both are asserted on by tests, because a silent
+/// miss here would compile fine and simply never round (or refract) anything.
+///
+/// Order matters and is load-bearing: the sample site is rewritten FIRST,
+/// while the helper is not yet in the source. Injecting first would rewrite
+/// `rubixSampleRefracted`'s own `texture2D(tex, v_coords)` into a call to
+/// itself -- infinite recursion, and one that compiles on some drivers.
+fn with_rubix_stages(source: &str) -> String {
+    let refracted = source.replace("texture2D(tex, v_coords)", "rubixSampleRefracted()");
+    let spliced = refracted.replace(
+        "void main() {",
+        &format!("{ROUNDING_GLSL}{REFRACT_GLSL}void main() {{"),
+    );
     if spliced.contains("* alpha;") {
         spliced.replace("* alpha;", "* alpha * rubixCornerAlpha();")
     } else {
@@ -157,12 +261,20 @@ fn with_rounding(source: &str) -> String {
     }
 }
 
-fn uniform_names() -> [UniformName<'static>; 4] {
+fn uniform_names() -> [UniformName<'static>; 8] {
     [
         UniformName::new("rubix_radius", UniformType::_1f),
         UniformName::new("rubix_win_size", UniformType::_2f),
         UniformName::new("rubix_elem_offset", UniformType::_2f),
         UniformName::new("rubix_elem_size", UniformType::_2f),
+        // `rubix_refract_strength <= 0.0` is "off", so a program that never
+        // gets these set falls back to the plain sample benignly -- but
+        // `RoundedElement::new` pushes all four unconditionally anyway rather
+        // than relying on that.
+        UniformName::new("rubix_refract_strength", UniformType::_1f),
+        UniformName::new("rubix_refract_uv_per_px", UniformType::_2f),
+        UniformName::new("rubix_refract_facet_size", UniformType::_1f),
+        UniformName::new("rubix_refract_dispersion", UniformType::_1f),
     ]
 }
 
@@ -193,33 +305,33 @@ impl RoundShaders {
         let mut sdr_names = names.to_vec();
         sdr_names.push(UniformName::new("sdr_white_nits", UniformType::_1f));
         Ok(RoundShaders {
-            plain: renderer.compile_custom_texture_shader(with_rounding(PLAIN_TEXTURE), &names)?,
+            plain: renderer.compile_custom_texture_shader(with_rubix_stages(PLAIN_TEXTURE), &names)?,
             decode_sdr: renderer
-                .compile_custom_texture_shader(with_rounding(DECODE_SDR), &sdr_names)?,
+                .compile_custom_texture_shader(with_rubix_stages(DECODE_SDR), &sdr_names)?,
             decode_hdr_pq: renderer
-                .compile_custom_texture_shader(with_rounding(DECODE_HDR_PQ), &names)?,
+                .compile_custom_texture_shader(with_rubix_stages(DECODE_HDR_PQ), &names)?,
             decode_windows_scrgb: renderer
-                .compile_custom_texture_shader(with_rounding(DECODE_WINDOWS_SCRGB), &names)?,
+                .compile_custom_texture_shader(with_rubix_stages(DECODE_WINDOWS_SCRGB), &names)?,
             // Both carry `sdr_white_nits` for the same reason `decode_sdr` does:
             // the tone curve's domain is "multiples of SDR white", so the live
             // slider decides where the knee falls.
             tonemap_pq: renderer.compile_custom_texture_shader(
-                with_rounding(&crate::hdr_shaders::tonemap_pq_to_sdr()),
+                with_rubix_stages(&crate::hdr_shaders::tonemap_pq_to_sdr()),
                 &sdr_names,
             )?,
             tonemap_scrgb: renderer.compile_custom_texture_shader(
-                with_rounding(&crate::hdr_shaders::tonemap_scrgb_to_sdr()),
+                with_rubix_stages(&crate::hdr_shaders::tonemap_scrgb_to_sdr()),
                 &sdr_names,
             )?,
             // Same uniform set as the sRGB tone-map variants: the reference
             // luminance rides the `sdr_white_nits` name (overloaded -- see
             // `Wallpaper::backdrop_element`).
             tonemap_abs10k_pq: renderer.compile_custom_texture_shader(
-                with_rounding(&crate::hdr_shaders::tonemap_pq_to_abs10k()),
+                with_rubix_stages(&crate::hdr_shaders::tonemap_pq_to_abs10k()),
                 &sdr_names,
             )?,
             tonemap_abs10k_scrgb: renderer.compile_custom_texture_shader(
-                with_rounding(&crate::hdr_shaders::tonemap_scrgb_to_abs10k()),
+                with_rubix_stages(&crate::hdr_shaders::tonemap_scrgb_to_abs10k()),
                 &sdr_names,
             )?,
         })
@@ -323,6 +435,34 @@ pub(crate) enum RoundMode {
     TonemapAbs10k(DecodeKind),
 }
 
+/// Per-element refraction parameters, in the element's own **physical** pixel
+/// space -- the caller scales logical config values by the output scale before
+/// building this, so the shader works in one space only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Refraction {
+    /// Peak ray offset in physical px. `0.0` disables the whole effect and is
+    /// the value every non-backdrop element passes.
+    pub strength: f32,
+    /// Facet cell size in physical px.
+    pub facet_size: f32,
+    /// Per-channel spread, `0.0`-`1.0`, before the seam amplification.
+    pub dispersion: f32,
+    /// How far `v_coords` moves per physical pixel of offset. A backdrop quad
+    /// is a source-crop of the wallpaper, so this is the crop's share of the
+    /// texture divided by the quad's on-screen size -- it cannot be derived in
+    /// the shader without `dFdx`, which GLSL ES 100 does not have.
+    pub uv_per_px: (f32, f32),
+}
+
+impl Refraction {
+    pub(crate) const NONE: Refraction = Refraction {
+        strength: 0.0,
+        facet_size: 1.0,
+        dispersion: 0.0,
+        uv_per_px: (0.0, 0.0),
+    };
+}
+
 /// How `space_elements` picks a [`RoundMode`] for each window.
 ///
 /// A display composite draws every window through the same program, because the
@@ -371,6 +511,7 @@ pub(crate) struct RoundedElement<E> {
 impl<E: Element> RoundedElement<E> {
     /// `window_rect` and the element's own geometry must be in the same
     /// physical space -- the output-region-local space elements are built in.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: E,
         shaders: &RoundShaders,
@@ -379,6 +520,7 @@ impl<E: Element> RoundedElement<E> {
         window_rect: Rectangle<i32, Physical>,
         scale: Scale<f64>,
         sdr_white_nits: f32,
+        refraction: Refraction,
     ) -> Self {
         let geo = inner.geometry(scale);
         let offset: Point<i32, Physical> = geo.loc - window_rect.loc;
@@ -390,6 +532,10 @@ impl<E: Element> RoundedElement<E> {
             ),
             Uniform::new("rubix_elem_offset", (offset.x as f32, offset.y as f32)),
             Uniform::new("rubix_elem_size", (geo.size.w as f32, geo.size.h as f32)),
+            Uniform::new("rubix_refract_strength", refraction.strength),
+            Uniform::new("rubix_refract_uv_per_px", refraction.uv_per_px),
+            Uniform::new("rubix_refract_facet_size", refraction.facet_size),
+            Uniform::new("rubix_refract_dispersion", refraction.dispersion),
         ];
         if RoundShaders::wants_sdr_white_nits(mode) {
             uniforms.push(Uniform::new("sdr_white_nits", sdr_white_nits));
@@ -417,7 +563,7 @@ impl<E: Element> RoundedElement<E> {
         sdr_white_nits: f32,
     ) -> Self {
         let window_rect = inner.geometry(scale);
-        Self::new(inner, shaders, mode, 0.0, window_rect, scale, sdr_white_nits)
+        Self::new(inner, shaders, mode, 0.0, window_rect, scale, sdr_white_nits, Refraction::NONE)
     }
 }
 
@@ -681,6 +827,7 @@ where
         geometry,
         Scale::from(scale),
         sdr_white_nits,
+        Refraction::NONE,
     ))
 }
 
@@ -734,6 +881,13 @@ where
     let radius = state.config.decoration.corner_radius as f32;
     let deco = &state.config.decoration;
     // Any of these is per-window state the batched call cannot express.
+    //
+    // The backdrop settings -- `backdrop_tonemap`, `backdrop_blur`, `refract`
+    // -- are deliberately absent. A backdrop quad is only ever emitted for a
+    // window with `opacity < 1.0` (there is nothing to see through an opaque
+    // one), so the opacity checks below already force the per-window walk for
+    // every configuration that could produce one. Adding them would be dead
+    // conditions that read as though they were load-bearing.
     let has_borders = deco.border_width > 0
         || deco.active.glow_margin > 0
         || deco.inactive.glow_margin > 0
@@ -742,7 +896,8 @@ where
         || deco.obscured_opacity < 1.0
         || deco.rules.iter().any(|r| {
             [&r.active, &r.inactive].into_iter().any(|s| {
-                s.opacity.is_some_and(|o| o < 1.0) || s.glow_margin.is_some_and(|g| g > 0)
+                s.opacity.is_some_and(|o| o < 1.0)
+                    || s.glow_margin.is_some_and(|g| g > 0)
             })
         });
     let hdr = matches!(mode, SpaceMode::Fixed(RoundMode::Decode(_)) | SpaceMode::HdrComposite);
@@ -828,9 +983,23 @@ where
         // separate check -- `style_for_window` forces it back to `1.0` for
         // exactly this reason.
         if let Some(style) = style.as_ref().filter(|s| {
-            s.opacity < 1.0 && (s.backdrop_tonemap || s.backdrop_blur)
+            s.opacity < 1.0 && (s.backdrop_tonemap || s.backdrop_blur || s.refract)
         }) {
             let tonemap = style.backdrop_tonemap || wallpaper_sdr_tonemap;
+            // Scaled here rather than in `backdrop_element`, which does not
+            // otherwise need to know the output scale: the caller owns the
+            // look (strength, facet size, dispersion), the callee owns the
+            // geometry (`uv_per_px`, overwritten below).
+            let refraction = if style.refract {
+                Refraction {
+                    strength: deco.refract_strength * scale as f32,
+                    facet_size: deco.refract_facet_size * scale as f32,
+                    dispersion: deco.refract_dispersion,
+                    uv_per_px: (0.0, 0.0), // filled in by backdrop_element
+                }
+            } else {
+                Refraction::NONE
+            };
             // `hdr_pass` picks which wrapper program a tone-mapped quad gets
             // (see `RoundMode::TonemapAbs10k`'s doc comment): `true` only for
             // `SpaceMode::HdrComposite`, whose destination is the abs10k
@@ -853,6 +1022,7 @@ where
                 style.backdrop_blur,
                 backdrop_hdr_pass(mode),
                 state.sdr_white_nits,
+                refraction,
             ) {
                 backdrops.push(quad);
             }
@@ -898,6 +1068,7 @@ where
                     window_rect,
                     Scale::from(scale),
                     state.sdr_white_nits,
+                    Refraction::NONE,
                 ))
             })),
             None => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
@@ -911,6 +1082,80 @@ where
 mod tests {
     use super::*;
 
+    // The recursion guard: `rubixSampleRefracted`'s own `texture2D(tex,
+    // v_coords)` must never be rewritten into a call to itself. Splicing the
+    // helper in before rewriting the sample site would do exactly that, and it
+    // is a failure mode that compiles clean on some drivers -- infinite
+    // recursion at shader-compile time, not at Rust-compile time.
+    #[test]
+    fn the_sample_rewrite_runs_before_the_helper_is_spliced() {
+        for (name, source) in [
+            ("plain", PLAIN_TEXTURE),
+            ("decode_sdr", DECODE_SDR),
+            ("decode_hdr_pq", DECODE_HDR_PQ),
+            ("decode_windows_scrgb", DECODE_WINDOWS_SCRGB),
+            ("tonemap_pq", &crate::hdr_shaders::tonemap_pq_to_sdr()),
+            ("tonemap_scrgb", &crate::hdr_shaders::tonemap_scrgb_to_sdr()),
+            ("tonemap_abs10k_pq", &crate::hdr_shaders::tonemap_pq_to_abs10k()),
+            ("tonemap_abs10k_scrgb", &crate::hdr_shaders::tonemap_scrgb_to_abs10k()),
+        ] {
+            let out = with_rubix_stages(source);
+            let main_at = out.find("void main() {").expect("main present");
+            let after_main = &out[main_at..];
+            assert!(
+                !after_main.contains("texture2D(tex, v_coords)"),
+                "{name}: a raw sample survives after main -- only the helper above main \
+                 may call texture2D(tex, v_coords) directly"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shader_variant_gets_the_refraction_helper() {
+        for (name, source) in [
+            ("plain", PLAIN_TEXTURE),
+            ("decode_sdr", DECODE_SDR),
+            ("decode_hdr_pq", DECODE_HDR_PQ),
+            ("decode_windows_scrgb", DECODE_WINDOWS_SCRGB),
+            ("tonemap_pq", &crate::hdr_shaders::tonemap_pq_to_sdr()),
+            ("tonemap_scrgb", &crate::hdr_shaders::tonemap_scrgb_to_sdr()),
+        ] {
+            let out = with_rubix_stages(source);
+            assert_eq!(
+                out.matches("vec4 rubixSampleRefracted()").count(),
+                1,
+                "{name}: helper must be defined exactly once"
+            );
+            assert!(
+                out.matches("rubixSampleRefracted()").count() >= 2,
+                "{name}: helper must be both defined and called"
+            );
+        }
+    }
+
+    #[test]
+    fn refraction_none_is_off() {
+        assert_eq!(Refraction::NONE.strength, 0.0);
+    }
+
+    // The declared uniform set every program gets -- constructing a live
+    // `RoundedElement` needs a compiled `RoundShaders`, which needs a real GL
+    // context this test suite has none of, so this pins the set at the
+    // declaration instead of the instance.
+    #[test]
+    fn every_program_declares_the_refraction_uniforms() {
+        let all = uniform_names();
+        let names: Vec<&str> = all.iter().map(|n| n.name.as_ref()).collect();
+        for expected in [
+            "rubix_refract_strength",
+            "rubix_refract_uv_per_px",
+            "rubix_refract_facet_size",
+            "rubix_refract_dispersion",
+        ] {
+            assert!(names.contains(&expected), "missing uniform {expected}");
+        }
+    }
+
     // A miss in either splice compiles fine and simply never rounds anything,
     // which is exactly the kind of failure that survives a visual check on one
     // machine and not another.
@@ -922,7 +1167,7 @@ mod tests {
             ("decode_hdr_pq", DECODE_HDR_PQ),
             ("decode_windows_scrgb", DECODE_WINDOWS_SCRGB),
         ] {
-            let out = with_rounding(source);
+            let out = with_rubix_stages(source);
             assert!(out.contains("float rubixCornerAlpha()"), "{name}: helper missing");
             assert!(
                 out.contains("rubixCornerAlpha();"),
@@ -934,14 +1179,14 @@ mod tests {
     // The capture tone-map variants go through the same splice, and they are the
     // ones most likely to break it: they are built by `format!` rather than
     // written out as a literal, so a stray change to the head or tail could move
-    // the anchors `with_rounding` looks for.
+    // the anchors `with_rubix_stages` looks for.
     #[test]
     fn capture_tonemap_variants_survive_the_rounding_splice() {
         for (name, source) in [
             ("tonemap_pq", crate::hdr_shaders::tonemap_pq_to_sdr()),
             ("tonemap_scrgb", crate::hdr_shaders::tonemap_scrgb_to_sdr()),
         ] {
-            let out = with_rounding(&source);
+            let out = with_rubix_stages(&source);
             assert!(out.contains("float rubixCornerAlpha()"), "{name}: helper missing");
             assert!(
                 out.contains("rubixCornerAlpha();"),
@@ -964,7 +1209,7 @@ mod tests {
     #[test]
     fn the_helper_is_declared_after_v_coords_so_it_compiles() {
         for source in [PLAIN_TEXTURE, DECODE_SDR, DECODE_HDR_PQ, DECODE_WINDOWS_SCRGB] {
-            let out = with_rounding(source);
+            let out = with_rubix_stages(source);
             let varying = out.find("varying vec2 v_coords;").expect("v_coords declared");
             let helper = out.find("float rubixCornerAlpha()").expect("helper present");
             assert!(varying < helper, "helper must come after the varying it reads");
@@ -975,7 +1220,7 @@ mod tests {
     fn splicing_leaves_the_defines_marker_intact() {
         // Smithay substitutes this line; losing it breaks every variant.
         for source in [PLAIN_TEXTURE, DECODE_SDR, DECODE_HDR_PQ, DECODE_WINDOWS_SCRGB] {
-            assert!(with_rounding(source).contains("//_DEFINES_"));
+            assert!(with_rubix_stages(source).contains("//_DEFINES_"));
         }
     }
 

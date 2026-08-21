@@ -691,6 +691,10 @@ pub struct WindowStyle {
     /// Sample the pre-blurred backdrop buffer instead of the sharp wallpaper.
     /// `false` (the default) preserves existing behaviour.
     pub backdrop_blur: bool,
+    /// Refract the backdrop quad through a faceted crystal-like field instead
+    /// of showing the wallpaper flat. `false` (the default) preserves existing
+    /// behaviour.
+    pub refract: bool,
 }
 
 impl Default for DecorationConfig {
@@ -736,6 +740,17 @@ pub struct DecorationConfig {
     /// `sdr_white_nits`'s own `[80, 300]` because useful values here are
     /// expected to sit well *under* window white.
     pub backdrop_luminance_nits: f32,
+    /// Peak ray offset for the crystal-facet backdrop refraction, in logical
+    /// pixels. Scaled by the output scale before it reaches the shader.
+    /// Clamped to `[0.0, 200.0]`.
+    pub refract_strength: f32,
+    /// Facet cell size for the backdrop refraction, in logical pixels.
+    /// Scaled by the output scale before it reaches the shader. Clamped to
+    /// `[4.0, 2000.0]`.
+    pub refract_facet_size: f32,
+    /// Per-channel dispersion spread, `0.0`-`1.0`, before the seam
+    /// amplification the shader applies. Clamped to `[0.0, 1.0]`.
+    pub refract_dispersion: f32,
 }
 
 /// A conditional override. Both matchers are case-insensitive substring tests,
@@ -768,6 +783,7 @@ pub struct StyleOverride {
     pub opacity: Option<f32>,
     pub backdrop_tonemap: Option<bool>,
     pub backdrop_blur: Option<bool>,
+    pub refract: Option<bool>,
 }
 
 impl StyleOverride {
@@ -792,6 +808,9 @@ impl StyleOverride {
         }
         if let Some(blur) = self.backdrop_blur {
             style.backdrop_blur = blur;
+        }
+        if let Some(refract) = self.refract {
+            style.refract = refract;
         }
     }
 }
@@ -872,6 +891,16 @@ struct RawDecoration {
     // here. Resolved in `resolve_decoration`.
     #[serde(default)]
     backdrop_luminance_nits: Option<f32>,
+    #[serde(default)]
+    active_refract: bool,
+    #[serde(default)]
+    inactive_refract: bool,
+    #[serde(default = "default_refract_strength")]
+    refract_strength: f32,
+    #[serde(default = "default_refract_facet_size")]
+    refract_facet_size: f32,
+    #[serde(default = "default_refract_dispersion")]
+    refract_dispersion: f32,
     // Singular to match the `[[decoration.rule]]` array-of-tables header
     // exactly, same convention as `[[output]]`.
     #[serde(default)]
@@ -900,6 +929,11 @@ impl Default for RawDecoration {
             inactive_backdrop_blur: false,
             backdrop_blur_radius: default_backdrop_blur_radius(),
             backdrop_luminance_nits: None,
+            active_refract: false,
+            inactive_refract: false,
+            refract_strength: default_refract_strength(),
+            refract_facet_size: default_refract_facet_size(),
+            refract_dispersion: default_refract_dispersion(),
             rule: Vec::new(),
         }
     }
@@ -937,6 +971,10 @@ struct RawBorderRule {
     active_backdrop_blur: Option<bool>,
     #[serde(default)]
     inactive_backdrop_blur: Option<bool>,
+    #[serde(default)]
+    active_refract: Option<bool>,
+    #[serde(default)]
+    inactive_refract: Option<bool>,
 }
 
 fn default_border_width() -> u32 {
@@ -955,6 +993,25 @@ fn default_opacity() -> f32 {
 
 fn default_backdrop_blur_radius() -> u32 {
     32
+}
+
+/// Peak ray offset for the crystal-facet backdrop refraction, in logical
+/// pixels. Subtle enough to read as glass, not as a funhouse mirror.
+fn default_refract_strength() -> f32 {
+    12.0
+}
+
+/// Facet cell size for the crystal-facet backdrop refraction, in logical
+/// pixels. Coarse enough that individual facets are visible on an ordinary
+/// window rather than dissolving into noise.
+fn default_refract_facet_size() -> f32 {
+    90.0
+}
+
+/// Per-channel dispersion spread for the crystal-facet backdrop refraction,
+/// before the seam amplification the shader applies.
+fn default_refract_dispersion() -> f32 {
+    0.35
 }
 
 /// Nearly-covered rather than entirely covered, so a window peeking out by a
@@ -1059,6 +1116,7 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
                     opacity: r.active_opacity.map(resolve_opacity),
                     backdrop_tonemap: r.active_backdrop_tonemap,
                     backdrop_blur: r.active_backdrop_blur,
+                    refract: r.active_refract,
                 },
                 inactive: StyleOverride {
                     color: color(r.inactive_color, inactive_fallback),
@@ -1068,6 +1126,7 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
                     opacity: r.inactive_opacity.map(resolve_opacity),
                     backdrop_tonemap: r.inactive_backdrop_tonemap,
                     backdrop_blur: r.inactive_backdrop_blur,
+                    refract: r.inactive_refract,
                 },
                 app_id: r.app_id,
                 title: r.title,
@@ -1086,6 +1145,7 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
             opacity: resolve_opacity(raw.active_opacity),
             backdrop_tonemap: raw.active_backdrop_tonemap,
             backdrop_blur: raw.active_backdrop_blur,
+            refract: raw.active_refract,
         },
         inactive: WindowStyle {
             color: resolve_color(&raw.inactive_color, inactive_fallback),
@@ -1095,6 +1155,7 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
             opacity: resolve_opacity(raw.inactive_opacity),
             backdrop_tonemap: raw.inactive_backdrop_tonemap,
             backdrop_blur: raw.inactive_backdrop_blur,
+            refract: raw.inactive_refract,
         },
         rules,
         obscured_opacity: resolve_opacity(raw.obscured_opacity),
@@ -1106,6 +1167,9 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
             .backdrop_luminance_nits
             .unwrap_or(sdr_white_nits)
             .clamp(10.0, 10000.0),
+        refract_strength: raw.refract_strength.clamp(0.0, 200.0),
+        refract_facet_size: raw.refract_facet_size.clamp(4.0, 2000.0),
+        refract_dispersion: raw.refract_dispersion.clamp(0.0, 1.0),
     }
 }
 

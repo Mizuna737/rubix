@@ -881,6 +881,7 @@
             opacity: 1.0,
             backdrop_tonemap: false,
             backdrop_blur: false,
+            refract: false,
         };
         let before = style.clone();
         let over = StyleOverride { backdrop_blur: Some(true), ..StyleOverride::default() };
