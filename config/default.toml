@@ -13,13 +13,11 @@ startup = [
     "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start rubix-session.target",
 ]
 
-# SDR white luminance (nits) fed to the HDR encode shader for `hdr = true`
-# outputs -- the "brightness slider" for SDR content composited through the
-# HDR (BT.2020/PQ) pipeline. Live/hot-reloadable: editing and saving this
-# value takes effect immediately, no restart. Also adjustable at runtime via
-# Alt+XF86AudioRaiseVolume / Alt+XF86AudioLowerVolume (Super+ on a real TTY
-# session -- see keybinds below). Valid range [80, 300]; out-of-range values
-# are clamped. Omitting the key defaults to 203 (BT.2408 reference SDR white).
+# How bright ordinary (non-HDR) windows look on an HDR monitor.
+# Turn it UP to brighten every normal window, DOWN to dim them.
+# Does nothing on a non-HDR monitor. Range [80, 300], clamped.
+# Takes effect on save; also bound to Alt/Super+XF86AudioRaise/LowerVolume.
+# Details: docs/brightness-tuning.md
 sdr_white_nits = 203.0
 
 # Self-contained idle screen-off timer -- Rubix's own DPMS-equivalent, with no
@@ -129,42 +127,20 @@ inner_gap = 10
 #   Center   no scaling; centred, and cropped if larger than the output
 mode = "Fill"
 
-# Linear-light gain applied to the image when it is decoded. 1.0 leaves it
-# alone; 0.5 halves its luminance. Clamped to [0.05, 4.0].
-#
-# This exists because SDR-to-HDR converters tend to lift the *whole* image
-# rather than only extending its highlights. An image whose midtones sit ten
-# times above where the SDR original rendered does not read as "more dynamic
-# range" -- it reads as "too bright", because on an HDR output SDR content is
-# pinned to sdr_white_nits while the wallpaper is free to sit wherever it was
-# graded. The gain pulls it back into the same neighbourhood while leaving the
-# highlight headroom intact.
-#
-# To pick a value, compare the image's luminance against the SDR original's,
-# and aim for a peak at or just under your panel's. Hot-reloadable, so nudging
-# it and saving is the fastest way to find the number.
+# Overall wallpaper brightness on an HDR monitor.
+# Turn it UP for a brighter wallpaper, DOWN for a dimmer one.
+# Mostly useful for taming SDR-to-HDR converted images, which tend to come
+# out far too bright. Range [0.05, 4.0], clamped.
+# Changing it re-decodes the image, so it applies on save.
+# Details: docs/brightness-tuning.md
 luminance_scale = 1.0
 
-# What luminance (cd/m2) in the source image is treated as white when the
-# wallpaper is tone-mapped down onto an SDR output -- the bottom monitor, or any
-# output with `hdr = false`. Ordinary HDR windows are unaffected; they keep
-# sdr_white_nits.
-#
-# This is separate from luminance_scale because the two display paths measure
-# against different things. On an HDR output the image is shown at its absolute
-# graded luminance. On an SDR output it must be normalised against some
-# reference white, and 203 (the BT.2408 default) assumes the content was graded
-# to that reference. SDR-to-HDR conversions usually are not -- they lift the
-# whole image -- so the same file that looks right in HDR comes out far too
-# bright in SDR, with the shadows lifted worst of all. Raising this number
-# darkens the SDR rendering without touching the HDR one.
-#
-# Measured against the file's own grading, i.e. before luminance_scale is
-# applied. That keeps the two knobs orthogonal: retuning the HDR brightness
-# does not quietly push the SDR output in the opposite direction.
-#
-# To find a value, compare against an SDR original and match its shadows first
-# -- a lifted black reads as "washed out" far more than a dimmed highlight does.
+# Wallpaper brightness on a NON-HDR monitor (and in screenshots).
+# BACKWARDS from what you would expect: turn it UP to make the wallpaper
+# DARKER, DOWN to make it brighter. It is a reference white, not a
+# brightness -- saying "3000 nits counts as white" makes everything dimmer.
+# Does nothing on an HDR monitor. Takes effect on save.
+# Details: docs/brightness-tuning.md
 sdr_reference_nits = 203.0
 
 # Seconds each image is shown when `path` is a directory. Ignored for a single
@@ -222,16 +198,12 @@ border_width = 2
 active_color = "#89b4fa"
 inactive_color = "#45475a"
 
-# Absolute border luminance in nits, applied ONLY on an output actually
-# compositing in HDR (`hdr = true` on an HDR-capable display). Everywhere else
-# -- SDR output, SDR hardware, HDR disabled, screenshots, screencasts -- it is
-# ignored entirely and the border is simply `active_color`. Nobody without an
-# HDR monitor is affected by anything in this block.
-#
-# The point is chrome brighter than SDR white: with sdr_white_nits at its 203
-# default, a 350-nit focus ring is a focus indication that SDR chrome
-# physically cannot express. Omit (or set 0) for "no opinion" -- the border
-# then sits at SDR white like every other SDR element.
+# How brightly the focused window's border glows on an HDR monitor.
+# Turn it UP for a more eye-catching focus ring, DOWN for a subtler one.
+# Set above sdr_white_nits to get a focus indicator that SDR chrome
+# physically cannot express. Omit or set 0 for no opinion.
+# Ignored on non-HDR monitors, in screenshots, and in screencasts.
+# Details: docs/brightness-tuning.md
 # Commented out so this file matches the built-in defaults exactly: a config
 # omitting [decoration] entirely gets no luminance opinion. Uncomment to opt in.
 # # active_luminance_nits = 350.0
@@ -331,22 +303,15 @@ inactive_color = "#45475a"
 # rather than using blur alone on a bright HDR wallpaper.
 # backdrop_blur_radius = 32
 
-# Ceiling in nits for what a backdrop's highlights may reach, used by
-# `*_backdrop_tonemap`. Defaults to the live `sdr_white_nits`, on the
-# principle that what shows through a window should not out-shine the window.
+# How bright the wallpaper is allowed to look THROUGH a translucent window.
+# Turn it DOWN to make text easier to read, UP to let more of the wallpaper
+# show through. Used by *_backdrop_tonemap; defaults to sdr_white_nits.
 #
-# THE TRAP: the roll-off knee sits at 0.8x this value, so setting it above the
-# wallpaper's actual peak luminance makes the cap an exact no-op -- toggling
-# tonemap then changes literally nothing, which is indistinguishable from the
-# feature being unwired. This knob exists because the backdrop originally
-# borrowed `sdr_reference_nits`, which is deliberately large (it normalises
-# the whole wallpaper for an SDR output), putting the knee above every pixel
-# in the image.
-#
-# Useful values sit well BELOW `sdr_white_nits` -- around 40 is a reasonable
-# starting point for a backdrop that recedes behind text. Clamped to
-# [10.0, 10000.0]. Live: a shader uniform only, so it retunes on save with no
-# re-decode.
+# WATCH OUT: this does nothing at all if you set it above your wallpaper's
+# actual peak brightness -- there is then nothing left to pull down, and
+# toggling tonemap looks broken rather than subtle. Useful values sit well
+# BELOW sdr_white_nits; 40 is a good starting point. Range [10, 10000].
+# Takes effect on save. Details: docs/brightness-tuning.md
 # backdrop_luminance_nits = 40.0
 
 # Per-window rules, applied in file order over the defaults above.
