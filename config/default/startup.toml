@@ -1,0 +1,54 @@
+# Startup commands, diagnostics, and idle behaviour.
+#
+# Every *.toml under this directory is loaded and merged, so the split
+# across files is organisational only -- move things wherever suits you.
+
+# Rubix default configuration.
+# Copy to $XDG_CONFIG_HOME/rubix/config.toml (or ~/.config/rubix/config.toml) to override.
+
+# Commands run once, via `sh -c`, after the compositor is up (Wayland socket
+# published + XWayland ready). The Rubix equivalent of AwesomeWM's autorun.
+# Here: import the compositor env into the systemd --user environment and start
+# the Rubix session target, which pulls in the notification daemon (mako),
+# clipboard (copyq), polkit agent, and teams-for-notif. The wallpaper is drawn
+# by the compositor itself (see [wallpaper] below), so no wallpaper tool is
+# started here -- swaybg cannot tag an HDR image, and a layer-shell wallpaper
+# would draw over this one anyway.
+startup = [
+    "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start rubix-session.target",
+]
+
+# Self-contained idle screen-off timer -- Rubix's own DPMS-equivalent, with no
+# external daemon required. Powers every output off (real CRTC disable, not a
+# black-filled framebuffer -- correct for OLED panels) after this many seconds
+# of no keyboard/pointer activity, and back on on the next input. Held off
+# while any client holds an idle-inhibit (idle-inhibit-unstable-v1) lock, e.g.
+# a fullscreen video player or a Teams call.
+# Live/hot-reloadable: editing and saving re-arms the timer immediately.
+[diagnostics]
+# Where config problems go, on top of always being written to the log.
+#
+# A typo used to vanish silently: an unknown key in a chord drops that bind, a
+# malformed mode falls back to preferred, an unparseable color falls back to the
+# default -- all of it logged and nowhere else. This decides who else hears
+# about it.
+#
+#   "Osd"     desktop notification via notify-send (default -- a bar is not
+#             guaranteed to exist, let alone to have room for a notification)
+#   "Ipc"     a `config_error` message to every IPC subscriber, for a status
+#             bar that wants to render it itself (see ipc.rs)
+#   "Both"
+#   "Silent"  log only -- the original behavior
+#
+# Startup problems are held back a few seconds before being reported, since the
+# notification daemon is usually itself in `startup` and the bar has not
+# connected yet.
+config_errors = "Osd"
+
+[idle]
+# Master switch. Optional section: omitting [idle] entirely takes these
+# defaults (a fresh install blanks its screen out of the box).
+enabled = true
+# Seconds of no activity before the screen powers off. 0 disables the timer
+# regardless of `enabled`.
+screen_off_seconds = 600

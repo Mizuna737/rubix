@@ -59,7 +59,7 @@ src/
 ├── decoration.rs          borders, corners, opacity rules
 ├── config.rs              TOML load / validate / hot-reload
 └── ipc.rs                 Unix-socket control
-config/default.toml        annotated reference config
+config/default/           annotated reference config, split by area
 docs/                      design schema, HDR findings, portal notes
 ```
 

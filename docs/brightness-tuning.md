@@ -5,7 +5,7 @@ the screen, and they are deliberately independent — retuning one does not drag
 another with it.
 
 If you just want to know which dial to turn, the table in
-`config/default.toml` next to each key is enough. This document is the
+`config/default/` next to each key is enough. This document is the
 long-form version: what each knob measures against, and why the awkward ones
 are awkward.
 

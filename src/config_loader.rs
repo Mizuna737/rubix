@@ -139,6 +139,23 @@ pub(super) fn merge_all(root: &Path, files: &[PathBuf]) -> Result<(toml::Table, 
     Ok((acc, prov))
 }
 
+/// Merge already-parsed tables, labelled by the name they should be reported
+/// under. Used for the built-in defaults, which are embedded rather than read
+/// from disk -- concatenating their text instead would be wrong, since a bare
+/// top-level key following another file's `[section]` header silently parses
+/// as a member of that section.
+pub(super) fn merge_parsed(
+    parts: &[(&str, toml::Table)],
+) -> Result<(toml::Table, Provenance), LoadError> {
+    let mut acc = toml::Table::new();
+    let mut prov = Provenance::new();
+    for (name, table) in parts {
+        let rel = PathBuf::from(name);
+        merge_into(&mut acc, &mut prov, table.clone(), &rel, &mut Vec::new())?;
+    }
+    Ok((acc, prov))
+}
+
 fn merge_into(
     acc: &mut toml::Table,
     prov: &mut Provenance,

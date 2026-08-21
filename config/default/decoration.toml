@@ -1,91 +1,7 @@
-# Rubix default configuration.
-# Copy to $XDG_CONFIG_HOME/rubix/config.toml (or ~/.config/rubix/config.toml) to override.
-
-# Commands run once, via `sh -c`, after the compositor is up (Wayland socket
-# published + XWayland ready). The Rubix equivalent of AwesomeWM's autorun.
-# Here: import the compositor env into the systemd --user environment and start
-# the Rubix session target, which pulls in the notification daemon (mako),
-# clipboard (copyq), polkit agent, and teams-for-notif. The wallpaper is drawn
-# by the compositor itself (see [wallpaper] below), so no wallpaper tool is
-# started here -- swaybg cannot tag an HDR image, and a layer-shell wallpaper
-# would draw over this one anyway.
-startup = [
-    "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start rubix-session.target",
-]
-
-# How bright ordinary (non-HDR) windows look on an HDR monitor.
-# Turn it UP to brighten every normal window, DOWN to dim them.
-# Does nothing on a non-HDR monitor. Range [80, 300], clamped.
-# Takes effect on save; also bound to Alt/Super+XF86AudioRaise/LowerVolume.
-# Details: docs/brightness-tuning.md
-sdr_white_nits = 203.0
-
-# Self-contained idle screen-off timer -- Rubix's own DPMS-equivalent, with no
-# external daemon required. Powers every output off (real CRTC disable, not a
-# black-filled framebuffer -- correct for OLED panels) after this many seconds
-# of no keyboard/pointer activity, and back on on the next input. Held off
-# while any client holds an idle-inhibit (idle-inhibit-unstable-v1) lock, e.g.
-# a fullscreen video player or a Teams call.
-# Live/hot-reloadable: editing and saving re-arms the timer immediately.
-[diagnostics]
-# Where config problems go, on top of always being written to the log.
+# Window decoration, animation, and wallpaper.
 #
-# A typo used to vanish silently: an unknown key in a chord drops that bind, a
-# malformed mode falls back to preferred, an unparseable color falls back to the
-# default -- all of it logged and nowhere else. This decides who else hears
-# about it.
-#
-#   "Osd"     desktop notification via notify-send (default -- a bar is not
-#             guaranteed to exist, let alone to have room for a notification)
-#   "Ipc"     a `config_error` message to every IPC subscriber, for a status
-#             bar that wants to render it itself (see ipc.rs)
-#   "Both"
-#   "Silent"  log only -- the original behavior
-#
-# Startup problems are held back a few seconds before being reported, since the
-# notification daemon is usually itself in `startup` and the bar has not
-# connected yet.
-config_errors = "Osd"
-
-[idle]
-# Master switch. Optional section: omitting [idle] entirely takes these
-# defaults (a fresh install blanks its screen out of the box).
-enabled = true
-# Seconds of no activity before the screen powers off. 0 disables the timer
-# regardless of `enabled`.
-screen_off_seconds = 600
-
-[layout]
-# Number of columns instantiated on the monitor at startup.
-# Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.
-visible_columns = 3
-
-# Gap, in pixels, between each column and the monitor edge / its neighbours.
-# Monitor edges and inter-column seams both measure exactly outer_gap (the seam is
-# split half-and-half between adjacent columns). Omitting the key defaults to 20.
-outer_gap = 20
-
-# Gap, in pixels, between tiled windows *within* a group's split tree. Exactly one
-# inner_gap sits in each split seam. Omitting the key defaults to 10.
-inner_gap = 10
-
-# Per-connector output placement. Omitting this section (or omitting an entry
-# for a given connector) is fine -- unconfigured outputs are auto-laid-out
-# left-to-right so they never collide at the same origin. Uncomment and adjust
-# to pin a specific connector's position (and optionally its mode).
-# [[output]]
-# name = "DP-3"            # connector name, as reported by the DRM backend
-# position = [0, 0]        # top-left corner in global compositor space
-# mode = "1920x1080"       # optional; omit to use the output's preferred mode
-# primary = true           # optional, defaults to false
-# hdr = true   # opt-in HDR (BT.2020/PQ) for this output; default false. Requires an HDR display.
-# wallpaper = "~/wallpapers/dp3.avif"   # optional; overrides [wallpaper] path for this output only
-#
-# [[output]]
-# name = "HDMI-A-1"
-# position = [1920, 0]
-# mode = "1280x400"
-# transform = "270"  # normal|90|180|270|flipped|flipped-90|...|left|right; rotates the output
+# Every *.toml under this directory is loaded and merged, so the split
+# across files is organisational only -- move things wherever suits you.
 
 # Optional section: omitting [wallpaper] entirely draws no wallpaper, and each
 # output clears to black -- which is what every config predating this section
@@ -151,19 +67,6 @@ interval_seconds = 300
 # Duration of scroll/rotate slide tweens, in milliseconds. Omitting this
 # section entirely is fine -- it defaults to 250.
 duration_ms = 250
-
-# Optional section: omitting [input] entirely is fine, taking the defaults below.
-[input]
-# Hovering a window gives it keyboard focus, instead of requiring a click.
-# Live/hot-reloadable, and flippable at runtime with the ToggleFocusFollowsMouse
-# keybind -- but a config save re-seeds the live value, so editing this is always
-# the way back to a known state.
-#
-# Deliberately inert in three cases: while a pointer grab is in progress (a drag
-# or resize owns the pointer), while any window is fullscreen (a stray hover
-# would otherwise drop a game out of fullscreen), and over layer-shell surfaces
-# such as the bar or rofi, which are not windows and must keep their keyboard.
-focus_follows_mouse = false
 
 # Window borders. Drawn OUTSIDE the client rect, over the surrounding gap, so a
 # window's tile keeps its full size -- the trade is that borders eat into
@@ -354,61 +257,3 @@ inactive_color = "#45475a"
 # inactive_backdrop_tonemap = true
 # active_backdrop_blur = true
 # inactive_backdrop_blur = true
-
-# Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
-# variant name -- serde deserializes it straight into the enum, so there is no
-# translation table in code. Chord syntax: modifier tokens (Super/Alt/Ctrl/Shift,
-# case-insensitive) joined with '+', ending in an xkb keysym name ("Return", "h").
-# Alt-based defaults so the binds survive nested testing under a host WM that
-# grabs Super; switch to Super for a real TTY session.
-[keybinds]
-"Alt+h" = "RotateColumnsLeft"
-"Alt+l" = "RotateColumnsRight"
-"Alt+j" = "ScrollColumnDown"
-"Alt+k" = "ScrollColumnUp"
-"Alt+Return" = "MoveToNewColumn"
-"Alt+Shift+H" = "MoveActiveColumnLeft"
-"Alt+Shift+L" = "MoveActiveColumnRight"
-# Relocate the focused window across the group grid: h/l cross columns (landing in
-# the destination column's active row), j/k walk rows within the column. j=Down /
-# k=Up to match the ScrollColumn binds above.
-"Alt+Control+h" = "MoveFocusedWindowLeft"
-"Alt+Control+l" = "MoveFocusedWindowRight"
-"Alt+Control+j" = "MoveFocusedWindowDown"
-"Alt+Control+k" = "MoveFocusedWindowUp"
-# Zoom the cube: more visible columns (narrower bands) / fewer (wider bands).
-"Alt+Shift+J" = "IncrementVisibleColumns"
-"Alt+Shift+K" = "DecrementVisibleColumns"
-"Alt+n" = "NewGroup"
-# Flip the focused window's parent split between horizontal and vertical.
-"Alt+r" = "FlipSplitDirection"
-"Alt+Shift+space" = { Spawn = "alacritty" }
-# Launcher. rofi picks its wayland (layer-shell) backend automatically under
-# Rubix; the compositor grants it keyboard focus via layer-shell keyboard
-# interactivity (see focus_interactive_layer).
-"Super+space" = { Spawn = "rofi -show drun" }
-# Audio. Bare XF86 media keysyms (resolved case-sensitively by xkb) reach the
-# compositor via libinput on the TTY; each Spawns a pactl command against the
-# default sink/source. The waybar volume module reacts on its own via `pactl
-# subscribe`, so no compositor-side sink handler is needed. pactl matches the
-# bar's tooling (@DEFAULT_SINK@).
-"XF86AudioRaiseVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ +5%" }
-"XF86AudioLowerVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ -5%" }
-"XF86AudioMute" = { Spawn = "pactl set-sink-mute @DEFAULT_SINK@ toggle" }
-"XF86AudioMicMute" = { Spawn = "pactl set-source-mute @DEFAULT_SOURCE@ toggle" }
-# SDR-white-nits "brightness slider" for HDR outputs (see sdr_white_nits
-# above). Alt-based to match this file's nested-testing convention; switch to
-# Super for a real TTY session (matches "Super+space" launcher above).
-"Alt+XF86AudioRaiseVolume" = "IncreaseSdrWhite"
-"Alt+XF86AudioLowerVolume" = "DecreaseSdrWhite"
-# Live A/B toggle: flips HDR on/off on every HDR-capable output with no
-# restart. Shifted-letter final token (matches Alt+Shift+H/+L/+J/+K above --
-# the key event's keysym is already the shifted symbol when Shift is held).
-"Alt+Shift+T" = "ToggleHdr"
-# Flip focus-follows-mouse live, for A/B without editing the config (see [input]).
-"Alt+Shift+F" = "ToggleFocusFollowsMouse"
-# Exit the compositor. On the TTY backend this is the only in-session quit (winit
-# also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
-# Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the
-# chord's final token must be the shifted form (matching Alt+Shift+H / +L above).
-"Alt+Shift+Q" = "Quit"

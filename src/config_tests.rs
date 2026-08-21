@@ -6,7 +6,7 @@
     // assert every bind survives rather than trusting the count implicitly.
     #[test]
     fn default_config_parses_and_resolves_every_bind() {
-        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let raw: RawConfig = default_raw_config();
         let bind_count = raw.keybinds.len();
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.visible_columns, 3);
@@ -14,26 +14,28 @@
         assert_eq!(bind_count, 26);
     }
 
-    // A single file holding today's whole config must resolve to exactly the
-    // same `Config` through the new multi-file loader as it did being parsed
-    // directly -- the no-op property this phase depends on for a safe
-    // restart into the existing single-`config.toml` layout.
+    // The defaults read off disk as four separate files must resolve to
+    // exactly what the embedded, in-memory merge produces. Guards the split
+    // itself: a section landing in the wrong file, or a key lost between
+    // them, shows up here rather than on someone's desktop.
     #[test]
-    fn single_file_through_the_loader_matches_direct_parse() {
+    fn default_parts_on_disk_match_the_embedded_merge() {
         let dir = std::env::temp_dir().join(format!(
             "rubix-config-noop-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        std::fs::write(dir.join("config.toml"), DEFAULT_CONFIG).expect("write config");
+        for (name, text) in DEFAULT_PARTS {
+            std::fs::write(dir.join(name), text).expect("write config part");
+        }
 
         let files = config_loader::discover_config_files(&dir);
         let (table, _) = config_loader::merge_all(&dir, &files).expect("merge succeeds");
         let raw = config_loader::deserialize_merged(table).expect("deserializes");
         let via_loader = Config::resolve(raw);
 
-        let direct = Config::resolve(toml::from_str(DEFAULT_CONFIG).expect("default parses directly"));
+        let direct = Config::resolve(default_raw_config());
 
         assert_eq!(via_loader.visible_columns, direct.visible_columns);
         assert_eq!(via_loader.outer_gap, direct.outer_gap);
@@ -194,7 +196,7 @@
 
     #[test]
     fn default_config_resolves_animation_duration_to_250ms() {
-        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let raw: RawConfig = default_raw_config();
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.animation_duration, std::time::Duration::from_millis(250));
     }
@@ -504,7 +506,7 @@
 
     #[test]
     fn config_omitting_decoration_section_gets_the_built_in_border_defaults() {
-        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let raw: RawConfig = default_raw_config();
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.decoration.border_width, 2);
         assert!(cfg.decoration.active.color != cfg.decoration.inactive.color);
@@ -972,7 +974,7 @@
     #[test]
     fn a_clean_config_produces_no_diagnostics() {
         let _ = take_config_diagnostics();
-        let raw: RawConfig = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        let raw: RawConfig = default_raw_config();
         let _ = Config::resolve(raw);
         assert!(
             take_config_diagnostics().is_empty(),

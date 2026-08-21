@@ -17,8 +17,39 @@ use crate::input::NavAction;
 mod config_loader;
 
 /// Built-in fallback, used when no user config exists or one fails to parse.
-/// Also serves as the copy-paste reference at `config/default.toml`.
-const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
+/// Also serves as the copy-paste reference at `config/default/`.
+///
+/// Split across files the same way a user's config is, and merged through the
+/// real loader rather than concatenated: a bare top-level key (`startup`,
+/// `sdr_white_nits`) appearing after another file's `[section]` header would
+/// silently parse as a member of that section. Merging also means every test
+/// that touches the defaults exercises the merge path.
+const DEFAULT_PARTS: [(&str, &str); 4] = [
+    ("decoration.toml", include_str!("../config/default/decoration.toml")),
+    ("input.toml", include_str!("../config/default/input.toml")),
+    ("layout.toml", include_str!("../config/default/layout.toml")),
+    ("startup.toml", include_str!("../config/default/startup.toml")),
+];
+
+/// The built-in defaults as one merged table. Panics on failure: these files
+/// are compiled in, so a problem here is a build-time mistake, not user input.
+fn default_config_table() -> toml::Table {
+    let parsed: Vec<(&str, toml::Table)> = DEFAULT_PARTS
+        .iter()
+        .map(|(name, text)| {
+            (*name, toml::from_str(text).unwrap_or_else(|e| panic!("built-in {name} must parse: {e}")))
+        })
+        .collect();
+    config_loader::merge_parsed(&parsed)
+        .unwrap_or_else(|e| panic!("built-in defaults must merge: {e}"))
+        .0
+}
+
+/// The built-in defaults, resolved.
+fn default_raw_config() -> RawConfig {
+    config_loader::deserialize_merged(default_config_table())
+        .unwrap_or_else(|e| panic!("built-in defaults must deserialize: {e}"))
+}
 
 thread_local! {
     /// Problems noticed while parsing the config, drained by the caller after a
@@ -145,7 +176,7 @@ pub struct Config {
     pub idle: IdleConfig,
 }
 
-/// Resolved `[idle]`. See `config/default.toml` for the on-disk defaults.
+/// Resolved `[idle]`. See `config/default/` for the on-disk defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IdleConfig {
     /// Master switch. `false` disables the timer outright, independent of
@@ -256,7 +287,7 @@ struct RawConfig {
     #[serde(default)]
     decoration: RawDecoration,
     // Top-level scalar (must sit before the first [table] header in the TOML
-    // file -- see config/default.toml). Live/hot-reloadable: HDR Phase 4's
+    // file -- see config/default/). Live/hot-reloadable: HDR Phase 4's
     // SDR-white-nits slider, adjustable via keybind (IncreaseSdrWhite /
     // DecreaseSdrWhite) or by editing this value and saving. Default mirrors
     // hdr_shaders::SDR_WHITE_NITS (BT.2408 reference SDR white); resolved
@@ -426,7 +457,7 @@ impl Config {
         } else {
             note_config_problem("no config directory found; using built-in defaults".to_string());
         }
-        Self::resolve(toml::from_str(DEFAULT_CONFIG).expect("built-in default config must parse"))
+        Self::resolve(default_raw_config())
     }
 
     fn resolve(raw: RawConfig) -> Self {

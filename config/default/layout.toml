@@ -1,0 +1,43 @@
+# Tiling layout and physical outputs.
+#
+# Every *.toml under this directory is loaded and merged, so the split
+# across files is organisational only -- move things wherever suits you.
+
+# How bright ordinary (non-HDR) windows look on an HDR monitor.
+# Turn it UP to brighten every normal window, DOWN to dim them.
+# Does nothing on a non-HDR monitor. Range [80, 300], clamped.
+# Takes effect on save; also bound to Alt/Super+XF86AudioRaise/LowerVolume.
+# Details: docs/brightness-tuning.md
+sdr_white_nits = 203.0
+
+[layout]
+# Number of columns instantiated on the monitor at startup.
+# Mirrors Monitor::visible_columns -- config keys match the Rust identifiers exactly.
+visible_columns = 3
+
+# Gap, in pixels, between each column and the monitor edge / its neighbours.
+# Monitor edges and inter-column seams both measure exactly outer_gap (the seam is
+# split half-and-half between adjacent columns). Omitting the key defaults to 20.
+outer_gap = 20
+
+# Gap, in pixels, between tiled windows *within* a group's split tree. Exactly one
+# inner_gap sits in each split seam. Omitting the key defaults to 10.
+inner_gap = 10
+
+# Per-connector output placement. Omitting this section (or omitting an entry
+# for a given connector) is fine -- unconfigured outputs are auto-laid-out
+# left-to-right so they never collide at the same origin. Uncomment and adjust
+# to pin a specific connector's position (and optionally its mode).
+# [[output]]
+# name = "DP-3"            # connector name, as reported by the DRM backend
+# position = [0, 0]        # top-left corner in global compositor space
+# mode = "1920x1080"       # optional; omit to use the output's preferred mode
+# primary = true           # optional, defaults to false
+# hdr = true   # opt-in HDR (BT.2020/PQ) for this output; default false. Requires an HDR display.
+# wallpaper = "~/wallpapers/dp3.avif"   # optional; overrides [wallpaper] path for this output only
+#
+# [[output]]
+# name = "HDMI-A-1"
+# position = [1920, 0]
+# mode = "1280x400"
+# transform = "270"  # normal|90|180|270|flipped|flipped-90|...|left|right; rotates the output

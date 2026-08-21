@@ -1,0 +1,75 @@
+# Input devices and keybinds.
+#
+# Every *.toml under this directory is loaded and merged, so the split
+# across files is organisational only -- move things wherever suits you.
+
+# Optional section: omitting [input] entirely is fine, taking the defaults below.
+[input]
+# Hovering a window gives it keyboard focus, instead of requiring a click.
+# Live/hot-reloadable, and flippable at runtime with the ToggleFocusFollowsMouse
+# keybind -- but a config save re-seeds the live value, so editing this is always
+# the way back to a known state.
+#
+# Deliberately inert in three cases: while a pointer grab is in progress (a drag
+# or resize owns the pointer), while any window is fullscreen (a stray hover
+# would otherwise drop a game out of fullscreen), and over layer-shell surfaces
+# such as the bar or rofi, which are not windows and must keep their keyboard.
+focus_follows_mouse = false
+
+# Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
+# variant name -- serde deserializes it straight into the enum, so there is no
+# translation table in code. Chord syntax: modifier tokens (Super/Alt/Ctrl/Shift,
+# case-insensitive) joined with '+', ending in an xkb keysym name ("Return", "h").
+# Alt-based defaults so the binds survive nested testing under a host WM that
+# grabs Super; switch to Super for a real TTY session.
+[keybinds]
+"Alt+h" = "RotateColumnsLeft"
+"Alt+l" = "RotateColumnsRight"
+"Alt+j" = "ScrollColumnDown"
+"Alt+k" = "ScrollColumnUp"
+"Alt+Return" = "MoveToNewColumn"
+"Alt+Shift+H" = "MoveActiveColumnLeft"
+"Alt+Shift+L" = "MoveActiveColumnRight"
+# Relocate the focused window across the group grid: h/l cross columns (landing in
+# the destination column's active row), j/k walk rows within the column. j=Down /
+# k=Up to match the ScrollColumn binds above.
+"Alt+Control+h" = "MoveFocusedWindowLeft"
+"Alt+Control+l" = "MoveFocusedWindowRight"
+"Alt+Control+j" = "MoveFocusedWindowDown"
+"Alt+Control+k" = "MoveFocusedWindowUp"
+# Zoom the cube: more visible columns (narrower bands) / fewer (wider bands).
+"Alt+Shift+J" = "IncrementVisibleColumns"
+"Alt+Shift+K" = "DecrementVisibleColumns"
+"Alt+n" = "NewGroup"
+# Flip the focused window's parent split between horizontal and vertical.
+"Alt+r" = "FlipSplitDirection"
+"Alt+Shift+space" = { Spawn = "alacritty" }
+# Launcher. rofi picks its wayland (layer-shell) backend automatically under
+# Rubix; the compositor grants it keyboard focus via layer-shell keyboard
+# interactivity (see focus_interactive_layer).
+"Super+space" = { Spawn = "rofi -show drun" }
+# Audio. Bare XF86 media keysyms (resolved case-sensitively by xkb) reach the
+# compositor via libinput on the TTY; each Spawns a pactl command against the
+# default sink/source. The waybar volume module reacts on its own via `pactl
+# subscribe`, so no compositor-side sink handler is needed. pactl matches the
+# bar's tooling (@DEFAULT_SINK@).
+"XF86AudioRaiseVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ +5%" }
+"XF86AudioLowerVolume" = { Spawn = "pactl set-sink-volume @DEFAULT_SINK@ -5%" }
+"XF86AudioMute" = { Spawn = "pactl set-sink-mute @DEFAULT_SINK@ toggle" }
+"XF86AudioMicMute" = { Spawn = "pactl set-source-mute @DEFAULT_SOURCE@ toggle" }
+# SDR-white-nits "brightness slider" for HDR outputs (see sdr_white_nits
+# above). Alt-based to match this file's nested-testing convention; switch to
+# Super for a real TTY session (matches "Super+space" launcher above).
+"Alt+XF86AudioRaiseVolume" = "IncreaseSdrWhite"
+"Alt+XF86AudioLowerVolume" = "DecreaseSdrWhite"
+# Live A/B toggle: flips HDR on/off on every HDR-capable output with no
+# restart. Shifted-letter final token (matches Alt+Shift+H/+L/+J/+K above --
+# the key event's keysym is already the shifted symbol when Shift is held).
+"Alt+Shift+T" = "ToggleHdr"
+# Flip focus-follows-mouse live, for A/B without editing the config (see [input]).
+"Alt+Shift+F" = "ToggleFocusFollowsMouse"
+# Exit the compositor. On the TTY backend this is the only in-session quit (winit
+# also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
+# Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the
+# chord's final token must be the shifted form (matching Alt+Shift+H / +L above).
+"Alt+Shift+Q" = "Quit"
