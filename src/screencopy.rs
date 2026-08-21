@@ -474,7 +474,7 @@ where
     // HDR game look like a blown-out white sky. Gated on there actually being an
     // HDR surface present, so the overwhelmingly common all-SDR capture takes
     // exactly the path it always did.
-    let tonemap = crate::udev::output_has_hdr_window(state, output);
+    let tonemap = crate::udev::output_has_hdr_content(state, output);
     let mut background: Vec<RubixRenderElement<R>> = Vec::new();
     let mut bottom: Vec<RubixRenderElement<R>> = Vec::new();
     let mut top: Vec<RubixRenderElement<R>> = Vec::new();
@@ -548,6 +548,20 @@ where
     elements.extend(space_elements);
     elements.extend(bottom);
     elements.extend(background);
+    // A capture destination is always 8-bit sRGB, so `tonemap` is the same flag
+    // the surfaces above used: an HDR wallpaper is decoded and tone-mapped down
+    // rather than handed over as though it were sRGB. See src/wallpaper.rs.
+    if let Some(region) = state.space.output_geometry(output)
+        && let Some((_, wallpaper)) = state.wallpaper.element(
+            renderer,
+            &output.name(),
+            region.size,
+            scale,
+            tonemap,
+        )
+    {
+        elements.push(wallpaper);
+    }
     elements
 }
 

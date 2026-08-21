@@ -1,4 +1,19 @@
-# Overnight status — dual-head, rotation, HDR (2026-07-30 → 07-31)
+# HDR status
+
+**Current as of 2026-08-20.** HDR is live and composited — not fullscreen-only. The frame is built
+in a linear working space and encoded to PQ, with per-window decode for PQ and Windows-scRGB
+content, and tone-mapping down for SDR outputs and for every capture path (screenshots, portal
+screencast). HDR games work through GE-Proton + gamescope. Idle HDR compositing costs no more than
+SDR after element-level damage tracking. The compositor draws its own wallpaper, so an HDR AVIF can
+drive a connector into HDR mode with no HDR window present.
+
+Everything below this line is the **2026-07-31 snapshot** that planned the work — kept for the
+measurements, the hardware findings, and the prior-art list. Its "what to test" and "plan" sections
+are historical; the live sprint doc is `Rubix-Roadmap` in the Obsidian vault.
+
+---
+
+## Snapshot — dual-head, rotation, HDR (2026-07-30 → 07-31)
 
 Written by Claude while you slept. TL;DR: **multi-monitor + rotation are done and ready
 to test; your dual-head config is written. HDR groundwork landed gated-off, but real HDR

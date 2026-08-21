@@ -209,6 +209,25 @@ impl RoundShaders {
         })
     }
 
+    /// Whether [`RoundShaders::program`] returns a program that declares
+    /// `sdr_white_nits`, and therefore whether an element using `mode` must
+    /// supply it.
+    ///
+    /// Kept beside `program` and pinned by a test, because the failure mode of
+    /// the two disagreeing is silent and total: a declared-but-unset uniform
+    /// reads as 0, and every one of these shaders divides by it. That shipped
+    /// once already -- the tone-map variants were compiled with the uniform but
+    /// never given it, so a PQ surface tone-mapped to SDR got a domain of
+    /// 0..10000 instead of 0..~50 and clipped to white edge to edge.
+    fn wants_sdr_white_nits(mode: RoundMode) -> bool {
+        matches!(
+            mode,
+            RoundMode::Decode(DecodeKind::Sdr)
+                | RoundMode::Tonemap(DecodeKind::HdrPq)
+                | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
+        )
+    }
+
     fn program(&self, mode: RoundMode) -> &GlesTexProgram {
         match mode {
             RoundMode::Plain => &self.plain,
@@ -298,6 +317,10 @@ pub(crate) struct RoundedElement<E> {
     inner: E,
     program: GlesTexProgram,
     uniforms: Vec<Uniform<'static>>,
+    /// Whether the corner mask actually carves anything out. False when the
+    /// wrapper exists only to install a program (radius 0) -- see
+    /// `opaque_regions`.
+    masked: bool,
 }
 
 impl<E: Element> RoundedElement<E> {
@@ -323,13 +346,14 @@ impl<E: Element> RoundedElement<E> {
             Uniform::new("rubix_elem_offset", (offset.x as f32, offset.y as f32)),
             Uniform::new("rubix_elem_size", (geo.size.w as f32, geo.size.h as f32)),
         ];
-        if mode == RoundMode::Decode(DecodeKind::Sdr) {
+        if RoundShaders::wants_sdr_white_nits(mode) {
             uniforms.push(Uniform::new("sdr_white_nits", sdr_white_nits));
         }
         RoundedElement {
             inner,
             program: shaders.program(mode).clone(),
             uniforms,
+            masked: radius > 0.0,
         }
     }
 }
@@ -365,8 +389,19 @@ impl<E: Element> Element for RoundedElement<E> {
     /// Deliberately empty. The corners are transparent now, so whatever the
     /// inner element claims about opacity is no longer true, and an untrue
     /// opaque region lets the renderer skip drawing what shows through.
-    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        OpaqueRegions::default()
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        // A rounded element is not opaque: the corners it discards have to be
+        // drawn through. But at radius 0 the mask is inert -- the wrapper is
+        // only carrying a shader program (a decode, a tone-map, the wallpaper)
+        // -- and forfeiting the inner element's opacity there would cost the
+        // occlusion culling for nothing. That matters most for the wallpaper,
+        // the largest element in the frame and the one most often fully
+        // covered.
+        if self.masked {
+            OpaqueRegions::default()
+        } else {
+            self.inner.opaque_regions(scale)
+        }
     }
 }
 
@@ -812,5 +847,73 @@ mod tests {
             RoundMode::Decode(DecodeKind::WindowsScrgb),
         ];
         assert_eq!(modes.len(), 4, "a new mode needs a program in RoundShaders");
+    }
+
+    // Pins `wants_sdr_white_nits` against the shader sources it speaks for.
+    //
+    // This is the bug that made an HDR wallpaper render as a white rectangle on
+    // an SDR output: the tone-map programs were compiled with `sdr_white_nits`
+    // declared, but only `Decode(Sdr)` ever supplied it. An unset uniform reads
+    // as 0, and every shader here divides by it -- so PQ decoded into a
+    // 0..10000 domain instead of 0..~50 and clipped everywhere. Nothing about
+    // that is visible in a compile, which is why it needs a test.
+    #[test]
+    fn every_mode_that_references_sdr_white_nits_is_given_it() {
+        // The mode -> source mapping, duplicated from `RoundShaders::program`
+        // on purpose: this test exists to catch the two drifting apart.
+        let sources: [(RoundMode, String); 7] = [
+            (RoundMode::Plain, PLAIN_TEXTURE.to_string()),
+            (RoundMode::Decode(DecodeKind::Sdr), DECODE_SDR.to_string()),
+            (RoundMode::Decode(DecodeKind::HdrPq), DECODE_HDR_PQ.to_string()),
+            (
+                RoundMode::Decode(DecodeKind::WindowsScrgb),
+                DECODE_WINDOWS_SCRGB.to_string(),
+            ),
+            (RoundMode::Tonemap(DecodeKind::Sdr), PLAIN_TEXTURE.to_string()),
+            (
+                RoundMode::Tonemap(DecodeKind::HdrPq),
+                crate::hdr_shaders::tonemap_pq_to_sdr(),
+            ),
+            (
+                RoundMode::Tonemap(DecodeKind::WindowsScrgb),
+                crate::hdr_shaders::tonemap_scrgb_to_sdr(),
+            ),
+        ];
+        for (mode, source) in sources {
+            let referenced = source.contains("sdr_white_nits");
+            assert_eq!(
+                RoundShaders::wants_sdr_white_nits(mode),
+                referenced,
+                "{mode:?}: shader references sdr_white_nits = {referenced}, \
+                 but wants_sdr_white_nits says {}",
+                RoundShaders::wants_sdr_white_nits(mode),
+            );
+        }
+    }
+
+    // The uniform has to actually reach the element, not merely be wanted.
+    #[test]
+    fn a_tone_mapped_element_carries_the_nits_uniform() {
+        for mode in [
+            RoundMode::Decode(DecodeKind::Sdr),
+            RoundMode::Tonemap(DecodeKind::HdrPq),
+            RoundMode::Tonemap(DecodeKind::WindowsScrgb),
+        ] {
+            assert!(
+                RoundShaders::wants_sdr_white_nits(mode),
+                "{mode:?} must supply sdr_white_nits",
+            );
+        }
+        for mode in [
+            RoundMode::Plain,
+            RoundMode::Tonemap(DecodeKind::Sdr),
+            RoundMode::Decode(DecodeKind::HdrPq),
+            RoundMode::Decode(DecodeKind::WindowsScrgb),
+        ] {
+            assert!(
+                !RoundShaders::wants_sdr_white_nits(mode),
+                "{mode:?} must not supply a uniform its program never declares",
+            );
+        }
     }
 }

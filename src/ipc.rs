@@ -78,6 +78,16 @@ enum Request {
     // Per-output power state -- what `rubix screen status` prints. Replies
     // `Reply::ScreenStatus`.
     ScreenStatus,
+    // Change the wallpaper without touching the config file. `output: None`
+    // sets every output (and clears any per-output overrides, so it cannot
+    // visibly miss a monitor). Decoding happens synchronously, so a bad path or
+    // an undecodable image comes back as `Reply::Error` rather than silently
+    // drawing nothing:
+    //   printf '{"type":"set_wallpaper","path":"/path/to/image.avif","output":null}\n' | \
+    //     socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rubix.sock"
+    // The change is not written back to the config, so a reload restores
+    // whatever the file says. See src/wallpaper.rs.
+    SetWallpaper { path: String, output: Option<String> },
 }
 
 #[derive(Serialize)]
@@ -257,6 +267,18 @@ fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
                     .map(|(name, off)| OutputPowerView { name, on: !off })
                     .collect(),
             },
+            Ok(Request::SetWallpaper { path, output }) => {
+                match data.wallpaper.set(output.as_deref(), std::path::Path::new(&path)) {
+                    Ok(()) => {
+                        // Nothing else marks the output damaged: the wallpaper
+                        // is not a client surface, so no commit arrives to
+                        // trigger a repaint on its own.
+                        data.nudge_render();
+                        Reply::Ok
+                    }
+                    Err(message) => Reply::Error { message },
+                }
+            }
             Err(e) => Reply::Error { message: e.to_string() },
         };
         if write_reply(&mut client.stream, &reply).is_err() {

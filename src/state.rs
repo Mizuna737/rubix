@@ -195,6 +195,10 @@ pub struct RubixState {
     // client registry lives there rather than on the state. Only ever populated
     // when the resolved sink includes Ipc.
     pub pending_config_errors: Vec<String>,
+    /// Decoded wallpapers and their per-output assignment. Populated from
+    /// config at startup and on reload, and mutable at runtime over IPC.
+    /// See src/wallpaper.rs.
+    pub wallpaper: crate::wallpaper::WallpaperManager,
 
     // wlr-foreign-toplevel-management: bound managers plus what each window's
     // handles were last told, so `foreign_toplevel::refresh` can send deltas.
@@ -358,6 +362,12 @@ pub struct RubixState {
     // disarmed (screen already off, idle disabled/`screen_off_seconds == 0`,
     // or an inhibitor is held) -- see `rearm_idle_timer`.
     pub(crate) idle_timer: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Coalesces a burst of filesystem events into one reload. See
+    /// `schedule_config_reload`.
+    pub(crate) config_reload_timer: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Fires when the next slideshow image is due. `None` when the wallpaper is
+    /// a single file, so a static desktop arms no timer at all.
+    pub(crate) wallpaper_timer: Option<smithay::reexports::calloop::RegistrationToken>,
     // Surfaces currently holding a live `zwp_idle_inhibitor_v1`. A `HashSet`
     // rather than a count: a client destroying its *wl_surface* without ever
     // sending the inhibitor's `destroy` request (crash, or just sloppy
@@ -494,6 +504,9 @@ impl RubixState {
             unmapped: HashMap::new(),
             ipc_dirty: false,
             pending_config_errors: Vec::new(),
+            wallpaper: crate::wallpaper::WallpaperManager::default(),
+            wallpaper_timer: None,
+            config_reload_timer: None,
             foreign_toplevel: Default::default(),
             reserved_bounds: None,
             animations: HashMap::new(),
@@ -735,6 +748,67 @@ impl RubixState {
             smithay::reexports::calloop::timer::TimeoutAction::Drop
         });
         self.idle_timer = token.ok();
+    }
+
+    /// Reload the config a short while after filesystem activity stops.
+    ///
+    /// A single save is not a single event. Editors truncate before writing, so
+    /// the first inotify event routinely arrives while the file is zero bytes
+    /// -- which parses as "TOML parse error at line 1, column 1" and, now that
+    /// config problems are surfaced on screen, produced a notification on every
+    /// save. Several more events follow as the write completes, each of which
+    /// used to trigger its own full reload (and, with a slideshow configured,
+    /// its own synchronous image decode).
+    ///
+    /// Re-arming on each event means the reload happens once, after the writing
+    /// has stopped.
+    pub(crate) fn schedule_config_reload(&mut self) {
+        if let Some(token) = self.config_reload_timer.take() {
+            self.loop_handle.remove(token);
+        }
+        let timer = smithay::reexports::calloop::timer::Timer::from_duration(
+            std::time::Duration::from_millis(250),
+        );
+        let token = self.loop_handle.insert_source(timer, move |_, _, data| {
+            data.config_reload_timer = None;
+            data.reload_config();
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        });
+        self.config_reload_timer = token.ok();
+    }
+
+    /// Arm (or disarm) the slideshow timer to match the wallpaper's schedule.
+    ///
+    /// Deliberately not driven off the render loop: a static desktop produces
+    /// no frames, so a slideshow hung off rendering would never advance on an
+    /// idle screen -- which is exactly when it is most visible.
+    pub(crate) fn rearm_wallpaper_timer(&mut self) {
+        if let Some(token) = self.wallpaper_timer.take() {
+            self.loop_handle.remove(token);
+        }
+        let Some(next_at) = self.wallpaper.next_slideshow_at() else {
+            return;
+        };
+        let delay = next_at.saturating_duration_since(Instant::now());
+        let timer = if delay.is_zero() {
+            smithay::reexports::calloop::timer::Timer::immediate()
+        } else {
+            smithay::reexports::calloop::timer::Timer::from_duration(delay)
+        };
+        let token = self.loop_handle.insert_source(timer, move |_, _, data| {
+            if data.wallpaper.advance_slideshow(Instant::now()) {
+                // Nothing else marks the output damaged: the wallpaper is not a
+                // client surface, so no commit arrives to trigger a repaint.
+                data.nudge_render();
+            }
+            data.wallpaper_timer = None;
+            // Re-armed rather than repeating on a fixed interval: a swap that
+            // had to wait on a slow decode reschedules itself sooner, and a
+            // config reload can change the interval underneath us.
+            data.rearm_wallpaper_timer();
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        });
+        self.wallpaper_timer = token.ok();
     }
 
     /// Recompute `idle_inhibited` from `idle_inhibitors` and, on change,
@@ -1078,7 +1152,7 @@ impl RubixState {
         // Drained here, not inside the `Some` arm: a config that fails to parse
         // outright is the single most important case to surface, and that is
         // exactly the case where `reload` returns None.
-        let problems = crate::config::take_config_diagnostics();
+        let mut problems = crate::config::take_config_diagnostics();
         let Some(new) = reloaded else {
             self.report_config_diagnostics(problems);
             return;
@@ -1123,6 +1197,16 @@ impl RubixState {
         // fresh interval, and disabling it (or setting `0`) cancels outright.
         self.config.idle = new.idle;
         self.rearm_idle_timer();
+        // Wallpapers resolve from both `[wallpaper]` and each `[[output]]`, so
+        // this runs after both are swapped in. Decode failures join the config
+        // problems already collected and go out through the same sink.
+        self.config.wallpaper = new.wallpaper;
+        problems.extend(
+            self.wallpaper
+                .resolve(&self.config.wallpaper, &self.config.outputs),
+        );
+        // The interval, or the presence of a slideshow at all, may have changed.
+        self.rearm_wallpaper_timer();
         tracing::info!("reloaded config: {count} keybinds active");
         // Last, so every field is already swapped and the report goes out through
         // the sink this edit asked for.

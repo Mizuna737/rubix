@@ -1363,7 +1363,13 @@ fn render_surface(
     // Only for `!surface.hdr`: an HDR output has the linear pipeline and does
     // this properly through the decode/encode passes instead.
     let sdr_tonemap =
-        sdr_tonemap_needed(surface.hdr, output_has_hdr_window(state, &surface.output));
+        sdr_tonemap_needed(surface.hdr, output_has_hdr_content(state, &surface.output));
+    // Swap in the frame due now. A still wallpaper -- every wallpaper today --
+    // returns false without touching anything; the call is here so that landing
+    // an animated decoder is a change to wallpaper.rs alone. When it does
+    // change, `MemoryRenderBuffer`'s damage bag carries the new frame's damage
+    // into the tracker without anything else needing to know.
+    state.wallpaper.advance_all(std::time::Instant::now());
     let mut background: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
     let mut bottom: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
     let mut top: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
@@ -1503,6 +1509,20 @@ fn render_surface(
     elements.extend(space_elements);
     elements.extend(bottom);
     elements.extend(background);
+    // Last, so it sits under every client. Only wrapped in a tone-map program
+    // when this output is SDR and the image is not -- an HDR output installs
+    // its decode for the whole pass instead. See src/wallpaper.rs.
+    if let Some(region) = state.space.output_geometry(&surface.output)
+        && let Some((_, wallpaper)) = state.wallpaper.element(
+            renderer,
+            &surface.output.name(),
+            region.size,
+            scale,
+            sdr_tonemap,
+        )
+    {
+        elements.push(wallpaper);
+    }
 
     // Connector color state follows the exclusive-fullscreen window's own
     // declared transfer function; on the desktop (no exclusive fullscreen) it
@@ -1549,7 +1569,7 @@ fn render_surface(
     // Phase 1b: when at least one HDR-declared surface contributes to this
     // output, the fast single-pass decode (below, unchanged since Phase 2)
     // can no longer be used -- it applies one shader override to every
-    // surface. `output_has_hdr_window` is a cheap per-window check (no
+    // surface. `output_has_hdr_content` is a cheap per-window check (no
     // renderer work) run first so the common case (no HDR content anywhere,
     // e.g. every normal desktop frame) takes the exact proven fast path with
     // zero extra cost. Only when it's actually needed is the more expensive
@@ -1646,7 +1666,7 @@ fn render_surface(
         // something to discard -- see the `.take()` in `encode_pass`.
         let mut hdr_feedback = Some(take_frame_feedback(state, &surface.output, None));
         surface.hdr_last_nits = Some(state.sdr_white_nits);
-        let hdr_result = if output_has_hdr_window(state, &surface.output) {
+        let hdr_result = if output_has_hdr_content(state, &surface.output) {
             let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
             render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits, &mut hdr_feedback)
         } else {
@@ -1939,7 +1959,13 @@ pub(crate) fn sdr_tonemap_needed(output_is_hdr: bool, has_hdr_content: bool) -> 
     !output_is_hdr && has_hdr_content
 }
 
-pub(crate) fn output_has_hdr_window(state: &RubixState, output: &Output) -> bool {
+pub(crate) fn output_has_hdr_content(state: &RubixState, output: &Output) -> bool {
+    // The compositor's own wallpaper counts, and is checked first because it is
+    // the cheapest test and the most likely source of HDR content on an
+    // otherwise ordinary desktop -- see src/wallpaper.rs.
+    if state.wallpaper.output_has_hdr(&output.name()) {
+        return true;
+    }
     let Some(region) = state.space.output_geometry(output) else {
         return false;
     };
@@ -2187,6 +2213,21 @@ fn gather_tagged_elements<'a>(
             .into_iter()
             .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
     );
+    // Bottom of the stack, tagged with its own decode kind so the z-run
+    // partition puts it in a run with the right program. Never wrapped here:
+    // this path is only reached on an HDR output, where the run installs the
+    // decode. See src/wallpaper.rs.
+    if let Some(region) = output_geo
+        && let Some(pair) = state.wallpaper.element(
+            renderer,
+            &output.name(),
+            region.size,
+            scale,
+            false,
+        )
+    {
+        tagged.push(pair);
+    }
     crate::decoration::prune_ring_cache(state);
     tagged
 }
@@ -2380,7 +2421,7 @@ fn render_surface_hdr<'a>(
     encode_pass(surface, renderer, &shaders, feedback)
 }
 
-/// HDR Phase 1b's slow-path pipeline: used only when [`output_has_hdr_window`]
+/// HDR Phase 1b's slow-path pipeline: used only when [`output_has_hdr_content`]
 /// found at least one HDR-declared surface on this output. Each surface is
 /// decoded through its own transfer function into a shared linear offscreen:
 ///

@@ -14,6 +14,100 @@
         assert_eq!(bind_count, 26);
     }
 
+    // ---- wallpaper ----
+
+    // A config predating [wallpaper] must keep working, drawing nothing rather
+    // than failing to parse.
+    #[test]
+    fn config_omitting_wallpaper_section_draws_none() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [wallpaper] still parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.wallpaper.path, None);
+        assert_eq!(cfg.wallpaper.mode, crate::wallpaper::WallpaperMode::Fill);
+    }
+
+    // The mode strings are the PascalCase Rust variant names, matched by serde
+    // with no rename -- the same rule the rest of this config follows.
+    #[test]
+    fn wallpaper_mode_matches_the_rust_variant_names() {
+        for (text, expected) in [
+            ("Fill", crate::wallpaper::WallpaperMode::Fill),
+            ("Fit", crate::wallpaper::WallpaperMode::Fit),
+            ("Stretch", crate::wallpaper::WallpaperMode::Stretch),
+            ("Center", crate::wallpaper::WallpaperMode::Center),
+        ] {
+            let toml_text = format!(
+                "[layout]\nvisible_columns = 3\n[keybinds]\n[wallpaper]\nmode = \"{text}\"\n"
+            );
+            let raw: RawConfig = toml::from_str(&toml_text).expect("mode parses");
+            assert_eq!(Config::resolve(raw).wallpaper.mode, expected, "{text}");
+        }
+    }
+
+    // A wallpaper path is the first config value a user naturally writes with a
+    // tilde; leaving it unexpanded produces a literal "~" directory lookup that
+    // fails with a confusing message.
+    #[test]
+    fn wallpaper_paths_expand_a_leading_tilde() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+
+            [wallpaper]
+            path = "~/pictures/a.avif"
+
+            [[output]]
+            name = "DP-3"
+            position = [0, 0]
+            wallpaper = "~/pictures/b.avif"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config parses");
+        let cfg = Config::resolve(raw);
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
+        assert_eq!(
+            cfg.wallpaper.path,
+            Some(PathBuf::from(&home).join("pictures/a.avif")),
+        );
+        assert_eq!(
+            cfg.outputs[0].wallpaper,
+            Some(PathBuf::from(&home).join("pictures/b.avif")),
+        );
+    }
+
+    // A tilde anywhere but the front is a legal filename character, not a home
+    // directory -- expanding it would break a path that was already correct.
+    #[test]
+    fn only_a_leading_tilde_is_expanded() {
+        assert_eq!(expand_tilde("/a/~b.avif".into()), PathBuf::from("/a/~b.avif"));
+        assert_eq!(expand_tilde("~notauser/a.avif".into()), PathBuf::from("~notauser/a.avif"));
+    }
+
+    // An output that names no wallpaper falls back to the global one; the
+    // per-output key exists to override, not to be mandatory.
+    #[test]
+    fn an_output_may_omit_its_wallpaper() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+
+            [[output]]
+            name = "DP-3"
+            position = [0, 0]
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config parses");
+        assert_eq!(Config::resolve(raw).outputs[0].wallpaper, None);
+    }
+
     // ---- input ----
 
     #[test]

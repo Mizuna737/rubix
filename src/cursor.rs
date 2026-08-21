@@ -91,6 +91,12 @@ render_elements! {
     // The `GlesAccess` bound above exists for this variant alone -- it is
     // how the element reaches a `GlesFrame` to install its shader program.
     Rounded = RoundedElement<WaylandSurfaceRenderElement<R>>,
+    // The wallpaper, wrapped the same way for the same reason: at radius 0 the
+    // wrapper installs a decode/tone-map program and the mask is inert. A
+    // separate variant because `RoundedElement` is generic over its inner
+    // element and this one wraps a memory buffer, not a surface.
+    // See wallpaper.rs.
+    RoundedMemory = RoundedElement<MemoryRenderBufferRenderElement<R>>,
     Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
 }
 

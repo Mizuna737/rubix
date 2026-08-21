@@ -130,7 +130,7 @@ where
     // HDR Phase 4a -- see `screencopy::build_elements` for the reasoning. Gated
     // on an HDR surface actually being present, so an all-SDR screenshare is
     // byte-for-byte the path it always took.
-    let tonemap = crate::udev::output_has_hdr_window(state, &output);
+    let tonemap = crate::udev::output_has_hdr_content(state, &output);
     let mut background: Vec<RubixRenderElement<R>> = Vec::new();
     let mut bottom: Vec<RubixRenderElement<R>> = Vec::new();
     let mut top: Vec<RubixRenderElement<R>> = Vec::new();

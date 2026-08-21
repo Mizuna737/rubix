@@ -5,7 +5,10 @@
 # published + XWayland ready). The Rubix equivalent of AwesomeWM's autorun.
 # Here: import the compositor env into the systemd --user environment and start
 # the Rubix session target, which pulls in the notification daemon (mako),
-# clipboard (copyq), polkit agent, wallpaper (swaybg), and teams-for-notif.
+# clipboard (copyq), polkit agent, and teams-for-notif. The wallpaper is drawn
+# by the compositor itself (see [wallpaper] below), so no wallpaper tool is
+# started here -- swaybg cannot tag an HDR image, and a layer-shell wallpaper
+# would draw over this one anyway.
 startup = [
     "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start rubix-session.target",
 ]
@@ -78,12 +81,95 @@ inner_gap = 10
 # mode = "1920x1080"       # optional; omit to use the output's preferred mode
 # primary = true           # optional, defaults to false
 # hdr = true   # opt-in HDR (BT.2020/PQ) for this output; default false. Requires an HDR display.
+# wallpaper = "~/wallpapers/dp3.avif"   # optional; overrides [wallpaper] path for this output only
 #
 # [[output]]
 # name = "HDMI-A-1"
 # position = [1920, 0]
 # mode = "1280x400"
 # transform = "270"  # normal|90|180|270|flipped|flipped-90|...|left|right; rotates the output
+
+# Optional section: omitting [wallpaper] entirely draws no wallpaper, and each
+# output clears to black -- which is what every config predating this section
+# did. Live/hot-reloadable, and settable at runtime over IPC without touching
+# this file:
+#   printf '{"type":"set_wallpaper","path":"/path/img.avif","output":null}\n' | \
+#     socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rubix.sock"
+# (an IPC change is not written back here, so a reload restores this file).
+[wallpaper]
+# Path to an image, or to a directory of them. `~` expands to $HOME.
+# Formats: .avif, .png, .jpg.
+#
+# A directory becomes a slideshow: every readable image in it, in sorted order,
+# each shown for `interval_seconds`. Files that will not decode are logged and
+# dropped from the rotation rather than stalling it. Only the current image and
+# the next one are held in memory, and the next is decoded on a worker thread
+# ahead of time -- a 2.5K AVIF costs over 100ms, which would be a visible hitch
+# if it happened on the compositor thread at swap time.
+#
+# AVIF is the one to use for HDR. It carries a CICP block naming its transfer
+# function, so an image graded to ST 2084 (PQ) is detected as HDR at load and
+# decoded through the PQ inverse EOTF -- the same shader an HDR client buffer
+# takes. PNG and JPEG are always treated as sRGB.
+#
+# An HDR wallpaper works on an SDR output too: it is tone-mapped down per
+# frame, so a mixed monitor set (one HDR panel, one not) shows the same image
+# correctly on both. It also drives an HDR-capable connector into HDR mode on
+# its own, with no HDR window needed.
+#
+# Grade to roughly your panel's peak. An image mastered at 4000 nits on a
+# 600-nit display spends most of its range in the tone-map's soft knee and
+# looks flatter than the same image graded to 600.
+# path = "~/wallpapers/default.avif"
+
+# How the image maps onto an output it does not match in aspect ratio:
+#   Fill     scale to cover, cropping the overflowing axis (default)
+#   Fit      scale to fit inside, leaving black bars on the shorter axis
+#   Stretch  scale both axes independently, ignoring aspect ratio
+#   Center   no scaling; centred, and cropped if larger than the output
+mode = "Fill"
+
+# Linear-light gain applied to the image when it is decoded. 1.0 leaves it
+# alone; 0.5 halves its luminance. Clamped to [0.05, 4.0].
+#
+# This exists because SDR-to-HDR converters tend to lift the *whole* image
+# rather than only extending its highlights. An image whose midtones sit ten
+# times above where the SDR original rendered does not read as "more dynamic
+# range" -- it reads as "too bright", because on an HDR output SDR content is
+# pinned to sdr_white_nits while the wallpaper is free to sit wherever it was
+# graded. The gain pulls it back into the same neighbourhood while leaving the
+# highlight headroom intact.
+#
+# To pick a value, compare the image's luminance against the SDR original's,
+# and aim for a peak at or just under your panel's. Hot-reloadable, so nudging
+# it and saving is the fastest way to find the number.
+luminance_scale = 1.0
+
+# What luminance (cd/m2) in the source image is treated as white when the
+# wallpaper is tone-mapped down onto an SDR output -- the bottom monitor, or any
+# output with `hdr = false`. Ordinary HDR windows are unaffected; they keep
+# sdr_white_nits.
+#
+# This is separate from luminance_scale because the two display paths measure
+# against different things. On an HDR output the image is shown at its absolute
+# graded luminance. On an SDR output it must be normalised against some
+# reference white, and 203 (the BT.2408 default) assumes the content was graded
+# to that reference. SDR-to-HDR conversions usually are not -- they lift the
+# whole image -- so the same file that looks right in HDR comes out far too
+# bright in SDR, with the shadows lifted worst of all. Raising this number
+# darkens the SDR rendering without touching the HDR one.
+#
+# Measured against the file's own grading, i.e. before luminance_scale is
+# applied. That keeps the two knobs orthogonal: retuning the HDR brightness
+# does not quietly push the SDR output in the opposite direction.
+#
+# To find a value, compare against an SDR original and match its shadows first
+# -- a lifted black reads as "washed out" far more than a dimmed highlight does.
+sdr_reference_nits = 203.0
+
+# Seconds each image is shown when `path` is a directory. Ignored for a single
+# file. Minimum 1. Omitting it defaults to 300 (five minutes).
+interval_seconds = 300
 
 [animation]
 # Duration of scroll/rotate slide tweens, in milliseconds. Omitting this

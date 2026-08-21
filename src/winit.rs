@@ -192,6 +192,21 @@ pub fn init_winit(
                     elements.extend(space_elements);
                     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(background.into_iter().map(RubixRenderElement::Surface));
+                    // winit is the dev backend: no HDR output, no capture, so
+                    // the wallpaper is drawn plainly. An HDR image here is not
+                    // tone-mapped (`tonemap: false`) -- the nested window has
+                    // no colour pipeline to tone-map into.
+                    if let Some(region) = data.space.output_geometry(&output)
+                        && let Some((_, wallpaper)) = data.wallpaper.element(
+                            renderer,
+                            &output.name(),
+                            region.size,
+                            scale,
+                            false,
+                        )
+                    {
+                        elements.push(wallpaper);
+                    }
 
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, [0.1, 0.1, 0.1, 1.0])

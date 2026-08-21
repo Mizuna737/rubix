@@ -7,6 +7,7 @@ mod config;
 mod cursor;
 mod decoration;
 mod edid;
+mod wallpaper;
 mod focus;
 mod grabs;
 mod hdr;
@@ -90,7 +91,10 @@ fn init_config_watch(event_loop: &EventLoop<RubixState>) {
         // the ground truth for tuning `should_reload` (run with RUST_LOG=rubix=debug).
         tracing::debug!("fs event: {event:?}");
         if crate::config::should_reload(&event, &file_name) {
-            data.reload_config();
+            // Debounced rather than reloaded inline -- one save produces a
+            // burst of events, the first of which usually sees a truncated
+            // file. See `RubixState::schedule_config_reload`.
+            data.schedule_config_reload();
         }
     });
 
@@ -420,7 +424,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // chance to connect, let alone subscribe. Reporting now would mean the one
     // diagnostic a user most needs -- "your config did not parse" -- is the one
     // guaranteed to be dropped. A few seconds is enough for both sinks to exist.
-    let startup_problems = crate::config::take_config_diagnostics();
+    let mut startup_problems = crate::config::take_config_diagnostics();
+    // Decoded here, before the backend starts, so the first frame drawn already
+    // has a wallpaper rather than flashing black. Failures join the config
+    // problems above and ride the same deferred report.
+    startup_problems.extend(
+        data.wallpaper
+            .resolve(&data.config.wallpaper, &data.config.outputs),
+    );
+    // Slideshow plumbing: a channel for images decoded on worker threads, and
+    // the timer that asks for the next swap. Both are inert when the wallpaper
+    // is a single file.
+    {
+        use smithay::reexports::calloop::channel;
+        let (tx, rx) = channel::channel();
+        if event_loop
+            .handle()
+            .insert_source(rx, |event, _, data: &mut RubixState| {
+                if let channel::Event::Msg(message) = event {
+                    data.wallpaper.receive_prefetch(message);
+                }
+            })
+            .is_ok()
+        {
+            data.wallpaper.set_decode_channel(tx);
+        } else {
+            // Without the channel the slideshow still runs; each swap just
+            // decodes inline and hitches for a frame or two.
+            tracing::warn!("wallpaper decode channel failed; slideshow will decode inline");
+        }
+    }
+    data.rearm_wallpaper_timer();
     if !startup_problems.is_empty() {
         let mut pending = Some(startup_problems);
         let timer = smithay::reexports::calloop::timer::Timer::from_duration(

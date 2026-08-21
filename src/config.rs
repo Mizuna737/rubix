@@ -114,6 +114,9 @@ pub struct Config {
     /// Empty when the user config omits the section (or has no entries) --
     /// the udev backend falls back to auto left-to-right layout in that case.
     pub outputs: Vec<OutputConfig>,
+    /// Desktop wallpaper. Live/hot-reloadable, and also settable at runtime
+    /// over IPC (`set_wallpaper`); see src/wallpaper.rs.
+    pub wallpaper: WallpaperConfig,
     /// SDR white luminance (nits) fed to the HDR encode shader's
     /// `sdr_white_nits` uniform for `hdr = true` outputs. Live/hot-reloadable;
     /// also adjustable at runtime via the IncreaseSdrWhite/DecreaseSdrWhite
@@ -152,6 +155,40 @@ pub struct IdleConfig {
     pub screen_off_seconds: u64,
 }
 
+/// Resolved wallpaper settings. An absent `path` means no wallpaper: outputs
+/// clear to black, which is what every config predating this section did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WallpaperConfig {
+    pub path: Option<PathBuf>,
+    pub mode: crate::wallpaper::WallpaperMode,
+    /// Linear-light gain applied to the image at decode time. 1.0 leaves it
+    /// untouched; 0.5 halves its luminance. Exists because an image graded far
+    /// above a panel's peak reads as uniformly too bright rather than as more
+    /// dynamic range. Clamped to [0.05, 4.0] in `resolve`.
+    pub luminance_scale: f32,
+    /// Seconds each image is shown when `path` names a directory. Ignored for a
+    /// single file. Minimum 1.
+    pub interval_seconds: u64,
+    /// What luminance (cd/m²) in the source image counts as white when the
+    /// wallpaper is tone-mapped onto an SDR output. Measured against the file's
+    /// own grading, before `luminance_scale` is applied, so the HDR and SDR
+    /// renderings can be tuned independently. Only the wallpaper uses this;
+    /// ordinary HDR windows keep `sdr_white_nits`. Clamped to [80, 10000].
+    pub sdr_reference_nits: f32,
+}
+
+impl Default for WallpaperConfig {
+    fn default() -> Self {
+        WallpaperConfig {
+            path: None,
+            mode: crate::wallpaper::WallpaperMode::default(),
+            luminance_scale: 1.0,
+            interval_seconds: 300,
+            sdr_reference_nits: crate::hdr_shaders::SDR_WHITE_NITS,
+        }
+    }
+}
+
 /// Resolved placement for one physical output, matched by connector name
 /// (e.g. "DP-3", "HDMI-A-1") at connect time in udev.rs.
 pub struct OutputConfig {
@@ -168,6 +205,9 @@ pub struct OutputConfig {
     /// `hdr` (or setting it false) leaves the SDR path byte-for-byte
     /// unchanged. Requires an HDR-capable display; see src/hdr.rs.
     pub hdr: bool,
+    /// Wallpaper for this output specifically, overriding `[wallpaper] path`.
+    /// `None` falls back to the global one; see src/wallpaper.rs.
+    pub wallpaper: Option<PathBuf>,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -231,11 +271,42 @@ struct RawConfig {
     // manually in resolve(), not deserialized directly.
     #[serde(default)]
     output: Vec<RawOutput>,
+    // Optional section: a config omitting [wallpaper] draws no wallpaper at all
+    // (the desktop clears to black), which is what every pre-wallpaper config
+    // already did.
+    #[serde(default)]
+    wallpaper: RawWallpaper,
     // Optional section: a config omitting [idle] gets the defaults below
     // (enabled, 600s) -- so a fresh install blanks its OLED panel out of the
     // box with no separate setup.
     #[serde(default)]
     idle: RawIdle,
+}
+
+#[derive(Deserialize, Default)]
+struct RawWallpaper {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    mode: crate::wallpaper::WallpaperMode,
+    #[serde(default = "default_luminance_scale")]
+    luminance_scale: f32,
+    #[serde(default = "default_interval_seconds")]
+    interval_seconds: u64,
+    #[serde(default = "default_sdr_reference_nits")]
+    sdr_reference_nits: f32,
+}
+
+fn default_sdr_reference_nits() -> f32 {
+    crate::hdr_shaders::SDR_WHITE_NITS
+}
+
+fn default_interval_seconds() -> u64 {
+    300
+}
+
+fn default_luminance_scale() -> f32 {
+    1.0
 }
 
 #[derive(Deserialize)]
@@ -250,6 +321,8 @@ struct RawOutput {
     transform: Option<String>,
     #[serde(default)]
     hdr: bool,
+    #[serde(default)]
+    wallpaper: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -362,6 +435,7 @@ impl Config {
                 primary: o.primary,
                 transform: o.transform.as_deref().and_then(parse_transform).unwrap_or(Transform::Normal),
                 hdr: o.hdr,
+                wallpaper: o.wallpaper.map(expand_tilde),
             })
             .collect();
 
@@ -374,6 +448,17 @@ impl Config {
             animation_duration: Duration::from_millis(raw.animation.duration_ms),
             startup: raw.startup,
             outputs,
+            wallpaper: WallpaperConfig {
+                path: raw.wallpaper.path.map(expand_tilde),
+                mode: raw.wallpaper.mode,
+                // Clamped rather than rejected: this is a value users tune by
+                // nudging it, and a typo'd 40 should darken to the floor, not
+                // decode a black desktop or refuse to load the config.
+                luminance_scale: raw.wallpaper.luminance_scale.clamp(0.05, 4.0),
+                // Floored at 1: a zero interval would re-decode continuously.
+                interval_seconds: raw.wallpaper.interval_seconds.max(1),
+                sdr_reference_nits: raw.wallpaper.sdr_reference_nits.clamp(80.0, 10000.0),
+            },
             sdr_white_nits: raw.sdr_white_nits.clamp(80.0, 300.0),
             focus_follows_mouse: raw.input.focus_follows_mouse,
             decoration: resolve_decoration(raw.decoration),
@@ -797,6 +882,22 @@ pub(crate) fn parse_color(text: &str) -> Option<Color32F> {
 /// Luminance is only meaningful as a positive absolute value. A zero or
 /// negative entry is read as "no opinion" rather than as a request to make the
 /// border black, which is almost certainly not what someone typing `0` meant.
+/// Expand a leading `~` to `$HOME`.
+///
+/// Wallpaper paths are the first config value a user naturally writes with a
+/// tilde -- every other path in this config is compositor-managed. An
+/// unexpandable `~` is left as-is so the eventual "no such file" names the path
+/// the user actually typed.
+fn expand_tilde(path: String) -> PathBuf {
+    let Some(rest) = path.strip_prefix("~/") else {
+        return PathBuf::from(path);
+    };
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
 fn resolve_luminance(nits: Option<f32>) -> Option<f32> {
     nits.filter(|n| *n > 0.0)
 }
