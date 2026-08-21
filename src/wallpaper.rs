@@ -791,11 +791,18 @@ impl WallpaperManager {
                 0.0,
                 Rectangle::default(),
                 Scale::from(scale),
-                // Still multiplied by the decode gain: `luminance_scale` is
-                // baked into the texels, so the reference has to carry the
-                // same gain for it to cancel -- (nits * gain) / (ref * gain).
-                // Same reasoning as `element`, different absolute knob.
-                self.backdrop_luminance_nits * self.scale,
+                // NOT scaled by the decode gain, unlike `element`'s
+                // `sdr_reference_nits`. The two knobs live in different
+                // reference frames: `sdr_reference_nits` is measured against
+                // the file's own grading (pre-gain), so it has to carry the
+                // gain to compare against post-gain texels. This one is an
+                // absolute display-referred ceiling -- the luminance a
+                // backdrop may actually reach on screen, which is what makes
+                // it comparable to `sdr_white_nits`. The gain is already baked
+                // into the texels, so multiplying here would scale the ceiling
+                // a second time (40 nits became 8, putting the knee at the
+                // wallpaper's median and flattening half the image).
+                self.backdrop_luminance_nits,
             )),
         ))
     }
@@ -1507,6 +1514,28 @@ mod tests {
         assert!(manager.resolve(&config, &[], &decoration).is_empty());
         assert_eq!(manager.backdrop_luminance_nits, 40.0);
         assert_eq!(manager.sdr_reference_nits, 2000.0);
+    }
+
+    #[test]
+    fn backdrop_ceiling_is_display_referred_and_ignores_the_decode_gain() {
+        // `sdr_reference_nits` is measured pre-gain and must be scaled by it;
+        // `backdrop_luminance_nits` is an absolute on-screen ceiling and must
+        // NOT be. Scaling it twice put a 40-nit ceiling at 8 nits, dropping
+        // the knee to the wallpaper's median and flattening half the image to
+        // a narrow band -- which read on screen as the colour being crushed.
+        let mut manager = WallpaperManager::default();
+        let mut config = slideshow_config(&fixture("pq16.avif"), 300);
+        config.luminance_scale = 0.2;
+        let decoration = crate::config::DecorationConfig {
+            backdrop_luminance_nits: 40.0,
+            ..crate::config::DecorationConfig::default()
+        };
+        assert!(manager.resolve(&config, &[], &decoration).is_empty());
+        assert_eq!(manager.scale, 0.2, "gain is applied to the texels");
+        assert_eq!(
+            manager.backdrop_luminance_nits, 40.0,
+            "the ceiling stays in display nits regardless of the decode gain",
+        );
     }
 
     // --- slideshow --------------------------------------------------------

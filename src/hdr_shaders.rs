@@ -525,10 +525,23 @@ const float RUBIX_KNEE = 0.8;
 
 // Multiples of the reference luminance in, multiples of the reference
 // luminance out -- identity below RUBIX_KNEE, asymptotic to 1.0 above it.
+//
+// Driven by the MAX COMPONENT and applied as a single scalar factor to all
+// three channels, deliberately unlike the capture tail's per-channel roll.
+// Rolling channels independently desaturates: a saturated highlight has its
+// strongest channel compressed while the others pass through untouched, which
+// drags every bright colour toward neutral. Scaling the whole triple by one
+// factor leaves chromaticity exactly where it was and only moves intensity --
+// which is the entire job here, since a backdrop that greys out is worse than
+// one that stays slightly bright.
 vec3 rubixToneCurveAbs10k(vec3 v) {
-    vec3 excess = max(v - RUBIX_KNEE, 0.0);
-    vec3 rolled = RUBIX_KNEE + (1.0 - RUBIX_KNEE) * (1.0 - exp(-excess / (1.0 - RUBIX_KNEE)));
-    return clamp(mix(v, rolled, step(RUBIX_KNEE, v)), 0.0, 1.0);
+    float m = max(max(v.r, v.g), v.b);
+    float excess = max(m - RUBIX_KNEE, 0.0);
+    float rolled = RUBIX_KNEE + (1.0 - RUBIX_KNEE) * (1.0 - exp(-excess / (1.0 - RUBIX_KNEE)));
+    // `m` is at least RUBIX_KNEE wherever step() selects the rolled branch, so
+    // the guard only protects the unused half of the mix.
+    float factor = mix(1.0, rolled / max(m, 1e-5), step(RUBIX_KNEE, m));
+    return clamp(v * factor, 0.0, 1.0);
 }
 "#;
 
@@ -625,16 +638,13 @@ void main() {{
 mod abs10k_tests {
     use super::*;
 
-    // Guards the "reuse the curve" requirement mechanically: the rolloff
-    // formula in the abs10k tail must be byte-identical to the capture tail's,
-    // since GLSL string constants can't share code by reference.
+    // The two tails share a rolloff formula and a knee, but NOT how they apply
+    // it: the capture tail rolls per channel, the abs10k tail derives one
+    // scalar factor from the max component and scales the triple by it. That
+    // difference is deliberate -- per-channel rolling desaturates, which on a
+    // backdrop reads as the wallpaper being crushed to white.
     #[test]
-    fn abs10k_curve_matches_capture_curve() {
-        // Compares the rolloff line and the knee constant, not the whole
-        // function body verbatim -- the two curves take differently-named
-        // arguments (`lin709` for the capture path, `v` here, since this one
-        // is no longer specifically BT.709), but the formula and its knee
-        // must be identical.
+    fn abs10k_curve_shares_the_rolloff_but_not_the_per_channel_application() {
         for src in [TONEMAP_TAIL_GLSL, ABS10K_TONE_TAIL_GLSL] {
             assert!(src.contains("const float RUBIX_KNEE = 0.8;"), "knee constant must match");
             assert!(
@@ -644,6 +654,15 @@ mod abs10k_tests {
                 "rolloff formula must match exactly"
             );
         }
+        assert!(
+            ABS10K_TONE_TAIL_GLSL.contains("float m = max(max(v.r, v.g), v.b);")
+                && ABS10K_TONE_TAIL_GLSL.contains("v * factor"),
+            "abs10k must roll on the max component and scale the triple",
+        );
+        assert!(
+            !ABS10K_TONE_TAIL_GLSL.contains("step(RUBIX_KNEE, v)"),
+            "abs10k must not roll per channel -- that is what desaturates",
+        );
     }
 
     // The whole point of this shader: the output must stay in absolute
