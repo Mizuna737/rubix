@@ -68,7 +68,19 @@ fn init_config_watch(event_loop: &EventLoop<RubixState>) {
     use calloop_notify::notify::{RecursiveMode, Watcher};
     use calloop_notify::NotifySource;
 
-    let Some((dir, file_name)) = crate::config::config_watch_target() else {
+    // Create the config directory when it is missing, so a from-scratch
+    // install gets hot-reload the moment the user writes their first file
+    // rather than only after a restart. Watching the parent instead does not
+    // actually achieve that: a non-recursive watch on the parent cannot see a
+    // file created inside a newly-created subdirectory, and going recursive on
+    // `~/.config` would react to every other application's `.toml`.
+    if let Some(dir) = crate::config::config_dir()
+        && !dir.exists()
+        && let Err(e) = std::fs::create_dir_all(&dir)
+    {
+        tracing::debug!("could not create config dir {dir:?} ({e}); hot-reload inactive");
+    }
+    let Some(dir) = crate::config::config_watch_target() else {
         tracing::debug!("no user config to watch; hot-reload inactive");
         return;
     };
@@ -81,7 +93,9 @@ fn init_config_watch(event_loop: &EventLoop<RubixState>) {
         }
     };
 
-    if let Err(e) = source.watch(&dir, RecursiveMode::NonRecursive) {
+    // Recursive: config files can live in nested subdirectories, not just
+    // directly under the root.
+    if let Err(e) = source.watch(&dir, RecursiveMode::Recursive) {
         tracing::warn!("config watch failed on {dir:?} ({e}); hot-reload disabled");
         return;
     }
@@ -90,7 +104,7 @@ fn init_config_watch(event_loop: &EventLoop<RubixState>) {
         // Logged before filtering so a live save shows the raw kind + paths --
         // the ground truth for tuning `should_reload` (run with RUST_LOG=rubix=debug).
         tracing::debug!("fs event: {event:?}");
-        if crate::config::should_reload(&event, &file_name) {
+        if crate::config::should_reload(&event) {
             // Debounced rather than reloaded inline -- one save produces a
             // burst of events, the first of which usually sees a truncated
             // file. See `RubixState::schedule_config_reload`.

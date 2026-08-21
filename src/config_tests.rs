@@ -14,6 +14,55 @@
         assert_eq!(bind_count, 26);
     }
 
+    // A single file holding today's whole config must resolve to exactly the
+    // same `Config` through the new multi-file loader as it did being parsed
+    // directly -- the no-op property this phase depends on for a safe
+    // restart into the existing single-`config.toml` layout.
+    #[test]
+    fn single_file_through_the_loader_matches_direct_parse() {
+        let dir = std::env::temp_dir().join(format!(
+            "rubix-config-noop-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("config.toml"), DEFAULT_CONFIG).expect("write config");
+
+        let files = config_loader::discover_config_files(&dir);
+        let (table, _) = config_loader::merge_all(&dir, &files).expect("merge succeeds");
+        let raw = config_loader::deserialize_merged(table).expect("deserializes");
+        let via_loader = Config::resolve(raw);
+
+        let direct = Config::resolve(toml::from_str(DEFAULT_CONFIG).expect("default parses directly"));
+
+        assert_eq!(via_loader.visible_columns, direct.visible_columns);
+        assert_eq!(via_loader.outer_gap, direct.outer_gap);
+        assert_eq!(via_loader.inner_gap, direct.inner_gap);
+        assert_eq!(via_loader.animation_duration, direct.animation_duration);
+        assert_eq!(via_loader.startup, direct.startup);
+        assert_eq!(via_loader.sdr_white_nits, direct.sdr_white_nits);
+        assert_eq!(via_loader.focus_follows_mouse, direct.focus_follows_mouse);
+        assert_eq!(via_loader.outputs.len(), direct.outputs.len());
+        assert_eq!(via_loader.wallpaper, direct.wallpaper);
+        assert_eq!(via_loader.idle, direct.idle);
+        assert_eq!(via_loader.keybinds.len(), direct.keybinds.len());
+        assert_eq!(via_loader.decoration.border_width, direct.decoration.border_width);
+        assert_eq!(via_loader.decoration.corner_radius, direct.decoration.corner_radius);
+        assert_eq!(via_loader.decoration.rules.len(), direct.decoration.rules.len());
+        assert_eq!(via_loader.decoration.backdrop_luminance_nits, direct.decoration.backdrop_luminance_nits);
+        // Keybinds come from a `HashMap`, so insertion/iteration order is not
+        // guaranteed to match between two independent parses of the same
+        // text -- compare as a sorted multiset of resolved chords instead.
+        let sort_key = |k: &Keybind| (k.logo, k.alt, k.ctrl, k.shift, k.keysym);
+        let mut via_sorted: Vec<_> = via_loader.keybinds.iter().map(sort_key).collect();
+        let mut direct_sorted: Vec<_> = direct.keybinds.iter().map(sort_key).collect();
+        via_sorted.sort();
+        direct_sorted.sort();
+        assert_eq!(via_sorted, direct_sorted);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ---- wallpaper ----
 
     // A config predating [wallpaper] must keep working, drawing nothing rather
@@ -372,25 +421,32 @@
     // ---- hot-reload event filtering ----
 
     use calloop_notify::notify::{
-        event::{CreateKind, DataChange, EventKind, MetadataKind, ModifyKind},
+        event::{CreateKind, DataChange, EventKind, MetadataKind, ModifyKind, RemoveKind},
         Event,
     };
-    use std::ffi::OsStr;
 
     fn event(kind: EventKind, path: &str) -> Event {
         Event::new(kind).add_path(PathBuf::from(path))
     }
 
     #[test]
-    fn reload_fires_on_content_write_to_the_config() {
-        let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/config.toml");
-        assert!(should_reload(&e, OsStr::new("config.toml")));
+    fn reload_fires_on_content_write_to_any_toml_file() {
+        let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/nested/other.toml");
+        assert!(should_reload(&e));
     }
 
     #[test]
-    fn reload_fires_on_create_of_the_config() {
+    fn reload_fires_on_create_of_a_toml_file() {
         let e = event(EventKind::Create(CreateKind::File), "/cfg/config.toml");
-        assert!(should_reload(&e, OsStr::new("config.toml")));
+        assert!(should_reload(&e));
+    }
+
+    // Deletion matters too: a file that vanished mid-session should not keep
+    // contributing stale settings to the next reload.
+    #[test]
+    fn reload_fires_on_deletion_of_a_toml_file() {
+        let e = event(EventKind::Remove(RemoveKind::File), "/cfg/config.toml");
+        assert!(should_reload(&e));
     }
 
     // The atime-feedback guard: our own read bumps access time, surfacing as a
@@ -398,13 +454,15 @@
     #[test]
     fn reload_ignores_bare_metadata_touch() {
         let e = event(EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)), "/cfg/config.toml");
-        assert!(!should_reload(&e, OsStr::new("config.toml")));
+        assert!(!should_reload(&e));
     }
 
+    // Only `*.toml` is config -- an unrelated file dropped in the (now
+    // recursively watched) directory must not trigger a reload.
     #[test]
-    fn reload_ignores_events_for_other_files() {
-        let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/other.toml");
-        assert!(!should_reload(&e, OsStr::new("config.toml")));
+    fn reload_ignores_events_for_non_toml_files() {
+        let e = event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), "/cfg/notes.md");
+        assert!(!should_reload(&e));
     }
 
     // ---- decoration ----

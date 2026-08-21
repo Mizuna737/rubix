@@ -13,6 +13,9 @@ use smithay::utils::Transform;
 
 use crate::input::NavAction;
 
+#[path = "config_loader.rs"]
+mod config_loader;
+
 /// Built-in fallback, used when no user config exists or one fails to parse.
 /// Also serves as the copy-paste reference at `config/default.toml`.
 const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
@@ -401,21 +404,29 @@ fn default_sdr_white_nits() -> f32 {
 }
 
 impl Config {
-    /// Load and resolve the config: user file if present and valid, else the
-    /// built-in default. Never panics on a missing or malformed user file.
+    /// Load and resolve the config: every `*.toml` file under the user's
+    /// config directory, deep-merged (see `config_loader`), if present and
+    /// valid, else the built-in default. Never panics on a missing or
+    /// malformed user config -- the compositor must still come up.
     pub fn load() -> Self {
-        Self::resolve(Self::read_raw())
-    }
-
-    fn read_raw() -> RawConfig {
-        let text = config_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
-
-        toml::from_str(&text).unwrap_or_else(|e| {
-            note_config_problem(format!("failed to parse config ({e}); using built-in defaults"));
-            toml::from_str(DEFAULT_CONFIG).expect("built-in default config must parse")
-        })
+        if let Some(dir) = config_dir() {
+            let files = config_loader::discover_config_files(&dir);
+            match config_loader::merge_all(&dir, &files) {
+                Ok((table, prov)) => {
+                    for msg in config_loader::check_unknown_keys(&table, &prov) {
+                        note_config_problem(msg);
+                    }
+                    match config_loader::deserialize_merged(table) {
+                        Ok(raw) => return Self::resolve(raw),
+                        Err(e) => note_config_problem(format!("{e}; using built-in defaults")),
+                    }
+                }
+                Err(e) => note_config_problem(format!("{e}; using built-in defaults")),
+            }
+        } else {
+            note_config_problem("no config directory found; using built-in defaults".to_string());
+        }
+        Self::resolve(toml::from_str(DEFAULT_CONFIG).expect("built-in default config must parse"))
     }
 
     fn resolve(raw: RawConfig) -> Self {
@@ -474,66 +485,66 @@ impl Config {
         }
     }
 
-    /// Re-read and resolve the *user* config from disk for hot-reload. Returns
-    /// `None` if the file is missing or fails to parse -- the caller keeps its
-    /// current config (keep-last-good), so a broken edit never disturbs the
-    /// running session. Distinct from [`load`](Self::load), which substitutes the
-    /// built-in default at startup: on reload we deliberately do *not* fall back
-    /// to default, preserving the last set of working binds.
+    /// Re-read and re-merge every `*.toml` file under the user's config
+    /// directory for hot-reload. Returns `None` if there's nothing to load or
+    /// the merge/parse fails -- the caller keeps its current config
+    /// (keep-last-good), so a broken edit never disturbs the running session.
+    /// Distinct from [`load`](Self::load), which substitutes the built-in
+    /// default at startup: on reload we deliberately do *not* fall back to
+    /// default, preserving the last set of working binds.
     pub fn reload() -> Option<Config> {
-        let text = std::fs::read_to_string(config_path()?).ok()?;
-        let raw: RawConfig = toml::from_str(&text)
-            .map_err(|e| note_config_problem(format!("config reload failed to parse ({e}); keeping current config")))
+        let dir = config_dir()?;
+        let files = config_loader::discover_config_files(&dir);
+        let (table, prov) = config_loader::merge_all(&dir, &files)
+            .map_err(|e| note_config_problem(format!("config reload failed ({e}); keeping current config")))
+            .ok()?;
+        for msg in config_loader::check_unknown_keys(&table, &prov) {
+            note_config_problem(msg);
+        }
+        let raw = config_loader::deserialize_merged(table)
+            .map_err(|e| note_config_problem(format!("config reload failed ({e}); keeping current config")))
             .ok()?;
         Some(Config::resolve(raw))
     }
 }
 
-/// `$XDG_CONFIG_HOME/rubix/config.toml`, falling back to `~/.config/rubix/config.toml`.
-pub fn config_path() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/rubix`, falling back to `~/.config/rubix`. The root
+/// directory recursively walked for `*.toml` config files.
+pub fn config_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("rubix/config.toml"));
+            return Some(PathBuf::from(xdg).join("rubix"));
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".config/rubix/config.toml"))
+    std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(".config/rubix"))
 }
 
-/// Directory + filename to hand the file watcher. We watch the *parent dir*
-/// (not the file) so a save survives an editor's atomic rename -- a direct file
-/// watch goes deaf once the inode is swapped. The path is canonicalized so a
-/// stow symlink is followed to the real file under the dotfiles repo (watching
-/// the symlink's own dir would miss writes to the target). Returns `None` when
-/// there's no user config and no dir to watch -- the compiled-in default can't
-/// be hot-reloaded, so there is simply nothing to watch.
-pub fn config_watch_target() -> Option<(PathBuf, std::ffi::OsString)> {
-    let path = config_path()?;
-    // File present: canonicalize it, watch the real inode's parent dir.
-    if let Ok(real) = path.canonicalize() {
-        return Some((real.parent()?.to_path_buf(), real.file_name()?.to_os_string()));
-    }
-    // File absent: watch the (canonicalized) parent dir so a later create fires.
-    let dir = path.parent()?.canonicalize().ok()?;
-    Some((dir, path.file_name()?.to_os_string()))
+/// Directory to hand the file watcher: the canonicalized config root, so a
+/// stow symlink (e.g. `~/.config/rubix` -> the dotfiles repo) is followed to
+/// the real directory -- watching the symlink's own parent would miss writes
+/// to the target tree. Watched recursively by the caller, since config files
+/// can live in nested subdirectories. Returns `None` when the config
+/// directory doesn't exist at all -- the compiled-in default can't be
+/// hot-reloaded, so there is simply nothing to watch.
+pub fn config_watch_target() -> Option<PathBuf> {
+    config_dir()?.canonicalize().ok()
 }
 
-/// True when a filesystem event warrants a config reload: it names the config
-/// file and is a content or create change. Bare metadata touches are filtered
-/// out -- our own read bumps the file's access time, and reacting to that would
-/// feed back into an endless reload loop (self-limiting under `relatime`, but
-/// cheap to rule out regardless).
-pub fn should_reload(event: &calloop_notify::notify::Event, file_name: &std::ffi::OsStr) -> bool {
+/// True when a filesystem event warrants a config reload: it touches a
+/// `*.toml` file and is a content, create, or delete change. Bare metadata
+/// touches are filtered out -- our own read bumps the file's access time, and
+/// reacting to that would feed back into an endless reload loop
+/// (self-limiting under `relatime`, but cheap to rule out regardless).
+pub fn should_reload(event: &calloop_notify::notify::Event) -> bool {
     use calloop_notify::notify::event::{EventKind, ModifyKind};
 
-    let touches = event.paths.iter().any(|p| p.file_name() == Some(file_name));
+    let touches_config = event.paths.iter().any(|p| config_loader::has_config_extension(p));
     let is_write = match &event.kind {
-        EventKind::Create(_) => true,
+        EventKind::Create(_) | EventKind::Remove(_) => true,
         EventKind::Modify(kind) => !matches!(kind, ModifyKind::Metadata(_)),
         _ => false,
     };
-    touches && is_write
+    touches_config && is_write
 }
 
 /// Parse a mode string like `"1280x400"` into `(width, height)`. Returns `None`
