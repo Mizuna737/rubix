@@ -96,7 +96,7 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::utils::{
-    Buffer as BufferCoord, DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+    Buffer as BufferCoord, DeviceFd, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
@@ -1588,8 +1588,8 @@ fn render_surface(
     // renderer work) run first so the common case (no HDR content anywhere,
     // e.g. every normal desktop frame) takes the exact proven fast path with
     // zero extra cost. Only when it's actually needed is the more expensive
-    // per-window gather (`gather_tagged_elements`) done and the z-run decode
-    // (`render_surface_hdr_zrun`) used instead.
+    // per-window gather (`gather_hdr_composite_elements`) done and the z-run
+    // decode (`render_surface_hdr_zrun`) used instead.
     // The HDR composite path renders into a 16F offscreen and hands
     // `render_frame` a single texture element, which makes direct scanout
     // structurally impossible. Under exclusive fullscreen the connector
@@ -1682,8 +1682,9 @@ fn render_surface(
         let mut hdr_feedback = Some(take_frame_feedback(state, &surface.output, None));
         surface.hdr_last_nits = Some(state.sdr_white_nits);
         let hdr_result = if output_has_hdr_content(state, &surface.output) {
-            let tagged = gather_tagged_elements(state, renderer, &surface.output, scale);
-            render_surface_hdr_zrun(surface, renderer, &tagged, state.sdr_white_nits, &mut hdr_feedback)
+            let composite_elements =
+                gather_hdr_composite_elements(state, renderer, &surface.output, scale, sdr_tonemap);
+            render_surface_hdr_zrun(surface, renderer, &composite_elements, state.sdr_white_nits, &mut hdr_feedback)
         } else {
             render_surface_hdr(surface, renderer, &elements, state.sdr_white_nits, &mut hdr_feedback)
         };
@@ -2006,217 +2007,160 @@ pub(crate) fn output_has_hdr_content(state: &RubixState, output: &Output) -> boo
         .any(|layer| surface_decode_kind(layer.wl_surface()).is_hdr())
 }
 
-/// Slow-path element gather for HDR Phase 1b: same front-to-back z-order as
-/// `render_surface`'s plain `elements` (cursor, overlay, top, ghosts, space,
-/// bottom, background), but paired with each element's [`DecodeKind`] so
-/// `render_surface_hdr_zrun` can decode each surface through its own
-/// transfer function. Cursor and ghost elements are always `Sdr` (compositor
-/// chrome and animation copies, never client HDR content); layer surfaces are
-/// tagged from their own declaration like any other client. They are rebuilt here
-/// via fresh, independent `render_elements` calls -- cheap (element structs
-/// referencing existing textures, no new GPU work) and avoids needing the
-/// non-`Clone` `WaylandSurfaceRenderElement`/`RubixRenderElement` values
-/// built by `render_surface`'s own (untouched) element collection to somehow
-/// be shared between the fast and slow paths.
+/// Element gather for HDR Phase 1b's composite pass: same front-to-back
+/// z-order as `render_surface`'s plain `elements` (cursor, overlay, top,
+/// ghosts, scaled, space, backdrops, bottom, background, wallpaper). Unlike
+/// the per-window gather this replaces, no element is tagged for a
+/// caller-side partition any more -- `render_surface_hdr_zrun` installs
+/// nothing itself, so every element here must already carry its own decode
+/// program (see `RoundedElement`), installed via `draw`'s
+/// `gles.override_default_tex_program` call.
 ///
-/// Space windows are gathered **per window** (`window.render_elements`, the
-/// same call the ghost path already uses) rather than via the single
-/// `Space::render_elements_for_region` batch, so each window's elements can
-/// be tagged with that window's own root-surface decode kind
-/// (`surface_decode_kind(window.wl_surface())`). The per-window geometry here
-/// reproduces `render_elements_for_region`'s algorithm exactly (smithay's
-/// `desktop/space/mod.rs`): iterate `Space::elements()` (back-to-front) in
-/// reverse for front-to-back order, skip windows whose bbox doesn't overlap
-/// the output region, and use `element_location - window.geometry().loc -
-/// region.loc` (physical-rounded) as the render location -- `InnerElement::
-/// render_location() - region.loc`, spelled out because `Space`'s internal
-/// `InnerElement` type isn't public.
-fn gather_tagged_elements<'a>(
+/// Space windows and their backdrop quads come from
+/// `crate::rounding::space_elements` with `SpaceMode::HdrComposite`, which
+/// resolves each window to `RoundMode::Decode(its own DecodeKind)` and each
+/// backdrop to `hdr_pass: true` -- the same per-window walk this function
+/// used to do by hand. Everything else in this pass -- cursor, the four
+/// layer-shell layers, ghosts, reveal-tween windows -- is wrapped here at
+/// radius 0 purely to install a program (`RoundedElement::with_program`):
+/// cursor and ghosts always as `Decode(Sdr)` (compositor chrome and
+/// animation copies, never client HDR content, same as before); layer
+/// surfaces from their own declaration (`surface_decode_kind`), since a
+/// layer surface that declares a transfer function -- an HDR wallpaper tool
+/// on the background layer is the real case -- has made a statement about
+/// its content that this pass must not ignore.
+fn gather_hdr_composite_elements<'a>(
     state: &RubixState,
     renderer: &mut RubixRenderer<'a>,
     output: &Output,
     scale: f64,
-) -> Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> {
-    // Paired with a DecodeKind like space windows, rather than assumed SDR: a
-    // layer surface that declares a transfer function has made a statement
-    // about its content, and ignoring it means silently misrendering a client
-    // that did everything right. The concrete case today is an HDR wallpaper
-    // on the background layer.
-    type TaggedSurface<'r> = (DecodeKind, WaylandSurfaceRenderElement<RubixRenderer<'r>>);
-    let mut background: Vec<TaggedSurface<'a>> = Vec::new();
-    let mut bottom: Vec<TaggedSurface<'a>> = Vec::new();
-    let mut top: Vec<TaggedSurface<'a>> = Vec::new();
-    let mut overlay: Vec<TaggedSurface<'a>> = Vec::new();
+    wallpaper_sdr_tonemap: bool,
+) -> Vec<RubixRenderElement<RubixRenderer<'a>>> {
+    // Compiled once, before anything below borrows the renderer again.
+    // `None` means rounding is off or its shaders failed to build -- on this
+    // pass that is not merely cosmetic, since `RoundedElement` is also the
+    // only program installer available. An element that would have needed a
+    // non-Sdr decode draws through whatever program the previous element
+    // left active instead, which can misrender colour badly. There is no
+    // better fallback than drawing unwrapped, and `round_shaders` has
+    // already logged the compile failure once.
+    let round = crate::rounding::round_shaders(renderer.as_mut());
+
+    let mut background: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut bottom: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut top: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut overlay: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
     {
         let map = layer_map_for_output(output);
         for layer in map.layers() {
             let Some(geo) = map.layer_geometry(layer) else { continue };
             let loc = geo.loc.to_physical_precise_round(scale);
             let kind = surface_decode_kind(layer.wl_surface());
-            let elems = layer
-                .render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
-                    renderer,
-                    loc,
-                    Scale::from(scale),
-                    1.0,
-                )
-                .into_iter()
-                .map(|e| (kind, e));
+            let elems = layer.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
+                renderer,
+                loc,
+                Scale::from(scale),
+                1.0,
+            );
+            let wrapped: Vec<RubixRenderElement<RubixRenderer<'a>>> = match &round {
+                Some(shaders) => elems
+                    .into_iter()
+                    .map(|e| {
+                        RubixRenderElement::Rounded(crate::rounding::RoundedElement::with_program(
+                            e,
+                            shaders,
+                            crate::rounding::RoundMode::Decode(kind),
+                            Scale::from(scale),
+                            state.sdr_white_nits,
+                        ))
+                    })
+                    .collect(),
+                None => elems.into_iter().map(RubixRenderElement::Surface).collect(),
+            };
             match layer.layer() {
-                Layer::Background => background.extend(elems),
-                Layer::Bottom => bottom.extend(elems),
-                Layer::Top => top.extend(elems),
-                Layer::Overlay => overlay.extend(elems),
+                Layer::Background => background.extend(wrapped),
+                Layer::Bottom => bottom.extend(wrapped),
+                Layer::Top => top.extend(wrapped),
+                Layer::Overlay => overlay.extend(wrapped),
             }
         }
     }
 
     let output_geo = state.space.output_geometry(output);
 
-    // Computed once per output: each window is tested against the ones above
-    // it, which cannot be done from inside the loop without re-walking.
-    let occlusion = crate::decoration::occlusion_map(state, output);
-    let mut space_tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
-    // Per-window backdrop quads -- see `crate::rounding::space_elements`'s
-    // sibling loop, which this mirrors. Missing from here entirely was the
-    // bug: this function is the ONLY element-gathering path reached whenever
-    // this output has any HDR content (`output_has_hdr_content`, checked by
-    // the caller before choosing between this and `space_elements`), which
-    // routinely includes an HDR wallpaper -- so the backdrop quads a frosted
-    // window needs were built by `space_elements` and then discarded
-    // whenever `gather_tagged_elements` ran instead.
-    let mut backdrops: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
-    // Compiled before the loop so the renderer borrow is released; `None`
-    // means either rounding is off or its shaders failed to build, and either
-    // way windows are drawn exactly as they were before rounding existed.
-    let radius = state.config.decoration.corner_radius as f32;
-    let round = (radius > 0.0)
-        .then(|| crate::rounding::round_shaders(renderer.as_mut()))
-        .flatten();
-    if let Some(region) = output_geo {
-        for window in state.space.elements().rev() {
-            let Some(bbox) = state.space.element_bbox(window) else { continue };
-            if !region.overlaps(bbox) {
-                continue;
-            }
-            let Some(location) = state.space.element_location(window) else { continue };
-            let geometry = window.geometry();
-            let render_location: Point<i32, Logical> = location - geometry.loc - region.loc;
-            let kind = window
-                .wl_surface()
-                .map(|s| surface_decode_kind(&s))
-                .unwrap_or(DecodeKind::Sdr);
-            let window_id = state
-                .windows
-                .iter()
-                .find_map(|(id, w)| (w == window).then_some(*id));
-            let fullscreen = window_id.is_some_and(|id| state.fullscreen_windows.contains(&id));
-            let window_rect = Rectangle::<i32, Physical>::new(
-                (location - region.loc).to_physical_precise_round(scale),
-                geometry.size.to_physical_precise_round(scale),
-            );
-            // Always `Sdr`-tagged: borders are compositor-authored chrome, never
-            // client HDR content, so they take the SDR decode. Their per-rule
-            // luminance rides on the colour itself, pre-compensated for exactly
-            // the solid-colour transform that decode installs.
-            // Resolved once and shared by the border and the window's own
-            // surfaces, so the two cannot disagree about which rule matched.
-            let style = window_id.map(|id| crate::decoration::style_for_window(
-                state,
-                id,
-                occlusion.get(&id).copied().unwrap_or(0.0),
-            ));
-            let opacity = style.as_ref().map_or(1.0, |s| s.opacity);
-            if let (Some(id), Some(style)) = (window_id, style.as_ref()) {
-                let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);
-                if let Some(ring) = crate::decoration::window_border_elements(
-                    state, renderer, id, style, local_rect, true,
-                ) {
-                    // The DecodeKind is irrelevant for a pixel shader -- it
-                    // bypasses the texture decode entirely and writes
-                    // working-space values directly -- but the z-run partition
-                    // is keyed on it, so it takes its neighbours' Sdr tag to
-                    // avoid splitting a run for no reason.
-                    space_tagged.push((DecodeKind::Sdr, RubixRenderElement::BorderRing(ring)));
-                }
-
-                // A frosted/tone-mapped backdrop only makes sense for a window
-                // that is actually letting the wallpaper show through -- same
-                // gate as `space_elements`'s, resolved from the SAME `style`
-                // rather than re-matching rules, so the two paths can never
-                // disagree about which windows get a backdrop.
-                if style.opacity < 1.0 && (style.backdrop_tonemap || style.backdrop_blur) {
-                    // `hdr_pass: true` -- this function is only ever reached on
-                    // the HDR composite pass (see the comment on `backdrops`
-                    // above), so a tone-mapped quad must stay in the abs10k
-                    // working space rather than collapse to sRGB.
-                    if let Some((wallpaper_kind, quad)) = state.wallpaper.backdrop_element(
-                        renderer,
-                        &output.name(),
-                        region.size,
-                        local_rect,
-                        scale,
-                        style.backdrop_tonemap,
-                        style.backdrop_blur,
-                        true,
-                    ) {
-                        // Tagged with the wallpaper's own DecodeKind, exactly
-                        // like the wallpaper element itself below -- the z-run
-                        // partition needs to know which decode this quad's
-                        // program was built against.
-                        backdrops.push((wallpaper_kind, quad));
-                    }
-                }
-            }
-            let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
-                renderer,
-                render_location.to_physical_precise_round(scale),
-                Scale::from(scale),
-                opacity,
-            );
-            match (&round, fullscreen) {
-                // Rounded elements carry the rounding variant of the decode
-                // this window would have taken anyway -- the program slot
-                // holds one or the other, never both.
-                (Some(shaders), false) => space_tagged.extend(elems.into_iter().map(|e| {
-                    (
-                        kind,
-                        RubixRenderElement::Rounded(crate::rounding::RoundedElement::new(
-                            e,
-                            shaders,
-                            crate::rounding::RoundMode::Decode(kind),
-                            radius,
-                            window_rect,
-                            Scale::from(scale),
-                            state.sdr_white_nits,
-                        )),
-                    )
-                })),
-                _ => space_tagged
-                    .extend(elems.into_iter().map(|e| (kind, RubixRenderElement::Surface(e)))),
-            }
-        }
-    }
+    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
+        state,
+        renderer,
+        output,
+        scale,
+        crate::rounding::SpaceMode::HdrComposite,
+        wallpaper_sdr_tonemap,
+    );
 
     let ghost_windows: Vec<(Window, Pos)> = state
         .active_ghosts
         .iter()
         .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
         .collect();
-    let mut ghosts: Vec<WaylandSurfaceRenderElement<RubixRenderer<'a>>> = Vec::new();
+    let mut ghosts: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
     for (window, pos) in ghost_windows {
-        ghosts.extend(window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
+        let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
             renderer,
             Point::<i32, Physical>::from((pos.x, pos.y)),
             Scale::from(1.0),
             1.0,
-        ));
+        );
+        ghosts.extend(match &round {
+            Some(shaders) => elems
+                .into_iter()
+                .map(|e| {
+                    RubixRenderElement::Rounded(crate::rounding::RoundedElement::with_program(
+                        e,
+                        shaders,
+                        crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
+                        Scale::from(1.0),
+                        state.sdr_white_nits,
+                    ))
+                })
+                .collect::<Vec<_>>(),
+            None => elems.into_iter().map(RubixRenderElement::Surface).collect(),
+        });
     }
 
+    // Cursor rebuilt independently of `render_surface`'s own (untouched)
+    // cursor elements -- cheap (element structs referencing existing
+    // textures, no new GPU work). Already a `RubixRenderElement`, not a bare
+    // surface element, so it is re-wrapped by matching the variant rather
+    // than via `RoundedElement::with_program` directly -- there is no enum
+    // slot for "`RoundedElement` around the whole enum" (and adding one would
+    // be self-referential).
     let cursor_elements: Vec<RubixRenderElement<RubixRenderer<'a>>> = match output_geo {
         Some(geo) if geo.to_f64().contains(state.pointer_location) => {
             let local = state.pointer_location - geo.loc.to_f64();
             pointer_render_elements(renderer, &state.cursor_status, local, scale)
+                .into_iter()
+                .map(|e| match (&round, e) {
+                    (Some(shaders), RubixRenderElement::Surface(inner)) => {
+                        RubixRenderElement::Rounded(crate::rounding::RoundedElement::with_program(
+                            inner,
+                            shaders,
+                            crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
+                            Scale::from(scale),
+                            state.sdr_white_nits,
+                        ))
+                    }
+                    (Some(shaders), RubixRenderElement::Memory(inner)) => {
+                        RubixRenderElement::RoundedMemory(crate::rounding::RoundedElement::with_program(
+                            inner,
+                            shaders,
+                            crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
+                            Scale::from(scale),
+                            state.sdr_white_nits,
+                        ))
+                    }
+                    (_, other) => other,
+                })
+                .collect()
         }
         _ => Vec::new(),
     };
@@ -2225,71 +2169,69 @@ fn gather_tagged_elements<'a>(
     // unmapped from the Space for the tween's duration, so this list is their
     // only draw -- dropping it makes them vanish for the animation rather than
     // merely render unscaled. Same z-slot as the ghosts, for the same reason.
-    let scaled = crate::state::reveal_scale_elements(state, renderer);
+    let scaled: Vec<RubixRenderElement<RubixRenderer<'a>>> = match &round {
+        Some(shaders) => crate::state::reveal_scale_elements(state, renderer)
+            .into_iter()
+            .map(|e| {
+                RubixRenderElement::RoundedRescaled(crate::rounding::RoundedElement::with_program(
+                    e,
+                    shaders,
+                    crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
+                    Scale::from(1.0),
+                    state.sdr_white_nits,
+                ))
+            })
+            .collect(),
+        None => crate::state::reveal_scale_elements(state, renderer)
+            .into_iter()
+            .map(RubixRenderElement::Rescaled)
+            .collect(),
+    };
 
     // Same front-to-back order as `render_surface`'s `elements`: cursor,
-    // overlay, top, ghosts, space, bottom, background.
-    let mut tagged: Vec<(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)> = Vec::new();
-    tagged.extend(cursor_elements.into_iter().map(|e| (DecodeKind::Sdr, e)));
-    tagged.extend(
-        overlay
-            .into_iter()
-            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
-    );
-    tagged.extend(
-        top
-            .into_iter()
-            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
-    );
-    tagged.extend(
-        ghosts
-            .into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Surface(e))),
-    );
-    tagged.extend(
-        scaled
-            .into_iter()
-            .map(|e| (DecodeKind::Sdr, RubixRenderElement::Rescaled(e))),
-    );
-    // Borders are emitted per window inside the space loop above, not as a
-    // group here -- grouped, every border floats above every window and a
-    // maximized window is covered in the borders of the windows behind it.
-    tagged.extend(space_tagged);
+    // overlay, top, ghosts, scaled, space, backdrops, bottom, background,
+    // wallpaper.
+    let mut elements: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
+    elements.extend(cursor_elements);
+    elements.extend(overlay);
+    elements.extend(top);
+    elements.extend(ghosts);
+    elements.extend(scaled);
+    elements.extend(space_elements);
     // Per-window backdrop quads, spliced in exactly where `render_surface`
     // puts them relative to `space_elements`'s output -- below every window,
-    // above `bottom`/`background`. See the comment on `backdrops` above.
-    tagged.extend(backdrops);
-    tagged.extend(
-        bottom
-            .into_iter()
-            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
-    );
-    tagged.extend(
-        background
-            .into_iter()
-            .map(|(k, e)| (k, RubixRenderElement::Surface(e))),
-    );
-    // Bottom of the stack, tagged with its own decode kind so the z-run
-    // partition puts it in a run with the right program. Never wrapped here:
-    // this path is only reached on an HDR output, where the run installs the
-    // decode. See src/wallpaper.rs.
+    // above `bottom`/`background`.
+    elements.extend(backdrop_elements);
+    elements.extend(bottom);
+    elements.extend(background);
+    // Bottom of the stack. `tonemap: false` -- this pass installs its own
+    // per-element decode below rather than asking `wallpaper::element` to
+    // tone-map, so the returned element is the bare, unwrapped one; wrap it
+    // here with the wallpaper's own `DecodeKind` like every other element in
+    // this pass.
     if let Some(region) = output_geo
-        && let Some(pair) = state.wallpaper.element(
-            renderer,
-            &output.name(),
-            region.size,
-            scale,
-            false,
-        )
+        && let Some((kind, elem)) = state.wallpaper.element(renderer, &output.name(), region.size, scale, false)
     {
-        tagged.push(pair);
+        let wrapped = match (&round, elem) {
+            (Some(shaders), RubixRenderElement::Memory(inner)) => {
+                RubixRenderElement::RoundedMemory(crate::rounding::RoundedElement::with_program(
+                    inner,
+                    shaders,
+                    crate::rounding::RoundMode::Decode(kind),
+                    Scale::from(scale),
+                    state.sdr_white_nits,
+                ))
+            }
+            (_, other) => other,
+        };
+        elements.push(wrapped);
     }
     crate::decoration::prune_ring_cache(state);
-    tagged
+    elements
 }
 
 /// Shared HDR resource prep for both the fast (`render_surface_hdr`) and
-/// slow (`render_surface_hdr_zrun`) decode paths: compile the three HDR
+/// slow (`render_surface_hdr_zrun`) decode paths: compile the two remaining HDR
 /// shaders once (cached on `SurfaceData::hdr_shaders` forever after) and
 /// (re)allocate the linear 16F offscreen when the output's mode size has
 /// changed (or on first use) -- never per frame either way. Any failure
@@ -2484,12 +2426,13 @@ fn render_surface_hdr<'a>(
 /// 1. Bind the offscreen and open ONE `MultiFrame`; set the SDR solid-color
 ///    transform (live nits) for the whole pass -- solids are never HDR, so a
 ///    single renderer-wide transform serves every element.
-/// 2. Clear once, then draw `tagged_elements` back-to-front, swapping the
-///    frame's texture program to each element's own decode immediately before
-///    its draw (`decode_sdr` plus its `sdr_white_nits` uniform, `decode_hdr_pq`
-///    or `decode_windows_scrgb` with none).
-/// 3. Drop the frame -- which discards the tex override with it -- clear the
-///    solid transform, then the shared [`encode_pass`].
+/// 2. Clear once, then draw `elements` back-to-front. Each element installs
+///    its own texture program as part of its own `draw` (see
+///    `RoundedElement::draw`'s `swap_round_program`) -- this function does not
+///    touch the program slot itself at all.
+/// 3. Drop the frame -- which discards whatever program the last element left
+///    installed with it -- clear the solid transform, then the shared
+///    [`encode_pass`].
 ///
 /// This was several render passes until the fork gained
 /// `MultiFrame::render_frame_mut`. Without it the override could only be set
@@ -2499,6 +2442,15 @@ fn render_surface_hdr<'a>(
 /// missing accessor and is gone; the ordering it went to some trouble to
 /// preserve is now just a single reverse.
 ///
+/// The program itself now travels with the element instead: every element in
+/// `elements` is a `RoundedElement` (or a plain shader-supplying type like
+/// `BorderRing`) built by `gather_hdr_composite_elements`, and its own `draw`
+/// installs whatever program it was built with via
+/// `gles.override_default_tex_program` before painting. This function no
+/// longer touches that slot at all -- there is no renderer-level default
+/// program for this pass any more, so an element that carried none would
+/// simply inherit whatever the previous element left active.
+///
 /// Still draws every element with full damage: the offscreen is redrawn
 /// completely every frame. That is the remaining cost, and it is what makes
 /// HDR compositing several times dearer than SDR at idle -- see the
@@ -2506,7 +2458,7 @@ fn render_surface_hdr<'a>(
 fn render_surface_hdr_zrun<'a>(
     surface: &mut SurfaceData,
     renderer: &mut RubixRenderer<'a>,
-    tagged_elements: &[(DecodeKind, RubixRenderElement<RubixRenderer<'a>>)],
+    elements: &[RubixRenderElement<RubixRenderer<'a>>],
     sdr_white_nits: f32,
     feedback: &mut Option<OutputPresentationFeedback>,
 ) -> Result<bool, String> {
@@ -2531,7 +2483,9 @@ fn render_surface_hdr_zrun<'a>(
             .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full_rect])
             .map_err(|e| format!("HDR z-run clear: {e:?}"))?;
 
-        // Back-to-front, each element decoded through its own transfer function.
+        // Back-to-front. Each element installs its own decode program inside
+        // its own `draw` (see `RoundedElement::draw`'s `swap_round_program`)
+        // -- this loop no longer touches the program slot itself.
         //
         // This was several render passes until now: elements were grouped into
         // maximal runs of equal DecodeKind and each run got its own frame with
@@ -2540,21 +2494,7 @@ fn render_surface_hdr_zrun<'a>(
         // doing the work. Our fork patch adds `render_frame_mut`, so the
         // program can be swapped between draws inside one frame and the run
         // machinery has no reason to exist.
-        for (kind, elem) in tagged_elements.iter().rev() {
-            if let Some(gles) = frame.render_frame_mut() {
-                let (program, uniforms) = match kind {
-                    DecodeKind::Sdr => (
-                        shaders.decode_sdr.clone(),
-                        vec![Uniform::new("sdr_white_nits", sdr_white_nits)],
-                    ),
-                    DecodeKind::HdrPq => (shaders.decode_hdr_pq.clone(), Vec::new()),
-                    // No sdr_white_nits uniform: Windows-scRGB pins 1.0 to
-                    // 80 cd/m² by protocol, so the SDR brightness slider must
-                    // not move HDR content.
-                    DecodeKind::WindowsScrgb => (shaders.decode_windows_scrgb.clone(), Vec::new()),
-                };
-                gles.override_default_tex_program(program, uniforms);
-            }
+        for elem in elements.iter().rev() {
             let dst = elem.geometry(Scale::from(1.0));
             let src = elem.src();
             let damage = [Rectangle::new(Point::from((0, 0)), dst.size)];

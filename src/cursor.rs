@@ -98,6 +98,13 @@ render_elements! {
     // See wallpaper.rs.
     RoundedMemory = RoundedElement<MemoryRenderBufferRenderElement<R>>,
     Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
+    // A reveal-tween window wrapped the same way as `Rounded`, for the HDR
+    // composite pass: that pass installs no renderer-wide default program, so
+    // even a compositor-chrome element like a mid-Reveal window must carry its
+    // own decode or it silently inherits whatever the previous element left
+    // active. Separate from `Rounded` because `RoundedElement` wraps the
+    // `RescaleRenderElement` here, not the bare surface element.
+    RoundedRescaled = RoundedElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>,
 }
 
 struct LoadedCursor {

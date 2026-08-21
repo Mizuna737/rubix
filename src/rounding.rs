@@ -342,6 +342,15 @@ pub(crate) enum SpaceMode {
     /// source's transfer function undone and the result tone-mapped, and
     /// neither has a linear working space to do it in.
     TonemapSdr,
+    /// The **HDR composite pass**. Resolves each window to
+    /// `RoundMode::Decode(its own DecodeKind)`, so a PQ game and an sRGB terminal
+    /// land in the same linear working space through different programs.
+    ///
+    /// Per-window for the same reason `TonemapSdr` is, but the destination is the
+    /// abs10k offscreen rather than an 8-bit sRGB buffer. `Fixed(Decode(Sdr))`
+    /// remains the *other* HDR-output case: an `hdr = true` output with no HDR
+    /// client present, where one program genuinely does serve the whole pass.
+    HdrComposite,
 }
 
 /// Wraps one surface element, clipping it to its window's rounded rect.
@@ -391,6 +400,24 @@ impl<E: Element> RoundedElement<E> {
             uniforms,
             masked: radius > 0.0,
         }
+    }
+
+    /// The wrapper used purely as a program installer, with no rounding.
+    ///
+    /// `rubixCornerAlpha` returns exactly 1.0 at `rubix_radius <= 0.0`, so the
+    /// mask half is a true no-op and the element is drawn unchanged except for
+    /// the program it is drawn with. Used for elements that are not windows --
+    /// cursor, layer surfaces, ghosts -- which still need a decode installed on
+    /// an HDR composite pass.
+    pub(crate) fn with_program(
+        inner: E,
+        shaders: &RoundShaders,
+        mode: RoundMode,
+        scale: Scale<f64>,
+        sdr_white_nits: f32,
+    ) -> Self {
+        let window_rect = inner.geometry(scale);
+        Self::new(inner, shaders, mode, 0.0, window_rect, scale, sdr_white_nits)
     }
 }
 
@@ -657,6 +684,28 @@ where
     ))
 }
 
+/// Per-window `RoundMode` for one element of `mode`'s pass, given that
+/// window's own declared `DecodeKind`. Pulled out of `space_elements`'s
+/// window loop so it is testable without a live renderer -- `TonemapSdr` and
+/// `HdrComposite` are otherwise easy to swap for each other by accident since
+/// both wrap `RoundMode` around the same `DecodeKind` lookup, just around a
+/// different variant.
+fn resolve_elem_mode(mode: SpaceMode, window_kind: DecodeKind) -> RoundMode {
+    match mode {
+        SpaceMode::Fixed(m) => m,
+        SpaceMode::TonemapSdr => RoundMode::Tonemap(window_kind),
+        SpaceMode::HdrComposite => RoundMode::Decode(window_kind),
+    }
+}
+
+/// Whether a per-window backdrop quad should wrap with `RoundMode::
+/// TonemapAbs10k` (`true`) rather than `RoundMode::Tonemap` (`false`) when it
+/// tone-maps at all -- see the call site's comment on `hdr_pass` for what
+/// picking the wrong one looks like on screen.
+fn backdrop_hdr_pass(mode: SpaceMode) -> bool {
+    matches!(mode, SpaceMode::HdrComposite)
+}
+
 /// `wallpaper_sdr_tonemap` is the same "destination is 8-bit sRGB, source is
 /// not" flag the caller already computes for the wallpaper element itself
 /// (`sdr_tonemap_needed`). A per-window backdrop quad sampling HDR wallpaper
@@ -696,12 +745,12 @@ where
                 s.opacity.is_some_and(|o| o < 1.0) || s.glow_margin.is_some_and(|g| g > 0)
             })
         });
-    let hdr = matches!(mode, SpaceMode::Fixed(RoundMode::Decode(_)));
+    let hdr = matches!(mode, SpaceMode::Fixed(RoundMode::Decode(_)) | SpaceMode::HdrComposite);
     // Capture resolves a program per window, which the batched call cannot
     // express -- it hands back one flat element list with no window identity
     // left in it. So this forces the per-window walk below even with no chrome
     // configured at all, which is exactly the bare-desktop-plus-HDR-game case.
-    let per_window_program = matches!(mode, SpaceMode::TonemapSdr);
+    let per_window_program = matches!(mode, SpaceMode::TonemapSdr | SpaceMode::HdrComposite);
     let Some(region) = state.space.output_geometry(output) else {
         return (Vec::new(), Vec::new());
     };
@@ -782,13 +831,18 @@ where
             s.opacity < 1.0 && (s.backdrop_tonemap || s.backdrop_blur)
         }) {
             let tonemap = style.backdrop_tonemap || wallpaper_sdr_tonemap;
-            // `hdr_pass: false` -- this destination is either a genuinely SDR
-            // output or a capture (`SpaceMode::TonemapSdr`/`Fixed(Plain)`), or
-            // an HDR-capable output with no HDR content at all, in which case
-            // `kind.is_hdr()` inside `backdrop_element` is false and this flag
-            // is never even consulted. See `RoundMode::TonemapAbs10k`'s doc
-            // comment for the pass that DOES need `hdr_pass: true`
-            // (`gather_tagged_elements`, an entirely separate call site).
+            // `hdr_pass` picks which wrapper program a tone-mapped quad gets
+            // (see `RoundMode::TonemapAbs10k`'s doc comment): `true` only for
+            // `SpaceMode::HdrComposite`, whose destination is the abs10k
+            // offscreen and must stay in that working space rather than
+            // collapse to sRGB. Every other mode here -- `TonemapSdr` (a
+            // genuinely SDR output, or a capture) and `Fixed` (including the
+            // `hdr = true`-output-no-HDR-client case, where `kind.is_hdr()`
+            // inside `backdrop_element` is false and this flag is never even
+            // consulted) -- is `false`. Getting this backwards produces
+            // `RoundMode::Tonemap` (collapse to sRGB) where `TonemapAbs10k`
+            // (stay in the working space) is wanted, which reads on screen as
+            // the backdrop crushing to white -- a bug already shipped once.
             if let Some((_, quad)) = state.wallpaper.backdrop_element(
                 renderer,
                 &output.name(),
@@ -797,7 +851,8 @@ where
                 scale,
                 tonemap,
                 style.backdrop_blur,
-                false,
+                backdrop_hdr_pass(mode),
+                state.sdr_white_nits,
             ) {
                 backdrops.push(quad);
             }
@@ -810,25 +865,26 @@ where
             Scale::from(scale),
             opacity,
         );
-        let elem_mode = match mode {
-            SpaceMode::Fixed(m) => m,
-            SpaceMode::TonemapSdr => RoundMode::Tonemap(
-                window
-                    .wl_surface()
-                    .map(|s| crate::color_management::surface_decode_kind(&s))
-                    .unwrap_or(DecodeKind::Sdr),
-            ),
-        };
+        let window_kind = window
+            .wl_surface()
+            .map(|s| crate::color_management::surface_decode_kind(&s))
+            .unwrap_or(DecodeKind::Sdr);
+        let elem_mode = resolve_elem_mode(mode, window_kind);
         // A fullscreen window is never rounded -- it covers the output, so there
         // is no corner to cut.
         let elem_radius = if fullscreen { 0.0 } else { radius };
         // An SDR window in a capture resolves to the plain program, which is what
         // it would have been drawn with anyway; wrapping it would buy a program
-        // swap per element for nothing.
-        let needs_program = matches!(
-            elem_mode,
-            RoundMode::Tonemap(DecodeKind::HdrPq) | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
-        );
+        // swap per element for nothing. `HdrComposite` is unconditional instead:
+        // that pass has no renderer-wide default program at all (every element
+        // installs its own -- see `udev::render_surface_hdr_zrun`), so even a
+        // `Decode(Sdr)`, radius-0, fullscreen window must still be wrapped or it
+        // silently draws with whatever program the previous element left active.
+        let needs_program = matches!(mode, SpaceMode::HdrComposite)
+            || matches!(
+                elem_mode,
+                RoundMode::Tonemap(DecodeKind::HdrPq) | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
+            );
         let wrap = round
             .as_ref()
             .filter(|_| elem_radius > 0.0 || needs_program);
@@ -1028,5 +1084,46 @@ mod tests {
                 "{mode:?} must not supply a uniform its program never declares",
             );
         }
+    }
+
+    // Same sentinel style as `every_decode_kind_maps_to_a_distinct_variant`: a
+    // new `SpaceMode` variant needs an arm in `resolve_elem_mode` (and in
+    // `space_elements`'s `hdr`/`per_window_program` flags) or it silently
+    // falls through to whatever the match's last arm happened to resolve to.
+    #[test]
+    fn every_space_mode_has_a_distinct_variant() {
+        let modes = [
+            SpaceMode::Fixed(RoundMode::Plain),
+            SpaceMode::TonemapSdr,
+            SpaceMode::HdrComposite,
+        ];
+        assert_eq!(modes.len(), 3, "a new SpaceMode needs an arm in resolve_elem_mode");
+    }
+
+    #[test]
+    fn hdr_composite_resolves_each_window_to_its_own_decode() {
+        assert_eq!(
+            resolve_elem_mode(SpaceMode::HdrComposite, DecodeKind::HdrPq),
+            RoundMode::Decode(DecodeKind::HdrPq),
+            "a PQ window on the HDR composite pass must decode through its own program",
+        );
+        assert_eq!(
+            resolve_elem_mode(SpaceMode::HdrComposite, DecodeKind::Sdr),
+            RoundMode::Decode(DecodeKind::Sdr),
+            "an SDR window on the HDR composite pass must still decode explicitly -- \
+             there is no renderer-wide default to fall back on",
+        );
+    }
+
+    // Pins the exact bug the `hdr_pass` comment on `space_elements` warns
+    // about: swap `HdrComposite`'s `true` for `false` and a frosted backdrop
+    // over an HDR wallpaper collapses to sRGB (`RoundMode::Tonemap`) instead
+    // of staying in the abs10k working space (`RoundMode::TonemapAbs10k`),
+    // which reads on screen as the backdrop crushing to white.
+    #[test]
+    fn only_hdr_composite_selects_the_abs10k_backdrop_wrapper() {
+        assert!(backdrop_hdr_pass(SpaceMode::HdrComposite));
+        assert!(!backdrop_hdr_pass(SpaceMode::TonemapSdr));
+        assert!(!backdrop_hdr_pass(SpaceMode::Fixed(RoundMode::Plain)));
     }
 }

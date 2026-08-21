@@ -260,19 +260,22 @@ void main() {
 }
 "#;
 
-/// The three compiled HDR texture-shader programs for one output.
+/// The compiled HDR texture-shader programs shared per output.
 /// `GlesTexProgram` is a cheap `Arc` clone (see the fork's
 /// `shaders/implicit/mod.rs`), so handing out clones of a cached `HdrShaders`
 /// across frames costs nothing -- compilation is the only expensive part,
 /// and `compile_hdr_shaders` is called at most once per output (see
 /// `SurfaceData::hdr_shaders` in udev.rs).
+///
+/// `decode_hdr_pq` and `decode_windows_scrgb` used to live here too, for the
+/// z-run's per-element decode swap (`render_surface_hdr_zrun`). That swap now
+/// goes through `RoundedElement`'s own copies of these programs
+/// (`rounding::RoundShaders`, compiled with the rounding splice applied) --
+/// see `gather_hdr_composite_elements` -- so this struct only needs the one
+/// program `render_surface_hdr`'s renderer-wide override still installs.
 #[derive(Clone)]
 pub struct HdrShaders {
     pub decode_sdr: GlesTexProgram,
-    pub decode_hdr_pq: GlesTexProgram,
-    /// Windows-scRGB (linear BT.709, 1.0 == 80 nits). See
-    /// [`DECODE_WINDOWS_SCRGB`].
-    pub decode_windows_scrgb: GlesTexProgram,
     pub encode: GlesTexProgram,
 }
 
@@ -284,16 +287,8 @@ pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, Gl
         DECODE_SDR,
         &[UniformName::new("sdr_white_nits", UniformType::_1f)],
     )?;
-    let decode_hdr_pq = renderer.compile_custom_texture_shader(DECODE_HDR_PQ, &[])?;
-    let decode_windows_scrgb =
-        renderer.compile_custom_texture_shader(DECODE_WINDOWS_SCRGB, &[])?;
     let encode = renderer.compile_custom_texture_shader(ENCODE_LINEAR_TO_PQ, &[])?;
-    Ok(HdrShaders {
-        decode_sdr,
-        decode_hdr_pq,
-        decode_windows_scrgb,
-        encode,
-    })
+    Ok(HdrShaders { decode_sdr, encode })
 }
 
 /// CPU-side sRGB EOTF + BT.709->BT.2020 + nits scaling, factored out of
@@ -547,7 +542,7 @@ vec3 rubixToneCurveAbs10k(vec3 v) {
 
 /// PQ decode straight into abs10k, capped at the backdrop reference
 /// luminance instead of collapsed to sRGB. Wraps a per-window backdrop quad
-/// on the **HDR composite pass** (`gather_tagged_elements` /
+/// on the **HDR composite pass** (`gather_hdr_composite_elements` /
 /// `render_surface_hdr_zrun`), where the destination is already the linear
 /// BT.2020 abs10k working space -- see [`ABS10K_TONE_TAIL_GLSL`].
 pub fn tonemap_pq_to_abs10k() -> String {

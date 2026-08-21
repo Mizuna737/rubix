@@ -715,16 +715,22 @@ impl WallpaperManager {
     /// `false` (an SDR output, or an SDR-showing-HDR-content output, or a
     /// capture) wraps with `RoundMode::Tonemap`, which decodes and rolls off
     /// straight to sRGB 0..1. `true` (a per-window backdrop on the **HDR
-    /// composite pass** -- see `udev::gather_tagged_elements`) wraps with
+    /// composite pass** -- see `rounding::space_elements` with
+    /// `SpaceMode::HdrComposite`) wraps with
     /// `RoundMode::TonemapAbs10k` instead, which stays in the abs10k working
     /// space that pass's destination actually is. Writing the sRGB program's
     /// 0..1 output into that offscreen would read a 0.77 pixel back as 7700
     /// cd/m^2 -- a blown-out backdrop, not a capped one.
     ///
     /// Returns the wallpaper's own `DecodeKind` alongside the element, same
-    /// shape as `element` above, so a caller tagging a z-run partition (the
-    /// HDR composite pass) can tag this quad exactly like the wallpaper
-    /// element itself.
+    /// shape as `element` above. The kind used to be how the HDR pass tagged
+    /// this quad for its z-run partition; that partition is gone and the quad
+    /// now carries its own program, so the kind is informational.
+    ///
+    /// `sdr_white_nits` is the pass's real SDR white point and
+    /// `self.backdrop_luminance_nits` is the tone curve's reference ceiling.
+    /// Both ride the same `sdr_white_nits` uniform name, so which one is
+    /// passed depends on the mode -- see the match below.
     // `tonemap` and `blur` stay two separate flags rather than one bundled
     // struct: they are deliberately orthogonal knobs (a capped-but-sharp
     // backdrop is a real look), and collapsing them to satisfy the arity lint
@@ -740,6 +746,7 @@ impl WallpaperManager {
         tonemap: bool,
         blur: bool,
         hdr_pass: bool,
+        sdr_white_nits: f32,
     ) -> Option<(DecodeKind, RubixRenderElement<R>)>
     where
         R: Renderer + ImportAll + ImportMem + GlesAccess,
@@ -771,16 +778,36 @@ impl WallpaperManager {
         .ok()?;
 
         let kind = wallpaper.decode;
-        if !tonemap || !kind.is_hdr() {
-            return Some((kind, RubixRenderElement::Memory(element)));
-        }
-        let Some(shaders) = round_shaders(renderer.gles_renderer()) else {
+        // Which program this quad must be drawn with, and which value the
+        // overloaded `sdr_white_nits` uniform carries for it.
+        //
+        // `None` means the quad needs no program of its own: the destination
+        // is SDR and the pass-wide default is already correct for it.
+        //
+        // The `(false, true)` arm is the one that is easy to miss. On the HDR
+        // composite pass there is no pass-wide default at all -- every element
+        // installs its own program -- so a quad returned bare would draw with
+        // whatever the previous element happened to leave in the slot. It
+        // still needs a plain decode even when nothing is being tone-mapped,
+        // and that decode wants the *real* SDR white point, not the backdrop
+        // ceiling. Reachable two ways: `backdrop_blur` on with
+        // `backdrop_tonemap` off, and any SDR wallpaper on an HDR output.
+        let Some(mode) = backdrop_program(tonemap, kind, hdr_pass) else {
             return Some((kind, RubixRenderElement::Memory(element)));
         };
-        let mode = if hdr_pass {
-            RoundMode::TonemapAbs10k(kind)
-        } else {
-            RoundMode::Tonemap(kind)
+        // A plain decode's uniform is the real SDR white point; the two
+        // tone-mapping modes overload the same name as the curve's ceiling.
+        let reference_nits = match mode {
+            RoundMode::Decode(_) => sdr_white_nits,
+            _ => self.backdrop_luminance_nits,
+        };
+        // Shaders failed to compile. On an SDR pass this is cosmetic -- an
+        // uncapped backdrop. On the HDR pass it means this quad inherits the
+        // previous element's program, which is wrong but is also the same
+        // degradation every other element in the pass suffers from the same
+        // failure; there is nothing better available at this point.
+        let Some(shaders) = round_shaders(renderer.gles_renderer()) else {
+            return Some((kind, RubixRenderElement::Memory(element)));
         };
         Some((
             kind,
@@ -802,9 +829,35 @@ impl WallpaperManager {
                 // into the texels, so multiplying here would scale the ceiling
                 // a second time (40 nits became 8, putting the knee at the
                 // wallpaper's median and flattening half the image).
-                self.backdrop_luminance_nits,
+                reference_nits,
             )),
         ))
+    }
+}
+
+/// Which program a backdrop quad must be drawn with, or `None` if it needs
+/// none of its own.
+///
+/// Split out as a pure function because getting it wrong is invisible
+/// everywhere except on a screen: the wrong arm still builds, still logs
+/// clean, and still draws something.
+pub(crate) fn backdrop_program(
+    tonemap: bool,
+    kind: DecodeKind,
+    hdr_pass: bool,
+) -> Option<RoundMode> {
+    match (tonemap && kind.is_hdr(), hdr_pass) {
+        // Cap the backdrop's luminance without leaving the abs10k working
+        // space the HDR composite pass draws into.
+        (true, true) => Some(RoundMode::TonemapAbs10k(kind)),
+        // Same rolloff, but the destination is 8-bit sRGB, so collapse to it.
+        (true, false) => Some(RoundMode::Tonemap(kind)),
+        // Nothing to tone-map, but the HDR pass has no pass-wide default to
+        // inherit -- every element installs its own program, so a quad with
+        // none would draw with whatever the previous element left behind.
+        (false, true) => Some(RoundMode::Decode(kind)),
+        // An SDR destination's pass default is already correct for this quad.
+        (false, false) => None,
     }
 }
 
@@ -1495,6 +1548,58 @@ mod tests {
             decoded,
             "changing the SDR reference must not re-decode",
         );
+    }
+
+    #[test]
+    fn a_backdrop_on_the_hdr_pass_always_carries_a_program() {
+        // The HDR composite pass installs no pass-wide default, so every arm
+        // with `hdr_pass = true` must be `Some`. A `None` here draws the quad
+        // with the previous element's program.
+        for kind in [DecodeKind::Sdr, DecodeKind::HdrPq, DecodeKind::WindowsScrgb] {
+            for tonemap in [false, true] {
+                assert!(
+                    backdrop_program(tonemap, kind, true).is_some(),
+                    "{kind:?} tonemap={tonemap} on the HDR pass has no program"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_untonemapped_backdrop_decodes_rather_than_tonemapping() {
+        // The two configs that reach this: blur on with tonemap off, and any
+        // SDR wallpaper on an HDR output.
+        assert_eq!(
+            backdrop_program(false, DecodeKind::HdrPq, true),
+            Some(RoundMode::Decode(DecodeKind::HdrPq))
+        );
+        assert_eq!(
+            backdrop_program(true, DecodeKind::Sdr, true),
+            Some(RoundMode::Decode(DecodeKind::Sdr)),
+            "an SDR wallpaper has nothing to tone-map, so it takes a plain decode"
+        );
+    }
+
+    #[test]
+    fn the_tonemap_destination_decides_sdr_versus_abs10k() {
+        // Backwards here reads on screen as the backdrop crushing to white --
+        // shipped once already.
+        assert_eq!(
+            backdrop_program(true, DecodeKind::HdrPq, true),
+            Some(RoundMode::TonemapAbs10k(DecodeKind::HdrPq)),
+            "the HDR pass must stay in the abs10k working space"
+        );
+        assert_eq!(
+            backdrop_program(true, DecodeKind::HdrPq, false),
+            Some(RoundMode::Tonemap(DecodeKind::HdrPq)),
+            "an sRGB destination must collapse to it"
+        );
+    }
+
+    #[test]
+    fn an_sdr_destination_leaves_an_untonemapped_backdrop_alone() {
+        assert_eq!(backdrop_program(false, DecodeKind::HdrPq, false), None);
+        assert_eq!(backdrop_program(false, DecodeKind::Sdr, false), None);
     }
 
     #[test]
