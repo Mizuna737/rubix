@@ -16,6 +16,8 @@ mod input;
 mod ipc;
 mod model;
 mod output_power;
+mod palette;
+mod theme;
 mod portal;
 mod rounding;
 mod foreign_toplevel;
@@ -164,6 +166,9 @@ fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &D
                         let mut cmd = std::process::Command::new("sh");
                         cmd.arg("-c").arg(command);
                         cmd.env("DISPLAY", format!(":{display_number}"));
+                        // Newly launched apps pick up the current wallpaper
+                        // theme this way; see `RubixState::theme_env`.
+                        cmd.envs(data.theme_env.iter().cloned());
                         cmd.spawn().ok();
                         tracing::info!("ran startup command: {command}");
                     }
@@ -211,6 +216,212 @@ fn open_log_file() -> Option<std::fs::File> {
 /// `screen` invocation at all (caller falls through to normal startup);
 /// `Some(exit_code)` otherwise, which the caller must `std::process::exit`
 /// immediately -- this never returns into compositor bring-up.
+/// `rubix palette PATH [--scale F] [--sdr-white-nits F]` -- decode a wallpaper
+/// and print the palette extracted from it as JSON, then exit.
+///
+/// Runs entirely offline: no socket, no renderer, no compositor. That is the
+/// point -- a palette can be checked against the real wallpaper library, and
+/// the extraction tuned, without restarting a session to look at the result.
+/// Like `handle_screen_subcommand` this must run before any backend bring-up.
+fn handle_palette_subcommand(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("palette") {
+        return None;
+    }
+    let rest = &args[1..];
+    let Some(path) = rest.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: rubix palette PATH [--scale F] [--sdr-white-nits F]");
+        return Some(2);
+    };
+
+    let mut scale = 1.0f32;
+    let mut sdr_white_nits = crate::config::default_sdr_white_nits();
+    let mut iter = rest[1..].iter();
+    while let Some(flag) = iter.next() {
+        let Some(value) = iter.next().and_then(|v| v.parse::<f32>().ok()) else {
+            eprintln!("rubix palette: {flag} needs a numeric value");
+            return Some(2);
+        };
+        match flag.as_str() {
+            "--scale" => scale = value,
+            "--sdr-white-nits" => sdr_white_nits = value,
+            other => {
+                eprintln!("rubix palette: unknown flag {other}");
+                return Some(2);
+            }
+        }
+    }
+
+    let palette = match crate::wallpaper::palette_for_file(
+        std::path::Path::new(path),
+        scale,
+        sdr_white_nits,
+    ) {
+        Ok(palette) => palette,
+        Err(e) => {
+            eprintln!("rubix palette: {e}");
+            return Some(1);
+        }
+    };
+
+    let swatches: Vec<serde_json::Value> = palette
+        .swatches
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "preview": crate::palette::preview_hex(s.abs10k, sdr_white_nits),
+                "weight": s.weight,
+                "intensity": s.intensity,
+                // Peak channel in cd/m^2 -- the number that says whether this
+                // swatch is a highlight or a midtone, which no sRGB hex can.
+                "peak_nits": s.abs10k.iter().copied().fold(0.0f32, f32::max) * 10_000.0,
+                "abs10k": s.abs10k,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "path": path,
+        "scale": scale,
+        "sdr_white_nits": sdr_white_nits,
+        "intensity_p50": palette.intensity_p50,
+        "intensity_p95": palette.intensity_p95,
+        "intensity_p99": palette.intensity_p99,
+        "swatches": swatches,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    Some(0)
+}
+
+fn handle_theme_subcommand(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("theme") {
+        return None;
+    }
+    let rest = &args[1..];
+    let Some(path) = rest.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!(
+            "usage: rubix theme PATH [--scale F] [--sdr-white-nits F] [--opacity F] \
+             [--backdrop-cap-nits F|none] [--sharp] [--target-lc F]"
+        );
+        return Some(2);
+    };
+
+    let mut scale = 0.15f32;
+    let mut params = crate::theme::ThemeParams {
+        sdr_white_nits: crate::config::default_sdr_white_nits(),
+        ..crate::theme::ThemeParams::default()
+    };
+    let mut iter = rest[1..].iter();
+    while let Some(flag) = iter.next() {
+        // `--sharp` is the only boolean flag; every other flag takes a value.
+        if flag == "--sharp" {
+            params.backdrop_blurred = false;
+            continue;
+        }
+        let Some(raw) = iter.next() else {
+            eprintln!("rubix theme: {flag} needs a value");
+            return Some(2);
+        };
+        match flag.as_str() {
+            "--scale" => match raw.parse::<f32>() {
+                Ok(v) => scale = v,
+                Err(_) => {
+                    eprintln!("rubix theme: --scale needs a numeric value");
+                    return Some(2);
+                }
+            },
+            "--sdr-white-nits" => match raw.parse::<f32>() {
+                Ok(v) => params.sdr_white_nits = v,
+                Err(_) => {
+                    eprintln!("rubix theme: --sdr-white-nits needs a numeric value");
+                    return Some(2);
+                }
+            },
+            "--opacity" => match raw.parse::<f32>() {
+                Ok(v) => params.opacity = v,
+                Err(_) => {
+                    eprintln!("rubix theme: --opacity needs a numeric value");
+                    return Some(2);
+                }
+            },
+            "--backdrop-cap-nits" => {
+                if raw == "none" {
+                    params.backdrop_cap_nits = None;
+                } else {
+                    match raw.parse::<f32>() {
+                        Ok(v) => params.backdrop_cap_nits = Some(v),
+                        Err(_) => {
+                            eprintln!("rubix theme: --backdrop-cap-nits needs a numeric value or 'none'");
+                            return Some(2);
+                        }
+                    }
+                }
+            }
+            "--target-lc" => match raw.parse::<f32>() {
+                Ok(v) => params.target_lc = v,
+                Err(_) => {
+                    eprintln!("rubix theme: --target-lc needs a numeric value");
+                    return Some(2);
+                }
+            },
+            other => {
+                eprintln!("rubix theme: unknown flag {other}");
+                return Some(2);
+            }
+        }
+    }
+
+    let palette = match crate::wallpaper::palette_for_file(
+        std::path::Path::new(path),
+        scale,
+        params.sdr_white_nits,
+    ) {
+        Ok(palette) => palette,
+        Err(e) => {
+            eprintln!("rubix theme: {e}");
+            return Some(1);
+        }
+    };
+
+    let Some(theme) = crate::theme::solve(&palette, &params) else {
+        eprintln!("rubix theme: could not solve a theme (no accent swatch in palette)");
+        return Some(1);
+    };
+
+    let colour_json = |c: &crate::theme::ThemeColor| {
+        serde_json::json!({
+            "hex": crate::palette::preview_hex(c.abs10k, params.sdr_white_nits),
+            "abs10k": c.abs10k,
+            "lc": c.lc,
+        })
+    };
+    let ansi_names = ["red", "green", "yellow", "blue", "magenta", "cyan"];
+    let ansi_json: serde_json::Map<String, serde_json::Value> = ansi_names
+        .iter()
+        .zip(theme.ansi.iter())
+        .map(|(name, c)| (name.to_string(), colour_json(c)))
+        .collect();
+
+    let out = serde_json::json!({
+        "path": path,
+        "scale": scale,
+        "sdr_white_nits": params.sdr_white_nits,
+        "opacity": params.opacity,
+        "backdrop_cap_nits": params.backdrop_cap_nits,
+        "backdrop_blurred": params.backdrop_blurred,
+        "target_lc": params.target_lc,
+        "background": colour_json(&theme.background),
+        "surface": colour_json(&theme.surface),
+        "foreground": colour_json(&theme.foreground),
+        "muted": colour_json(&theme.muted),
+        "accent": colour_json(&theme.accent),
+        "border": colour_json(&theme.border),
+        "ansi": ansi_json,
+        "effective_background": theme.effective_background,
+        "met_targets": theme.met_targets,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    Some(0)
+}
+
 fn handle_screen_subcommand(args: &[String]) -> Option<i32> {
     if args.first().map(String::as_str) != Some("screen") {
         return None;
@@ -406,6 +617,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(code) = handle_screen_subcommand(&cli_args) {
         std::process::exit(code);
     }
+    if let Some(code) = handle_palette_subcommand(&cli_args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = handle_theme_subcommand(&cli_args) {
+        std::process::exit(code);
+    }
 
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -439,6 +656,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // diagnostic a user most needs -- "your config did not parse" -- is the one
     // guaranteed to be dropped. A few seconds is enough for both sinks to exist.
     let mut startup_problems = crate::config::take_config_diagnostics();
+    // Set before the first `resolve` below so a config that starts with
+    // `[theme] enable = true` gets its palette extracted on the very first
+    // decode, instead of only from the next wallpaper change.
+    data.wallpaper.set_theme_params(data.theme_params());
     // Decoded here, before the backend starts, so the first frame drawn already
     // has a wallpaper rather than flashing black. Failures join the config
     // problems above and ride the same deferred report.
@@ -515,7 +736,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = args.next();
 
     if let (Some("-c") | Some("--command"), Some(command)) = (flag.as_deref(), arg) {
-        std::process::Command::new(command).spawn().ok();
+        std::process::Command::new(command).envs(data.theme_env.iter().cloned()).spawn().ok();
     }
 
     // After every dispatch cycle: refresh the space (enter/leave bookkeeping),
@@ -544,6 +765,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(clients) = &ipc_clients {
                 crate::ipc::broadcast_config_errors(clients, &problems);
             }
+        }
+        // Drains `WallpaperManager`'s dirty flag, so this fires exactly once
+        // per solved theme -- on startup, on a config reload, on `set_wallpaper`
+        // over IPC, and on every slideshow advance -- never on every frame.
+        if let Some((path, theme)) = data.wallpaper.take_theme_update() {
+            data.apply_theme_update(&path, &theme, ipc_clients.as_ref());
         }
     })?;
 

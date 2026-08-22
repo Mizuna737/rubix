@@ -200,6 +200,15 @@ pub struct RubixState {
     /// See src/wallpaper.rs.
     pub wallpaper: crate::wallpaper::WallpaperManager,
 
+    /// Env vars set on every process spawned from here on, carrying the
+    /// latest solved theme (`RUBIX_THEME`/`RUBIX_BACKGROUND`/
+    /// `RUBIX_FOREGROUND`/`RUBIX_ACCENT`). Empty when `[theme] enable` is
+    /// false. Only affects processes started AFTER a theme change -- an
+    /// already-running app needs the file or the IPC event instead, since its
+    /// environment cannot be rewritten from outside it. See
+    /// `apply_theme_update` and the `NavAction::Spawn`/startup spawn sites.
+    pub theme_env: Vec<(String, String)>,
+
     // wlr-foreign-toplevel-management: bound managers plus what each window's
     // handles were last told, so `foreign_toplevel::refresh` can send deltas.
     pub(crate) foreign_toplevel: crate::foreign_toplevel::ForeignToplevelState,
@@ -505,6 +514,7 @@ impl RubixState {
             ipc_dirty: false,
             pending_config_errors: Vec::new(),
             wallpaper: crate::wallpaper::WallpaperManager::default(),
+            theme_env: Vec::new(),
             wallpaper_timer: None,
             config_reload_timer: None,
             foreign_toplevel: Default::default(),
@@ -1072,6 +1082,55 @@ impl RubixState {
         self.ipc_dirty = true;
     }
 
+    /// Solve inputs for the theme, or `None` when `[theme] enable` is false --
+    /// the single gate that also stops `WallpaperManager` from extracting a
+    /// palette at all (see `WallpaperManager::set_theme_params`).
+    pub(crate) fn theme_params(&self) -> Option<crate::theme::ThemeParams> {
+        self.config.theme.enable.then(|| self.config.theme.solve_params(&self.config.decoration))
+    }
+
+    /// Emit a freshly solved theme to every configured surface: the JSON file
+    /// (atomically), IPC subscribers, and the environment newly spawned
+    /// children inherit.
+    ///
+    /// Called once per theme change -- the caller drains
+    /// `WallpaperManager::take_theme_update`, so this never runs on every
+    /// frame or every wallpaper-lifecycle tick, only when the solved theme
+    /// actually changed.
+    pub(crate) fn apply_theme_update(
+        &mut self,
+        wallpaper_path: &std::path::Path,
+        theme: &crate::theme::Theme,
+        registry: Option<&crate::ipc::ClientRegistry>,
+    ) {
+        let sdr_white_nits = self.config.theme.sdr_white_nits;
+        let json = theme_json(wallpaper_path, theme, sdr_white_nits);
+
+        if let Err(e) = write_theme_file(&self.config.theme.output_path, &json) {
+            tracing::warn!("theme: failed to write {}: {e}", self.config.theme.output_path.display());
+        }
+
+        // Only affects processes started from here on -- see the doc comment
+        // on `theme_env` itself.
+        self.theme_env = vec![
+            ("RUBIX_THEME".to_string(), self.config.theme.output_path.display().to_string()),
+            ("RUBIX_BACKGROUND".to_string(), crate::palette::preview_hex(theme.background.abs10k, sdr_white_nits)),
+            ("RUBIX_FOREGROUND".to_string(), crate::palette::preview_hex(theme.foreground.abs10k, sdr_white_nits)),
+            ("RUBIX_ACCENT".to_string(), crate::palette::preview_hex(theme.accent.abs10k, sdr_white_nits)),
+        ];
+
+        if let Some(registry) = registry {
+            crate::ipc::broadcast_theme_changed(registry, &json);
+        }
+
+        // Detached, like `notify_config_problems` below: `on_change` is user
+        // config and may be slow, hang, or simply be wrong, and none of that
+        // may ever block the compositor thread.
+        if let Some(command) = &self.config.theme.on_change {
+            spawn_detached_shell(command);
+        }
+    }
+
     /// Surface config problems through the configured sink.
     ///
     /// `note_config_problem` has already logged every one of these; this is the
@@ -1201,6 +1260,11 @@ impl RubixState {
         // this runs after both are swapped in. Decode failures join the config
         // problems already collected and go out through the same sink.
         self.config.wallpaper = new.wallpaper;
+        // Swapped before `resolve` below, so a `[theme]` edit (including
+        // turning it on or off) takes effect on the SAME reload that touches
+        // the wallpaper, rather than lagging one edit behind.
+        self.config.theme = new.theme;
+        self.wallpaper.set_theme_params(self.theme_params());
         problems.extend(
             self.wallpaper
                 .resolve(&self.config.wallpaper, &self.config.outputs, &self.config.decoration),
@@ -2213,4 +2277,71 @@ fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Every colour role as hex + `abs10k` + achieved `Lc`, matching exactly what
+/// `rubix theme` prints on stdout (see `handle_theme_subcommand` in main.rs)
+/// so a file watcher and a CLI invocation agree on one shape.
+fn theme_json(wallpaper_path: &std::path::Path, theme: &crate::theme::Theme, sdr_white_nits: f32) -> serde_json::Value {
+    let colour = |c: &crate::theme::ThemeColor| {
+        serde_json::json!({
+            "hex": crate::palette::preview_hex(c.abs10k, sdr_white_nits),
+            "abs10k": c.abs10k,
+            "lc": c.lc,
+        })
+    };
+    let ansi_names = ["red", "green", "yellow", "blue", "magenta", "cyan"];
+    let ansi: serde_json::Map<String, serde_json::Value> =
+        ansi_names.iter().zip(theme.ansi.iter()).map(|(name, c)| (name.to_string(), colour(c))).collect();
+    serde_json::json!({
+        "wallpaper": wallpaper_path.display().to_string(),
+        "background": colour(&theme.background),
+        "surface": colour(&theme.surface),
+        "foreground": colour(&theme.foreground),
+        "muted": colour(&theme.muted),
+        "accent": colour(&theme.accent),
+        "border": colour(&theme.border),
+        "ansi": ansi,
+        "effective_background": theme.effective_background,
+        "met_targets": theme.met_targets,
+    })
+}
+
+/// Write `json` to `path` atomically: a temp file in the SAME directory (so
+/// the rename stays on one filesystem and is therefore atomic), then
+/// `rename` over the final name. A consumer polling or watching `path` never
+/// observes a half-written file.
+fn write_theme_file(path: &std::path::Path, json: &serde_json::Value) -> std::io::Result<()> {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "theme output_path has no parent directory",
+        ));
+    };
+    std::fs::create_dir_all(dir)?;
+    // PID-suffixed so two rubix processes (or a stale one that never exited)
+    // sharing an output_path cannot race each other's temp file.
+    let tmp = dir.join(format!(".theme.json.{}.tmp", std::process::id()));
+    let write_result = std::fs::write(&tmp, serde_json::to_vec_pretty(json).unwrap_or_default());
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return write_result;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Run a shell command detached, same posture as `notify_config_problems`:
+/// never blocks the compositor thread, and the child is reaped on a
+/// throwaway thread rather than left as a zombie for the life of the
+/// session. `on_change` is user config and may be slow or simply wrong --
+/// none of that may ever reach the render loop.
+fn spawn_detached_shell(command: &str) {
+    match std::process::Command::new("sh").arg("-c").arg(command).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => tracing::warn!("theme: on_change command failed to spawn: {e}"),
+    }
 }

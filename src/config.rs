@@ -174,6 +174,11 @@ pub struct Config {
     /// Live/hot-reloadable: `RubixState::reload_config` re-arms the idle
     /// timer against the new `screen_off_seconds` immediately.
     pub idle: IdleConfig,
+
+    /// Live theme extraction: a contrast-solved palette derived from the
+    /// active wallpaper and re-derived whenever it changes. Off by default --
+    /// see `ThemeConfig::enable`.
+    pub theme: ThemeConfig,
 }
 
 /// Resolved `[idle]`. See `config/default/` for the on-disk defaults.
@@ -221,6 +226,137 @@ impl Default for WallpaperConfig {
             sdr_reference_nits: crate::hdr_shaders::SDR_WHITE_NITS,
         }
     }
+}
+
+/// Resolved `[theme]`. Off by default: a fresh install writes nothing and
+/// spawns nothing until this is explicitly turned on. See
+/// `RubixState`'s wallpaper-change handling in `state.rs` for where this
+/// actually drives a solve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThemeConfig {
+    /// Master switch. `false` (the default) means the theme is never solved,
+    /// written, or broadcast -- wallpaper decode pays no extra cost either.
+    pub enable: bool,
+    /// Where the solved theme is written as JSON, atomically (temp file plus
+    /// rename) so a consumer never reads a half-written file. `~` expands to
+    /// $HOME.
+    pub output_path: PathBuf,
+    /// Shell command (`sh -c`) run, detached, after each write. Point this at
+    /// a renderer such as `rubixTheme.py` to push the theme into other apps.
+    pub on_change: Option<String>,
+    /// Contrast target for body text, in APCA `Lc`. Clamped to `[0, 106]`.
+    pub target_lc: f32,
+    /// Override for the solve's window opacity. `None` derives the worst case
+    /// across the live active/inactive decoration styles -- see
+    /// `worst_case_backdrop_params`.
+    pub opacity: Option<f32>,
+    /// Override for the backdrop luminance cap, in nits. `None` derives it the
+    /// same way as `opacity`.
+    pub backdrop_cap_nits: Option<f32>,
+    /// Override for whether the solve treats the backdrop as blurred. `None`
+    /// derives it the same way as `opacity`.
+    pub backdrop_blurred: Option<bool>,
+    /// Mirrors the top-level `sdr_white_nits`, not independently settable --
+    /// text legibility is judged against the same SDR reference the rest of
+    /// the compositor uses.
+    pub sdr_white_nits: f32,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        resolve_theme(RawTheme::default(), default_sdr_white_nits())
+    }
+}
+
+impl ThemeConfig {
+    /// Inputs to `theme::solve`: explicit `[theme]` overrides win; anything
+    /// left unset falls back to the worst case across the live active/
+    /// inactive window styles (see `worst_case_backdrop_params`), because
+    /// inactive windows typically show more wallpaper than active ones and
+    /// the theme is solved once and shared by every window.
+    pub(crate) fn solve_params(&self, decoration: &DecorationConfig) -> crate::theme::ThemeParams {
+        let (derived_opacity, derived_cap, derived_blurred) = worst_case_backdrop_params(decoration);
+        crate::theme::ThemeParams {
+            opacity: self.opacity.unwrap_or(derived_opacity),
+            backdrop_cap_nits: self.backdrop_cap_nits.or(derived_cap),
+            backdrop_blurred: self.backdrop_blurred.unwrap_or(derived_blurred),
+            sdr_white_nits: self.sdr_white_nits,
+            target_lc: self.target_lc,
+        }
+    }
+}
+
+/// The worst-case opacity, backdrop cap, and blur-vs-sharp across the active
+/// and inactive window styles: the *lower* opacity (more wallpaper shows
+/// through), the *higher* or absent cap (less tone-mapping), and unblurred
+/// unless BOTH styles blur. A theme is solved once per wallpaper and shared by
+/// every window, so it has to hold up against whichever style shows the most
+/// backdrop -- usually the inactive one, but a rule can flip that per window,
+/// so both are checked rather than assuming which wins.
+pub(crate) fn worst_case_backdrop_params(decoration: &DecorationConfig) -> (f32, Option<f32>, bool) {
+    let opacity = decoration.active.opacity.min(decoration.inactive.opacity);
+    let cap_for = |style: &WindowStyle| style.backdrop_tonemap.then_some(decoration.backdrop_luminance_nits);
+    let backdrop_cap_nits = match (cap_for(&decoration.active), cap_for(&decoration.inactive)) {
+        // Either style leaving the backdrop uncapped is the worse case: a
+        // capped theme would understate what a window over that style shows.
+        (None, _) | (_, None) => None,
+        (Some(a), Some(b)) => Some(a.max(b)),
+    };
+    let backdrop_blurred = decoration.active.backdrop_blur && decoration.inactive.backdrop_blur;
+    (opacity, backdrop_cap_nits, backdrop_blurred)
+}
+
+fn resolve_theme(raw: RawTheme, sdr_white_nits: f32) -> ThemeConfig {
+    ThemeConfig {
+        enable: raw.enable,
+        output_path: expand_tilde(raw.output_path),
+        on_change: raw.on_change,
+        target_lc: raw.target_lc.clamp(0.0, 106.0),
+        opacity: raw.opacity,
+        backdrop_cap_nits: raw.backdrop_cap_nits,
+        backdrop_blurred: raw.backdrop_blurred,
+        sdr_white_nits,
+    }
+}
+
+#[derive(Deserialize)]
+struct RawTheme {
+    #[serde(default)]
+    enable: bool,
+    #[serde(default = "default_theme_output_path")]
+    output_path: String,
+    #[serde(default)]
+    on_change: Option<String>,
+    #[serde(default = "default_theme_target_lc")]
+    target_lc: f32,
+    #[serde(default)]
+    opacity: Option<f32>,
+    #[serde(default)]
+    backdrop_cap_nits: Option<f32>,
+    #[serde(default)]
+    backdrop_blurred: Option<bool>,
+}
+
+impl Default for RawTheme {
+    fn default() -> Self {
+        RawTheme {
+            enable: false,
+            output_path: default_theme_output_path(),
+            on_change: None,
+            target_lc: default_theme_target_lc(),
+            opacity: None,
+            backdrop_cap_nits: None,
+            backdrop_blurred: None,
+        }
+    }
+}
+
+fn default_theme_output_path() -> String {
+    "~/.cache/rubix/theme.json".to_string()
+}
+
+fn default_theme_target_lc() -> f32 {
+    crate::theme::LC_BODY
 }
 
 /// Resolved placement for one physical output, matched by connector name
@@ -315,6 +451,10 @@ struct RawConfig {
     // box with no separate setup.
     #[serde(default)]
     idle: RawIdle,
+    // Optional section: a config omitting [theme] leaves the feature off --
+    // no solve, no file write, no spawn. See `ThemeConfig::enable`.
+    #[serde(default)]
+    theme: RawTheme,
 }
 
 #[derive(Deserialize, Default)]
@@ -430,7 +570,7 @@ fn default_inner_gap() -> u32 {
     10
 }
 
-fn default_sdr_white_nits() -> f32 {
+pub(crate) fn default_sdr_white_nits() -> f32 {
     crate::hdr_shaders::SDR_WHITE_NITS
 }
 
@@ -513,6 +653,7 @@ impl Config {
                 enabled: raw.idle.enabled,
                 screen_off_seconds: raw.idle.screen_off_seconds,
             },
+            theme: resolve_theme(raw.theme, sdr_white_nits),
         }
     }
 

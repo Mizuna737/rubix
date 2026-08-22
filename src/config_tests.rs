@@ -982,3 +982,92 @@
             "the shipped default config must not warn about itself"
         );
     }
+
+    // ---- theme ----
+
+    fn theme_from(toml_body: &str) -> ThemeConfig {
+        let raw: RawTheme = toml::from_str(toml_body).expect("theme section parses");
+        resolve_theme(raw, crate::hdr_shaders::SDR_WHITE_NITS)
+    }
+
+    #[test]
+    fn theme_is_disabled_and_unopinionated_by_default() {
+        let theme = ThemeConfig::default();
+        assert!(!theme.enable);
+        assert!(theme.opacity.is_none());
+        assert!(theme.backdrop_cap_nits.is_none());
+        assert!(theme.backdrop_blurred.is_none());
+        assert_eq!(theme.target_lc, crate::theme::LC_BODY);
+    }
+
+    #[test]
+    fn theme_output_path_expands_tilde() {
+        let theme = theme_from("output_path = \"~/somewhere/theme.json\"\n");
+        assert!(!theme.output_path.to_string_lossy().starts_with('~'), "{:?}", theme.output_path);
+        assert!(theme.output_path.ends_with("somewhere/theme.json"), "{:?}", theme.output_path);
+    }
+
+    #[test]
+    fn theme_target_lc_clamps_to_the_apca_range() {
+        let low = theme_from("target_lc = -10.0\n");
+        assert_eq!(low.target_lc, 0.0);
+        let high = theme_from("target_lc = 999.0\n");
+        assert_eq!(high.target_lc, 106.0);
+    }
+
+    #[test]
+    fn worst_case_opacity_is_the_lower_of_active_and_inactive() {
+        // A more transparent window shows more wallpaper, so it binds the
+        // theme harder -- the solve must key off whichever is lower.
+        let deco = decoration_from("active_opacity = 0.95\ninactive_opacity = 0.75\n");
+        let (opacity, _, _) = worst_case_backdrop_params(&deco);
+        assert_eq!(opacity, 0.75);
+    }
+
+    #[test]
+    fn an_uncapped_style_beats_a_capped_one_for_the_worst_case_backdrop() {
+        // Only inactive tonemaps; active leaves the backdrop uncapped, which
+        // is strictly worse (more of the raw wallpaper can bleed through) and
+        // must win regardless of which style is "lower".
+        let deco = decoration_from(
+            "active_backdrop_tonemap = false\ninactive_backdrop_tonemap = true\nbackdrop_luminance_nits = 40.0\n",
+        );
+        let (_, cap, _) = worst_case_backdrop_params(&deco);
+        assert!(cap.is_none(), "an uncapped style must win over a capped one, got {cap:?}");
+    }
+
+    #[test]
+    fn both_styles_capped_takes_the_higher_of_the_two_ceilings() {
+        let deco = decoration_from(
+            "active_backdrop_tonemap = true\ninactive_backdrop_tonemap = true\nbackdrop_luminance_nits = 40.0\n",
+        );
+        let (_, cap, _) = worst_case_backdrop_params(&deco);
+        // Both styles share one global `backdrop_luminance_nits`, so this
+        // pins the case where they agree rather than diverge.
+        assert_eq!(cap, Some(40.0));
+    }
+
+    #[test]
+    fn blur_is_the_worst_case_only_when_both_styles_blur() {
+        // A sharp backdrop keeps a small bright highlight at full strength
+        // (see theme.rs's p95/p99 note), so ANY unblurred style is the worse
+        // case and must win.
+        let deco = decoration_from("active_backdrop_blur = true\ninactive_backdrop_blur = false\n");
+        let (_, _, blurred) = worst_case_backdrop_params(&deco);
+        assert!(!blurred);
+    }
+
+    #[test]
+    fn an_explicit_theme_override_wins_over_the_derived_worst_case() {
+        let deco = decoration_from("active_opacity = 0.95\ninactive_opacity = 0.75\n");
+        let theme = ThemeConfig { opacity: Some(0.5), ..ThemeConfig::default() };
+        let params = theme.solve_params(&deco);
+        assert_eq!(params.opacity, 0.5, "an explicit override must not be overridden by the derived value");
+    }
+
+    #[test]
+    fn an_absent_theme_override_falls_back_to_the_derived_worst_case() {
+        let deco = decoration_from("active_opacity = 0.95\ninactive_opacity = 0.75\n");
+        let params = ThemeConfig::default().solve_params(&deco);
+        assert_eq!(params.opacity, 0.75);
+    }

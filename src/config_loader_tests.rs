@@ -231,6 +231,7 @@ fn the_schema_matches_the_raw_structs() {
         ("RawAnimation", ANIMATION_SCHEMA),
         ("RawInput", INPUT_SCHEMA),
         ("RawIdle", IDLE_SCHEMA),
+        ("RawTheme", THEME_SCHEMA),
     ];
 
     let mut problems = Vec::new();

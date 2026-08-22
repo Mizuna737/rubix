@@ -104,7 +104,17 @@ enum Reply {
     // reloaded with problems in it (see `broadcast_config_errors`). A bar
     // reading this stream must therefore match on `type` rather than assuming
     // every line is a `state` -- this is the first message that is not one.
+    // `ThemeChanged`, below, is the same story with a different trigger.
     ConfigError { messages: Vec<String> },
+    // Pushed unsolicited to every subscriber whenever `[theme]` is enabled and
+    // the wallpaper theme is (re)solved -- on wallpaper resolve/set, on a
+    // slideshow advance, and on any config change that alters the solve
+    // inputs (see `RubixState::apply_theme_update`). Carries the same shape
+    // `rubix theme` prints on stdout (see `handle_theme_subcommand` in
+    // main.rs) and the same JSON written to `[theme] output_path`, so a
+    // subscriber and a file-watcher agree on one format. As with
+    // `ConfigError`, a bar reading this stream must match on `type`.
+    ThemeChanged { theme: serde_json::Value },
     Error { message: String },
 }
 
@@ -300,6 +310,27 @@ pub(crate) fn broadcast_snapshot(state: &RubixState, registry: &ClientRegistry) 
     }
     let snapshot = build_snapshot(state);
     let Ok(mut line) = serde_json::to_string(&Reply::State(snapshot)) else {
+        return;
+    };
+    line.push('\n');
+    clients.retain_mut(|client| {
+        if !client.subscribed.get() {
+            return true;
+        }
+        client.write_stream.write_all(line.as_bytes()).is_ok()
+    });
+}
+
+/// Push the freshly solved theme to every subscriber, out of band from the
+/// snapshot stream -- same posture as `broadcast_config_errors`: a discrete
+/// event tied to one wallpaper/config change, not coalesced.
+pub(crate) fn broadcast_theme_changed(registry: &ClientRegistry, theme: &serde_json::Value) {
+    let mut clients = registry.borrow_mut();
+    if !clients.iter().any(|c| c.subscribed.get()) {
+        return;
+    }
+    let reply = Reply::ThemeChanged { theme: theme.clone() };
+    let Ok(mut line) = serde_json::to_string(&reply) else {
         return;
     };
     line.push('\n');

@@ -347,6 +347,15 @@ const LAYOUT_SCHEMA: &[(&str, Schema)] =
 const ANIMATION_SCHEMA: &[(&str, Schema)] = &[("duration_ms", Schema::Leaf)];
 const INPUT_SCHEMA: &[(&str, Schema)] = &[("focus_follows_mouse", Schema::Leaf)];
 const DIAGNOSTICS_SCHEMA: &[(&str, Schema)] = &[("config_errors", Schema::Leaf)];
+const THEME_SCHEMA: &[(&str, Schema)] = &[
+    ("enable", Schema::Leaf),
+    ("output_path", Schema::Leaf),
+    ("on_change", Schema::Leaf),
+    ("target_lc", Schema::Leaf),
+    ("opacity", Schema::Leaf),
+    ("backdrop_cap_nits", Schema::Leaf),
+    ("backdrop_blurred", Schema::Leaf),
+];
 
 const ROOT_SCHEMA: &[(&str, Schema)] = &[
     ("layout", Schema::Table(LAYOUT_SCHEMA)),
@@ -360,6 +369,7 @@ const ROOT_SCHEMA: &[(&str, Schema)] = &[
     ("output", Schema::ArrayOfTables(OUTPUT_SCHEMA)),
     ("wallpaper", Schema::Table(WALLPAPER_SCHEMA)),
     ("idle", Schema::Table(IDLE_SCHEMA)),
+    ("theme", Schema::Table(THEME_SCHEMA)),
 ];
 
 /// Report every key in `table` that `RawConfig` does not recognise, naming

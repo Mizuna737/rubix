@@ -506,6 +506,9 @@ impl RubixState {
                 if let Some(n) = self.xdisplay {
                     cmd.env("DISPLAY", format!(":{n}"));
                 }
+                // Newly launched apps pick up the current wallpaper theme
+                // this way; see `RubixState::theme_env`.
+                cmd.envs(self.theme_env.iter().cloned());
                 cmd.spawn().ok();
             },
             NavAction::Quit => {

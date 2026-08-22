@@ -214,6 +214,11 @@ pub struct PrefetchedWallpaper {
     /// at the wrong strength.
     blur_radius: u32,
     result: Result<Decoded, String>,
+    /// The palette extracted from the same decode, off the compositor thread,
+    /// when theming is enabled. Computed here rather than re-decoding later --
+    /// the pixels are already in hand on this worker thread and extraction
+    /// only costs a clustering pass over them, not a second decode.
+    palette: Option<crate::palette::Palette>,
 }
 
 /// File extensions scanned when a directory is given. Matches what
@@ -287,6 +292,24 @@ pub struct WallpaperManager {
     /// `None` in tests and before `main` wires the channel up, in which case
     /// prefetching is simply skipped and swaps decode inline.
     decode_tx: Option<calloop::channel::Sender<PrefetchedWallpaper>>,
+    /// Palette extracted alongside each decode, keyed like `loaded`. Kept
+    /// separate rather than folded into `Wallpaper` so the render path (which
+    /// touches `Wallpaper` every frame) never has to know theming exists.
+    /// Populated only when `theme_params` is `Some` -- see `resolve`.
+    palettes: HashMap<PathBuf, crate::palette::Palette>,
+    /// Solve inputs for the theme, or `None` when `[theme] enable` is false.
+    /// Set by `RubixState` from the resolved config; `None` skips palette
+    /// extraction entirely; see `set_theme_params`.
+    theme_params: Option<crate::theme::ThemeParams>,
+    /// The theme solved for the current default wallpaper, and the path it
+    /// was solved from. Recomputed whenever the default wallpaper or
+    /// `theme_params` changes -- see `recompute_theme`.
+    current_theme: Option<(PathBuf, crate::theme::Theme)>,
+    /// Set whenever `current_theme` changes; cleared by `take_theme_update`.
+    /// A dirty flag rather than change-detection on the `Theme` value itself,
+    /// matching `RubixState::ipc_dirty`'s pattern -- the caller drains it once
+    /// per relevant event rather than diffing structs.
+    theme_dirty: bool,
 }
 
 impl Default for WallpaperManager {
@@ -306,6 +329,10 @@ impl Default for WallpaperManager {
             prefetch: None,
             inflight: None,
             decode_tx: None,
+            palettes: HashMap::new(),
+            theme_params: None,
+            current_theme: None,
+            theme_dirty: false,
         }
     }
 }
@@ -408,12 +435,13 @@ impl WallpaperManager {
             }
         }
 
+        let palette_sdr_white_nits = self.theme_params.as_ref().map(|p| p.sdr_white_nits);
         for path in &wanted {
             if self.loaded.contains_key(path) {
                 continue;
             }
-            match load(path, self.scale, self.backdrop_blur_radius) {
-                Ok(wallpaper) => {
+            match load(path, self.scale, self.backdrop_blur_radius, palette_sdr_white_nits) {
+                Ok((wallpaper, palette)) => {
                     tracing::info!(
                         "wallpaper {}: {}x{} {:?}",
                         path.display(),
@@ -422,6 +450,9 @@ impl WallpaperManager {
                         wallpaper.decode,
                     );
                     self.loaded.insert(path.clone(), wallpaper);
+                    if let Some(palette) = palette {
+                        self.palettes.insert(path.clone(), palette);
+                    }
                 }
                 Err(e) => problems.push(format!("wallpaper {}: {e}", path.display())),
             }
@@ -430,7 +461,9 @@ impl WallpaperManager {
         // CPU memory plus the same again on the GPU, so this is worth doing
         // eagerly rather than letting an edited config accumulate old images.
         self.loaded.retain(|path, _| wanted.contains(path));
+        self.palettes.retain(|path, _| wanted.contains(path));
         self.prime_prefetch();
+        self.recompute_theme();
         problems
     }
 
@@ -443,10 +476,14 @@ impl WallpaperManager {
     pub(crate) fn set(&mut self, output: Option<&str>, path: &Path) -> Result<(), String> {
         let path = path.to_path_buf();
         if !self.loaded.contains_key(&path) {
-            let wallpaper =
-                load(&path, self.scale, self.backdrop_blur_radius)
+            let palette_sdr_white_nits = self.theme_params.as_ref().map(|p| p.sdr_white_nits);
+            let (wallpaper, palette) =
+                load(&path, self.scale, self.backdrop_blur_radius, palette_sdr_white_nits)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             self.loaded.insert(path.clone(), wallpaper);
+            if let Some(palette) = palette {
+                self.palettes.insert(path.clone(), palette);
+            }
         }
         match output {
             Some(name) => {
@@ -460,6 +497,7 @@ impl WallpaperManager {
             }
         }
         self.evict_unreferenced();
+        self.recompute_theme();
         Ok(())
     }
 
@@ -500,14 +538,26 @@ impl WallpaperManager {
         let Some(tx) = self.decode_tx.clone() else { return };
         let scale = self.scale;
         let blur_radius = self.backdrop_blur_radius;
+        let palette_sdr_white_nits = self.theme_params.as_ref().map(|p| p.sdr_white_nits);
         self.inflight = Some(next.clone());
         // A detached thread per image rather than a pool: one decode every
         // `interval` seconds, and the thread exits as soon as it has sent.
         std::thread::spawn(move || {
             let result = decode_file(&next, scale, blur_radius);
+            // Extracted here, alongside the decode this thread already paid
+            // for, rather than back on the compositor thread -- the pixels
+            // are already in hand and a second decode would be needed to get
+            // them there. `None` when theming is off, so a wallpaper-only
+            // config pays nothing extra.
+            let palette = match (&result, palette_sdr_white_nits) {
+                (Ok(decoded), Some(nits)) => decoded.frames.first().and_then(|frame| {
+                    crate::palette::extract(&frame.pixels, decoded.size, decoded.fourcc, decoded.decode, nits)
+                }),
+                _ => None,
+            };
             // A send failure means the compositor is gone; there is nothing
             // useful to do about it and nothing to clean up.
-            let _ = tx.send(PrefetchedWallpaper { path: next, scale, blur_radius, result });
+            let _ = tx.send(PrefetchedWallpaper { path: next, scale, blur_radius, result, palette });
         });
     }
 
@@ -527,6 +577,9 @@ impl WallpaperManager {
         }
         match message.result {
             Ok(decoded) => {
+                if let Some(palette) = message.palette {
+                    self.palettes.insert(message.path.clone(), palette);
+                }
                 self.prefetch = Some((message.path, Wallpaper::new(decoded)));
             }
             Err(e) => {
@@ -585,6 +638,7 @@ impl WallpaperManager {
         self.default_path = Some(path);
         self.evict_unreferenced();
         self.prime_prefetch();
+        self.recompute_theme();
         true
     }
 
@@ -593,6 +647,45 @@ impl WallpaperManager {
         self.loaded.retain(|path, _| {
             Some(path) == default.as_ref() || self.assignments.values().any(|p| p == path)
         });
+        self.palettes.retain(|path, _| self.loaded.contains_key(path));
+    }
+
+    /// Set (or clear) the solve inputs for the theme. Called by `RubixState`
+    /// after every config resolve/reload -- `None` when `[theme] enable` is
+    /// false, which stops palette extraction at the source (see `resolve`,
+    /// `set`, `prime_prefetch`) rather than just discarding a computed theme
+    /// nobody asked for.
+    pub(crate) fn set_theme_params(&mut self, params: Option<crate::theme::ThemeParams>) {
+        self.theme_params = params;
+        self.recompute_theme();
+    }
+
+    /// Re-solve the theme for the current default wallpaper, if theming is on
+    /// and that wallpaper's palette has been extracted.
+    ///
+    /// A no-op (not a clear-to-`None`) when the palette is not yet ready --
+    /// this fires on every wallpaper-lifecycle event, including the moment a
+    /// slideshow starts decoding its first image, and the previous theme
+    /// staying up for one extra tick is preferable to visibly blanking it.
+    fn recompute_theme(&mut self) {
+        let Some(params) = self.theme_params else { return };
+        let Some(path) = self.default_path.clone() else { return };
+        let Some(palette) = self.palettes.get(&path) else { return };
+        if let Some(theme) = crate::theme::solve(palette, &params) {
+            self.current_theme = Some((path, theme));
+            self.theme_dirty = true;
+        }
+    }
+
+    /// Take the current theme if it has changed since the last call, so the
+    /// caller (`RubixState`) writes/broadcasts it exactly once per change
+    /// rather than on every wallpaper-lifecycle tick.
+    pub(crate) fn take_theme_update(&mut self) -> Option<(PathBuf, crate::theme::Theme)> {
+        if !self.theme_dirty {
+            return None;
+        }
+        self.theme_dirty = false;
+        self.current_theme.clone()
     }
 
     fn path_for(&self, output: &str) -> Option<&PathBuf> {
@@ -1224,13 +1317,28 @@ fn blur_frame(pixels: &[u8], size: Size<i32, BufferCoords>, fourcc: Fourcc, radi
     }
 }
 
-/// Decode an image file into a [`Wallpaper`], dispatching on extension.
+/// Decode an image file into a [`Wallpaper`], dispatching on extension, and
+/// -- when `palette_sdr_white_nits` is `Some` -- extract its palette from the
+/// same decode rather than paying for a second one later. `None` skips
+/// extraction entirely, which is the common case when theming is off.
 ///
 /// AVIF is the only format that carries a transfer function Rubix cares about,
 /// so it is the only one that can yield a `DecodeKind` other than `Sdr`. PNG
 /// and JPEG are always SDR by construction.
-fn load(path: &Path, scale: f32, blur_radius: u32) -> Result<Wallpaper, String> {
-    Ok(Wallpaper::new(decode_file(path, scale, blur_radius)?))
+fn load(
+    path: &Path,
+    scale: f32,
+    blur_radius: u32,
+    palette_sdr_white_nits: Option<f32>,
+) -> Result<(Wallpaper, Option<crate::palette::Palette>), String> {
+    let decoded = decode_file(path, scale, blur_radius)?;
+    let palette = palette_sdr_white_nits.and_then(|nits| {
+        decoded
+            .frames
+            .first()
+            .and_then(|frame| crate::palette::extract(&frame.pixels, decoded.size, decoded.fourcc, decoded.decode, nits))
+    });
+    Ok((Wallpaper::new(decoded), palette))
 }
 
 /// The pure half of [`load`]: file in, pixels and colour metadata out.
@@ -1256,6 +1364,33 @@ fn decode_file(path: &Path, scale: f32, blur_radius: u32) -> Result<Decoded, Str
         .first()
         .and_then(|frame| blur_frame(&frame.pixels, decoded.size, decoded.fourcc, blur_radius));
     Ok(decoded)
+}
+
+/// Decode a file and extract its palette, without a renderer or a running
+/// compositor. Backs the `rubix palette` subcommand, which is how a palette can
+/// be inspected against a real wallpaper before anything is themed from it.
+///
+/// `scale` is the wallpaper's `luminance_scale`: the palette describes the
+/// wallpaper *as displayed*, not as authored, because that is what text will
+/// actually sit on.
+pub(crate) fn palette_for_file(
+    path: &Path,
+    scale: f32,
+    sdr_white_nits: f32,
+) -> Result<crate::palette::Palette, String> {
+    // Blur radius zero: the frosted copy is a render-time convenience and
+    // costs a full second buffer, and blurring cannot change which colours are
+    // present -- only how they are spatially arranged.
+    let decoded = decode_file(path, scale, 0)?;
+    let frame = decoded.frames.first().ok_or("decoded image has no frames")?;
+    crate::palette::extract(
+        &frame.pixels,
+        decoded.size,
+        decoded.fourcc,
+        decoded.decode,
+        sdr_white_nits,
+    )
+    .ok_or_else(|| format!("cannot extract a palette from {:?} pixels", decoded.fourcc))
 }
 
 /// PNG/JPEG via the `image` crate. Always 8-bit sRGB.
@@ -1861,6 +1996,7 @@ mod tests {
             scale: 1.0,
             blur_radius: 0,
             result: decode_file(&fixture("sdr16.avif"), 1.0, 0),
+            palette: None,
         });
         assert!(manager.advance_slideshow(Instant::now() + Duration::from_secs(2)));
         assert!(!manager.output_has_hdr("DP-3"), "now on the SDR image");
@@ -1881,6 +2017,7 @@ mod tests {
             scale: 0.5, // manager is at 1.0
             blur_radius: 0,
             result: decode_file(&fixture("sdr16.avif"), 0.5, 0),
+            palette: None,
         });
         assert!(manager.prefetch.is_none(), "stale gain must not be queued");
     }
@@ -1903,6 +2040,7 @@ mod tests {
             scale: 1.0,
             blur_radius: 0,
             result: Err("not an image".into()),
+            palette: None,
         });
         let slideshow = manager.slideshow.as_ref().unwrap();
         assert_eq!(slideshow.entries.len(), 2);
@@ -1924,6 +2062,7 @@ mod tests {
             scale: 1.0,
             blur_radius: 0,
             result: decode_file(&fixture("sdr16.avif"), 1.0, 0),
+            palette: None,
         });
         manager.advance_slideshow(Instant::now() + Duration::from_secs(2));
         assert_eq!(manager.loaded.len(), 1, "the previous image must be evicted");
@@ -1958,6 +2097,7 @@ mod tests {
             scale: 1.0,
             blur_radius: 0,
             result: decode_file(&fixture("sdr16.avif"), 1.0, 0),
+            palette: None,
         });
         assert!(manager.advance_slideshow(Instant::now() + Duration::from_secs(2)));
         assert_eq!(manager.slideshow.as_ref().unwrap().index, 1);
@@ -2098,6 +2238,64 @@ mod tests {
         // `derive(Default)` would give 0.0 here and decode every wallpaper to
         // black -- a failure that looks exactly like "the wallpaper is broken".
         assert_eq!(WallpaperManager::default().scale, 1.0);
+    }
+
+    // --- theme -------------------------------------------------------------
+
+    #[test]
+    fn theme_params_being_unset_computes_no_theme() {
+        // The default: a config that never turns theming on must never pay
+        // for palette extraction or produce a theme to write.
+        let mut manager = WallpaperManager::default();
+        let config = crate::config::WallpaperConfig {
+            path: Some(fixture("pq16.avif")),
+            mode: WallpaperMode::Fill,
+            luminance_scale: 1.0,
+            interval_seconds: 300,
+            sdr_reference_nits: 203.0,
+        };
+        manager.resolve(&config, &[], &crate::config::DecorationConfig::default());
+        assert!(manager.take_theme_update().is_none());
+    }
+
+    #[test]
+    fn resolving_with_theme_params_set_produces_a_theme_for_the_default_wallpaper() {
+        let mut manager = WallpaperManager::default();
+        manager.set_theme_params(Some(crate::theme::ThemeParams::default()));
+        let config = crate::config::WallpaperConfig {
+            path: Some(fixture("pq16.avif")),
+            mode: WallpaperMode::Fill,
+            luminance_scale: 1.0,
+            interval_seconds: 300,
+            sdr_reference_nits: 203.0,
+        };
+        manager.resolve(&config, &[], &crate::config::DecorationConfig::default());
+        let (path, _theme) = manager.take_theme_update().expect("theme should be solved");
+        assert_eq!(path, fixture("pq16.avif"));
+        // A second read without a change in between must not repeat the
+        // update -- `take_theme_update` is a drain, not a peek.
+        assert!(manager.take_theme_update().is_none());
+    }
+
+    #[test]
+    fn switching_theme_params_off_stops_further_updates() {
+        let mut manager = WallpaperManager::default();
+        manager.set_theme_params(Some(crate::theme::ThemeParams::default()));
+        let config = crate::config::WallpaperConfig {
+            path: Some(fixture("pq16.avif")),
+            mode: WallpaperMode::Fill,
+            luminance_scale: 1.0,
+            interval_seconds: 300,
+            sdr_reference_nits: 203.0,
+        };
+        manager.resolve(&config, &[], &crate::config::DecorationConfig::default());
+        assert!(manager.take_theme_update().is_some());
+
+        manager.set_theme_params(None);
+        assert!(
+            manager.take_theme_update().is_none(),
+            "turning theming off must not leave a stale theme to be picked up"
+        );
     }
 
     // --- backdrop blur -----------------------------------------------------

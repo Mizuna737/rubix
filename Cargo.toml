@@ -19,6 +19,18 @@ libavif-sys = { version = "0.17", default-features = false, features = ["codec-d
 # SDR formats only -- an HDR image always arrives as AVIF. Trimmed to the two
 # formats worth supporting rather than pulling in every decoder image ships.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Palette extraction from the decoded wallpaper (src/palette.rs). Default
+# features off deliberately: they pull in a second `image`, plus the deprecated
+# `structopt`, for a CLI this does not use. Disabled, the crate is a generic
+# k-means over `rand`, which the tree already builds -- one new package.
+# It is used for its `Calculate` trait, implemented here on an ICtCp point, so
+# clustering happens in absolute luminance rather than through a colour type
+# that cannot express it.
+kmeans_colors = { version = "0.7", default-features = false }
+# Not a new package: `kmeans_colors` already pulls this in, and the version is
+# pinned by it. Named directly only because implementing its `Calculate` trait
+# means writing `impl Rng` in a signature.
+rand = { version = "0.9", default-features = false }
 bitflags = "2"
 calloop-notify = "0.2"
 pipewire = { version = "0.10", features = ["v0_3_65"] }
