@@ -768,13 +768,9 @@ impl WallpaperManager {
         let dst_physical = window_rect.size.to_f64().to_physical(scale);
         let dst_w = dst_physical.w.max(1.0);
         let dst_h = dst_physical.h.max(1.0);
-        let refraction = Refraction {
-            uv_per_px: (
-                ((crop.size.w / buffer_w) / dst_w) as f32,
-                ((crop.size.h / buffer_h) / dst_h) as f32,
-            ),
-            ..refraction
-        };
+        let (uv_origin, uv_per_px) =
+            refraction_mapping(crop, (buffer_w, buffer_h), (dst_w, dst_h));
+        let refraction = Refraction { uv_origin, uv_per_px, ..refraction };
         let refract = refraction.strength > 0.0;
 
         // Falls back to the sharp buffer if there is no blurred one -- either
@@ -863,6 +859,36 @@ impl WallpaperManager {
 /// Split out as a pure function because getting it wrong is invisible
 /// everywhere except on a screen: the wrong arm still builds, still logs
 /// clean, and still draws something.
+/// The `(uv_origin, uv_per_px)` pair that lets the refraction shader undo a
+/// backdrop quad's crop and recover window-local pixels.
+///
+/// This is the whole of the window-versus-desktop anchoring question, which is
+/// why it is a named function with a test rather than four lines inline. A
+/// backdrop quad samples a *slice* of the shared wallpaper, so its `v_coords`
+/// neither start at zero nor span the full texture, and both facts change as
+/// the window moves. Feeding raw `v_coords` to the facet field anchored the
+/// crystal to the wallpaper: dragging a window scooped up different facets the
+/// whole way across, instead of carrying its own.
+///
+/// The invariant the test pins is a round trip -- `(v_coords - uv_origin) /
+/// uv_per_px` must be `0` at the crop's top-left and the quad's size in
+/// physical pixels at its bottom-right.
+pub(crate) fn refraction_mapping(
+    crop: Rectangle<f64, Logical>,
+    buffer: (f64, f64),
+    dst_physical: (f64, f64),
+) -> ((f32, f32), (f32, f32)) {
+    let (buffer_w, buffer_h) = buffer;
+    let (dst_w, dst_h) = dst_physical;
+    (
+        ((crop.loc.x / buffer_w) as f32, (crop.loc.y / buffer_h) as f32),
+        (
+            ((crop.size.w / buffer_w) / dst_w) as f32,
+            ((crop.size.h / buffer_h) / dst_h) as f32,
+        ),
+    )
+}
+
 pub(crate) fn backdrop_program(
     tonemap: bool,
     kind: DecodeKind,
@@ -2171,6 +2197,52 @@ mod tests {
     }
 
     // --- backdrop crop -----------------------------------------------------
+
+    #[test]
+    fn the_refraction_mapping_undoes_the_crop_to_window_local_pixels() {
+        // A window sitting well away from the wallpaper's origin, which is the
+        // case that was broken: at the origin the bug is invisible.
+        let crop = Rectangle::<f64, Logical>::new(
+            Point::from((1200.0, 700.0)),
+            Size::from((640.0, 360.0)),
+        );
+        let buffer = (3840.0, 2160.0);
+        let dst = (1280.0, 720.0);
+        let (origin, per_px) = refraction_mapping(crop, buffer, dst);
+
+        // Top-left of the crop must land on window pixel (0, 0).
+        let u0 = (crop.loc.x / buffer.0) as f32;
+        let v0 = (crop.loc.y / buffer.1) as f32;
+        assert!(((u0 - origin.0) / per_px.0).abs() < 1e-3);
+        assert!(((v0 - origin.1) / per_px.1).abs() < 1e-3);
+
+        // Bottom-right must land on the quad's size in physical pixels.
+        let u1 = ((crop.loc.x + crop.size.w) / buffer.0) as f32;
+        let v1 = ((crop.loc.y + crop.size.h) / buffer.1) as f32;
+        assert!((((u1 - origin.0) / per_px.0) - dst.0 as f32).abs() < 1e-1);
+        assert!((((v1 - origin.1) / per_px.1) - dst.1 as f32).abs() < 1e-1);
+    }
+
+    #[test]
+    fn a_window_that_moves_keeps_its_own_facet_coordinates() {
+        // The same window at two positions over the wallpaper. Window-local
+        // coordinates must come out identical, or the facets slide.
+        let buffer = (3840.0, 2160.0);
+        let dst = (900.0, 560.0);
+        let size = Size::from((450.0, 280.0));
+        let a = Rectangle::<f64, Logical>::new(Point::from((300.0, 400.0)), size);
+        let b = Rectangle::<f64, Logical>::new(Point::from((2100.0, 900.0)), size);
+        let (oa, pa) = refraction_mapping(a, buffer, dst);
+        let (ob, pb) = refraction_mapping(b, buffer, dst);
+
+        for frac in [0.0f32, 0.25, 0.5, 1.0] {
+            let ua = (a.loc.x / buffer.0) as f32 + frac * pa.0 * dst.0 as f32;
+            let ub = (b.loc.x / buffer.0) as f32 + frac * pb.0 * dst.0 as f32;
+            let xa = (ua - oa.0) / pa.0;
+            let xb = (ub - ob.0) / pb.0;
+            assert!((xa - xb).abs() < 1e-1, "frac {frac}: {xa} vs {xb}");
+        }
+    }
 
     #[test]
     fn crop_for_window_covering_the_whole_output_recovers_placements_src() {

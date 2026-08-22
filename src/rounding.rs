@@ -136,6 +136,7 @@ float rubixCornerAlpha() {
 /// fracture physically is and energy the wallpaper already had.
 const REFRACT_GLSL: &str = r#"
 uniform float rubix_refract_strength;
+uniform vec2 rubix_refract_uv_origin;
 uniform vec2 rubix_refract_uv_per_px;
 uniform float rubix_refract_facet_size;
 uniform float rubix_refract_dispersion;
@@ -199,7 +200,19 @@ vec4 rubixSampleRefracted() {
     if (rubix_refract_strength <= 0.0) {
         return texture2D(tex, v_coords);
     }
-    vec2 pw = (v_coords * rubix_elem_size + rubix_elem_offset)
+    // Window-local pixels, and emphatically not `v_coords * rubix_elem_size +
+    // rubix_elem_offset` the way the corner mask computes them. That works for
+    // a window's own surfaces, whose `v_coords` span their whole texture, but a
+    // backdrop quad is a *crop* of the shared wallpaper: its `v_coords` cover
+    // only the slice under the window and slide as the window moves, and its
+    // `rubix_elem_offset` is the quad's position on the output rather than an
+    // offset within a window. Using them anchored the crystal to the desktop,
+    // so a window dragged across the screen scooped up a different set of
+    // facets the whole way. Undoing the crop instead pins the facets to the
+    // window, which is what makes it read as a pane of something rather than a
+    // hole onto something.
+    vec2 pw = (v_coords - rubix_refract_uv_origin)
+            / max(rubix_refract_uv_per_px, vec2(1e-9))
             / max(rubix_refract_facet_size, 1.0);
 
     // Plane families are exactly periodic on their own, and a periodic lattice
@@ -329,7 +342,7 @@ fn with_rubix_stages(source: &str) -> String {
     }
 }
 
-fn uniform_names() -> [UniformName<'static>; 8] {
+fn uniform_names() -> [UniformName<'static>; 9] {
     [
         UniformName::new("rubix_radius", UniformType::_1f),
         UniformName::new("rubix_win_size", UniformType::_2f),
@@ -340,6 +353,7 @@ fn uniform_names() -> [UniformName<'static>; 8] {
         // `RoundedElement::new` pushes all four unconditionally anyway rather
         // than relying on that.
         UniformName::new("rubix_refract_strength", UniformType::_1f),
+        UniformName::new("rubix_refract_uv_origin", UniformType::_2f),
         UniformName::new("rubix_refract_uv_per_px", UniformType::_2f),
         UniformName::new("rubix_refract_facet_size", UniformType::_1f),
         UniformName::new("rubix_refract_dispersion", UniformType::_1f),
@@ -515,6 +529,12 @@ pub(crate) struct Refraction {
     pub facet_size: f32,
     /// Per-channel spread, `0.0`-`1.0`, before the seam amplification.
     pub dispersion: f32,
+    /// Where this element's `v_coords` start, so the shader can undo the crop
+    /// and recover window-local coordinates. Together with `uv_per_px` this is
+    /// the whole mapping: `(v_coords - uv_origin) / uv_per_px` must come out as
+    /// pixels from the window's own top-left, or the facets anchor to whatever
+    /// the texture is instead of to the window.
+    pub uv_origin: (f32, f32),
     /// How far `v_coords` moves per physical pixel of offset. A backdrop quad
     /// is a source-crop of the wallpaper, so this is the crop's share of the
     /// texture divided by the quad's on-screen size -- it cannot be derived in
@@ -527,6 +547,7 @@ impl Refraction {
         strength: 0.0,
         facet_size: 1.0,
         dispersion: 0.0,
+        uv_origin: (0.0, 0.0),
         uv_per_px: (0.0, 0.0),
     };
 }
@@ -601,6 +622,7 @@ impl<E: Element> RoundedElement<E> {
             Uniform::new("rubix_elem_offset", (offset.x as f32, offset.y as f32)),
             Uniform::new("rubix_elem_size", (geo.size.w as f32, geo.size.h as f32)),
             Uniform::new("rubix_refract_strength", refraction.strength),
+            Uniform::new("rubix_refract_uv_origin", refraction.uv_origin),
             Uniform::new("rubix_refract_uv_per_px", refraction.uv_per_px),
             Uniform::new("rubix_refract_facet_size", refraction.facet_size),
             Uniform::new("rubix_refract_dispersion", refraction.dispersion),
@@ -1063,6 +1085,9 @@ where
                     strength: deco.refract_strength * scale as f32,
                     facet_size: deco.refract_facet_size * scale as f32,
                     dispersion: deco.refract_dispersion,
+                    // Both filled in by `backdrop_element`, which is the only
+                    // place that knows the crop this quad samples through.
+                    uv_origin: (0.0, 0.0),
                     uv_per_px: (0.0, 0.0), // filled in by backdrop_element
                 }
             } else {
