@@ -158,7 +158,20 @@ void main() {
     a += ringCoverage(centred + vec2(0.25, 0.25), winHalf, r);
     a *= 0.25;
 
-    a = clamp(a + dither(v_coords * size) * (1.0 / 512.0), 0.0, 1.0);
+    // Gated to where the ring actually puts something. `a` is exactly zero
+    // across the window's interior and outside the glow, and noise added there
+    // is not dithering, it is light -- the element covers the window inflated
+    // by border and glow and draws *above* it, so that light lands on the
+    // window's own pixels.
+    //
+    // It is invisible in SDR, which is why it went unnoticed: a quarter of an
+    // 8-bit step. Under PQ it is not, because the curve is near-vertical at
+    // black. Premultiplied against a 1200-nit border colour, a lift of 1/1024
+    // in alpha is ~1.2 cd/m^2, which PQ encodes at about 16% of the code
+    // range. Measured on a black interior before this gate: mean 5.7% of range,
+    // peaks at 15.7%. That is the "film grain over HDR windows".
+    float lit = smoothstep(0.0, 1.0 / 255.0, a);
+    a = clamp(a + dither(v_coords * size) * (1.0 / 512.0) * lit, 0.0, 1.0);
 
     // Premultiplied, which is what the renderer blends for.
     gl_FragColor = vec4(rubix_color.rgb * rubix_color.a * a, rubix_color.a * a) * alpha;
