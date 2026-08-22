@@ -1,0 +1,67 @@
+# Desktop-wide colour theme, derived from the current wallpaper.
+#
+# Rubix reads the colours out of the wallpaper it is already displaying, then
+# picks text colours that stay readable through the window's transparency and
+# refraction. The result is written to a file and handed to `on_change`, which
+# re-themes the applications that read it.
+#
+# Colours are re-derived whenever the wallpaper changes, including every
+# slideshow step.
+
+[theme]
+# Turn the whole thing off to leave application themes alone. Off by default:
+# nothing is written, no command runs, and wallpaper decode pays nothing extra.
+enable = false
+
+# Runs after each new theme is written, detached. Point it at a renderer that
+# pushes the colours into your applications.
+# on_change = "~/Scripts/rubixTheme.py"
+
+# How readable body text must be, 0-106. Raise it for crisper, higher-contrast
+# text that drifts toward plain white; lower it for text that keeps more of the
+# wallpaper's colour but is harder to read on a busy background. Below about 60
+# small text becomes a strain.
+target_lc = 75.0
+
+# Where the generated theme is written. Anything wanting the colours can read
+# this file; the path is also exported as $RUBIX_THEME to programs launched
+# from the compositor.
+output_path = "~/.cache/rubix/theme.json"
+
+# Colour window borders from the wallpaper instead of using [decoration]
+# active_color and inactive_color.
+#
+# The focused window's border is an accent colour taken straight out of the
+# wallpaper -- a vivid one that is actually in the image, skipping whatever
+# colour covers most of it, since a border cannot stand out against the very
+# thing behind it. A sunset gives an amber border, a seascape a bright blue.
+# Unfocused windows get a muted version on the wallpaper's own hue, so they
+# settle into the background instead of competing with it.
+#
+# Focus stays obvious because those two are far apart, and because only the
+# focused window draws a glow. Off by default, so a border colour you set by
+# hand is never overridden without asking.
+apply_to_borders = false
+
+# The remaining settings normally look after themselves: the contrast solve
+# reads how see-through your windows actually are from [decoration] and aims at
+# the least readable case. Set them only to override that.
+#
+# Be aware that the automatic choice aims at an UNFOCUSED window, which shows
+# more wallpaper, unblurred and with no brightness limit. If your unfocused
+# windows are set up that way, nothing stays readable against them and every
+# colour is forced to white. Pinning these to your focused window's settings is
+# usually what you want.
+#
+# How much wallpaper to assume shows through a window, where 1.0 is fully
+# opaque. Lower values produce brighter, higher-contrast text.
+# opacity = 0.85
+#
+# How bright the wallpaper behind a window is allowed to get, in nits. Lower it
+# to let the theme keep more colour; remove it to assume the wallpaper's own
+# full brightness, which forces the most cautious theme.
+# backdrop_cap_nits = 100.0
+#
+# Whether to assume the wallpaper behind a window is blurred. Blur evens out
+# small bright spots, so assuming it allows a gentler theme.
+# backdrop_blurred = true

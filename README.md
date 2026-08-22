@@ -11,8 +11,9 @@ standalone on the TTY (udev/DRM/libinput), and the session layer — bars, notif
 keyring, XWayland, native-Wayland Electron — is wired and verified. It is not yet packaged or
 recommended for anyone else's daily use.
 
-See [`docs/design.md`](docs/design.md) for the full design schema and
-[`docs/hdr-status.md`](docs/hdr-status.md) for the colour pipeline.
+See [`docs/design.md`](docs/design.md) for the full design schema,
+[`docs/hdr-status.md`](docs/hdr-status.md) for the colour pipeline, and
+[`docs/theming.md`](docs/theming.md) for wallpaper-derived theming.
 
 ## What works
 
@@ -60,7 +61,7 @@ src/
 ├── config.rs              TOML load / validate / hot-reload
 └── ipc.rs                 Unix-socket control
 config/default/           annotated reference config, split by area
-docs/                      design schema, HDR findings, portal notes
+docs/                      design schema, HDR findings, theming, portal notes
 ```
 
 ## Conventions
