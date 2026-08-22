@@ -998,6 +998,16 @@
         assert!(theme.backdrop_cap_nits.is_none());
         assert!(theme.backdrop_blurred.is_none());
         assert_eq!(theme.target_lc, crate::theme::LC_BODY);
+        // An explicitly configured `active_color` must survive turning theming
+        // on: overriding a colour the user typed, without being asked, is worse
+        // than leaving the border alone.
+        assert!(!theme.apply_to_borders);
+    }
+
+    #[test]
+    fn borders_follow_the_wallpaper_only_when_asked() {
+        assert!(theme_from("apply_to_borders = true\n").apply_to_borders);
+        assert!(!theme_from("enable = true\n").apply_to_borders);
     }
 
     #[test]

@@ -70,6 +70,41 @@ mod apca {
     pub const LO_CLIP: f32 = 0.1;
 }
 
+/// Chroma multiplier and floor for the glow. A glow is the one element allowed
+/// to be genuinely saturated: it is thin, it is transient, and nothing is read
+/// through it, so the legibility cost that keeps text near-neutral does not
+/// apply. The floor matters for near-monochrome wallpapers, where scaling a
+/// swatch's own chroma alone would produce a grey glow.
+const GLOW_CHROMA_GAIN: f32 = 1.8;
+
+/// Minimum PQ intensity for a swatch to be usable as a border colour. Below
+/// this a swatch is effectively black, and its hue is rounding error.
+const GLOW_MIN_SOURCE_INTENSITY: f32 = 0.28;
+
+/// How bright the finished border must be, as its largest display-sRGB
+/// channel.
+///
+/// Saturation and luminance trade against each other at the edge of the gamut:
+/// a hue that sRGB can only just represent stays in gamut at high chroma *only*
+/// while it is very dark. Maximising chroma first therefore picks the dark end
+/// of that trade and yields a near-black border -- which no amount of HDR
+/// luminance can rescue, because scaling a black colour leaves it black.
+/// Brightness is the requirement and chroma is what gets spent to reach it.
+const GLOW_MIN_BRIGHTNESS: f32 = 0.62;
+const GLOW_CHROMA_FLOOR: f32 = 0.07;
+const GLOW_CHROMA_CEILING: f32 = 0.22;
+
+/// Largest sRGB channel the glow may reach before it counts as clipped.
+///
+/// The glow is not solved for contrast the way text is. It is drawn as an HDR
+/// element at `active_luminance_nits`, so its separation from the wallpaper
+/// comes from luminance the compositor applies afterwards -- driving intensity
+/// up here to win a contrast target instead just clips every channel and the
+/// hue washes out to white, which is what a first attempt did on four of six
+/// wallpapers. What the solve owes is the most luminous version of the chosen
+/// hue that still fits in gamut, and the compositor supplies the brightness.
+const GLOW_CLIP_LIMIT: f32 = 0.995;
+
 /// Contrast targets, in APCA `Lc`.
 pub(crate) const LC_BODY: f32 = 75.0;
 pub(crate) const LC_SECONDARY: f32 = 60.0;
@@ -132,6 +167,12 @@ pub(crate) struct Theme {
     pub accent: ThemeColor,
     /// Borders and separators -- non-text, so a lower target.
     pub border: ThemeColor,
+    /// The focused window's border glow. Unlike every other role this one is
+    /// meant to *stand out* rather than recede, so it sits away from the
+    /// accent on the hue circle and is solved against the wallpaper rather
+    /// than against the window background -- a glow spills onto the desktop,
+    /// not onto the content.
+    pub glow: ThemeColor,
     /// Terminal semantics, in ANSI order: red, green, yellow, blue, magenta,
     /// cyan. Hue-anchored so red stays recognisably red, but pulled toward the
     /// wallpaper's chroma so the set reads as one family.
@@ -326,6 +367,135 @@ fn solve_intensity(
     ThemeColor { abs10k, lc }
 }
 
+/// Solve for contrast like `solve_intensity`, but back off chroma until the
+/// result is a colour sRGB can actually show.
+///
+/// A wallpaper made of neon -- pure reds, pure cyans -- yields an accent whose
+/// chroma sits outside the display gamut. Solving intensity against it drives
+/// two channels past 1.0 and a third below 0, and the clamp turns whatever hue
+/// was asked for into a screaming primary: one such wallpaper produced
+/// `#ff00ff`. Reducing chroma keeps the hue and gives up only the saturation
+/// the display could not have shown in the first place.
+fn solve_intensity_in_gamut(
+    hue: f32,
+    chroma: f32,
+    bg_srgb: [f32; 3],
+    target_lc: f32,
+    sdr_white_nits: f32,
+    floor: f32,
+) -> ThemeColor {
+    // Descends all the way to zero chroma, which is always in gamut, so this
+    // cannot fall through to a clamped colour. Stopping short left a wallpaper
+    // of pure primaries with no reachable option and handed back the clipped
+    // result anyway.
+    const STEPS: usize = 12;
+    let mut last = None;
+    for step in 0..=STEPS {
+        let attempt = chroma * (1.0 - step as f32 / STEPS as f32);
+        let solved = solve_intensity(hue, attempt, bg_srgb, target_lc, sdr_white_nits, floor);
+        let raw = abs10k_to_display_srgb_unclamped(solved.abs10k, sdr_white_nits);
+        if raw.iter().all(|&c| (-0.002..=GLOW_CLIP_LIMIT).contains(&c)) {
+            return solved;
+        }
+        last = Some(solved);
+    }
+    // Unreachable in practice -- zero chroma is a neutral -- but a neutral is
+    // still the right answer if it ever is.
+    last.unwrap_or_else(|| {
+        solve_intensity(hue, 0.0, bg_srgb, target_lc, sdr_white_nits, floor)
+    })
+}
+
+/// The most luminous in-gamut form of a hue, for elements whose brightness is
+/// applied later rather than solved here.
+///
+/// Raising intensity at fixed hue and chroma eventually pushes a channel past
+/// 1.0, and clamping that channel is what turns a saturated colour white. So
+/// the search looks for the highest intensity that clips nothing. Chroma is
+/// stepped down only if no intensity works at all, which happens when the
+/// requested chroma sits outside the display gamut for that hue.
+fn solve_vivid(hue: f32, chroma: f32, sdr_white_nits: f32) -> ([f32; 3], f32) {
+    let brightest_in_gamut = |attempt: f32| -> Option<([f32; 3], f32)> {
+        let in_gamut = |intensity: f32| -> Option<[f32; 3]> {
+            let abs10k = crate::palette::ictcp_to_abs10k(from_polar(intensity, hue, attempt));
+            let srgb = abs10k_to_display_srgb_unclamped(abs10k, sdr_white_nits);
+            let fits = srgb.iter().all(|&c| (-0.002..=GLOW_CLIP_LIMIT).contains(&c));
+            fits.then_some(abs10k)
+        };
+        // The in-gamut band for a saturated hue is an interval, not everything
+        // below a ceiling: a dark saturated colour is out of gamut too. Scan
+        // for the band first, then refine its top edge.
+        let mut anchor = None;
+        for coarse in 0..40 {
+            let intensity = 0.05 + 0.9 * (coarse as f32) / 39.0;
+            if in_gamut(intensity).is_some() {
+                anchor = Some(intensity);
+            } else if anchor.is_some() {
+                break; // past the top of the band
+            }
+        }
+        let anchor = anchor?;
+        let (mut lo, mut hi) = (anchor, 1.0f32);
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            if in_gamut(mid).is_some() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let abs10k = in_gamut(lo)?;
+        let brightness = abs10k_to_display_srgb(abs10k, sdr_white_nits)
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        Some((abs10k, brightness))
+    };
+
+    // Descending chroma, taking the first attempt bright enough to read as a
+    // border. Chroma is spent to buy brightness rather than the other way
+    // round -- see `GLOW_MIN_BRIGHTNESS`.
+    let mut best: Option<([f32; 3], f32, f32)> = None;
+    for step in 0..10 {
+        let attempt = chroma * (1.0 - 0.09 * step as f32);
+        let Some((abs10k, brightness)) = brightest_in_gamut(attempt) else { continue };
+        if brightness >= GLOW_MIN_BRIGHTNESS {
+            return (abs10k, attempt);
+        }
+        if best.is_none_or(|(_, _, best_brightness)| brightness > best_brightness) {
+            best = Some((abs10k, attempt, brightness));
+        }
+    }
+    if let Some((abs10k, attempt, _)) = best {
+        return (abs10k, attempt);
+    }
+    // Every chroma failed, which means the hue itself is unreachable; fall back
+    // to a neutral rather than returning something out of gamut.
+    let abs10k = crate::palette::ictcp_to_abs10k(from_polar(0.5, hue, 0.0));
+    (abs10k, 0.0)
+}
+
+/// Like `abs10k_to_display_srgb` but without the clamp, so a caller can tell
+/// whether a colour actually fits in gamut instead of being handed the clipped
+/// version and no way to know.
+fn abs10k_to_display_srgb_unclamped(abs10k: [f32; 3], sdr_white_nits: f32) -> [f32; 3] {
+    let scale = 10_000.0 / sdr_white_nits.max(1.0);
+    let [r, g, b] = [abs10k[0] * scale, abs10k[1] * scale, abs10k[2] * scale];
+    let lin709 = [
+        1.660_491 * r - 0.587_641_1 * g - 0.072_850_1 * b,
+        -0.124_550_3 * r + 1.132_899_4 * g - 0.008_349_2 * b,
+        -0.018_154_3 * r - 0.100_578_8 * g + 1.118_733 * b,
+    ];
+    let encode = |c: f32| {
+        if c <= 0.003_130_8 {
+            c * 12.92
+        } else {
+            1.055 * c.max(0.0).powf(1.0 / 2.4) - 0.055
+        }
+    };
+    [encode(lin709[0]), encode(lin709[1]), encode(lin709[2])]
+}
+
 /// The worst background a glyph will meet: a neutral at the relevant
 /// percentile of wallpaper intensity, with the backdrop ceiling applied.
 fn worst_case_backdrop(palette: &Palette, params: &ThemeParams) -> [f32; 3] {
@@ -351,6 +521,52 @@ fn worst_case_backdrop(palette: &Palette, params: &ThemeParams) -> [f32; 3] {
 /// a stray vivid pixel. The product favours a colour that is both saturated
 /// and actually present, which is what a person means by the wallpaper's
 /// colour.
+/// The swatch the border takes its colour from.
+///
+/// A colour that is actually *in* the wallpaper, rather than one computed to
+/// oppose it: a synthesized complement stands out, but it reads as an
+/// unrelated colour laid on top, because nothing else on screen is that hue.
+/// Picking a real swatch keeps the border in the same family as everything
+/// else the wallpaper produced.
+///
+/// The most populous swatch is skipped -- that is the wallpaper's own
+/// background, the one colour guaranteed not to stand out against itself.
+/// Among the rest the scoring is the accent's: chroma weighted by how much of
+/// the image carries it, so a vivid colour that is genuinely present beats both
+/// a stray pixel and a large dull field.
+fn glow_swatch(palette: &Palette) -> Option<&Swatch> {
+    // A near-black swatch still reports a hue, but it is noise: at that
+    // luminance the channel differences are a handful of code values, and no
+    // amount of brightening recovers a colour that was never there. Such
+    // swatches are skipped so the border comes from a colour the eye can
+    // actually see in the image.
+    let bright_enough: Vec<&Swatch> = palette
+        .swatches
+        .iter()
+        .filter(|s| s.intensity >= GLOW_MIN_SOURCE_INTENSITY)
+        .collect();
+    // Falling back to everything rather than returning None: a wallpaper that
+    // is genuinely all shadow should still get a border, just a dim one.
+    let mut candidates: Vec<&Swatch> = if bright_enough.is_empty() {
+        palette.swatches.iter().collect()
+    } else {
+        bright_enough
+    };
+    // `swatches` is weight-descending, so the first entry is the background.
+    // Guarded: with only one swatch there is nothing else to choose, and a
+    // border in the background's own colour is better than none.
+    if candidates.len() > 1 {
+        candidates.remove(0);
+    }
+    candidates.into_iter().max_by(|a, b| {
+        let score = |s: &Swatch| {
+            let (_, chroma) = hue_chroma(crate::palette::abs10k_to_ictcp(s.abs10k));
+            chroma * s.weight.sqrt()
+        };
+        score(a).total_cmp(&score(b))
+    })
+}
+
 fn accent_swatch(palette: &Palette) -> Option<&Swatch> {
     palette
         .swatches
@@ -440,7 +656,7 @@ pub(crate) fn solve(palette: &Palette, params: &ThemeParams) -> Option<Theme> {
         params.sdr_white_nits,
         BACKGROUND_INTENSITY,
     );
-    let accent = solve_intensity(
+    let accent = solve_intensity_in_gamut(
         accent_hue,
         accent_chroma.max(0.03),
         effective_srgb,
@@ -456,6 +672,31 @@ pub(crate) fn solve(palette: &Palette, params: &ThemeParams) -> Option<Theme> {
         params.sdr_white_nits,
         BACKGROUND_INTENSITY,
     );
+
+    // Solved against the wallpaper, not the composited window background: the
+    // glow is drawn outside the window, so the backdrop is all there is behind
+    // it.
+    let backdrop_srgb = abs10k_to_display_srgb(backdrop, params.sdr_white_nits);
+    // Hue and chroma both come from a real swatch; only the luminance is
+    // solved, so the border is a colour lifted out of the wallpaper rather
+    // than one derived from it.
+    let (glow_hue, glow_source_chroma) = glow_swatch(palette)
+        .map(|s| hue_chroma(crate::palette::abs10k_to_ictcp(s.abs10k)))
+        .unwrap_or((accent_hue, accent_chroma));
+    let (glow_abs10k, _) = solve_vivid(
+        glow_hue,
+        (glow_source_chroma * GLOW_CHROMA_GAIN).clamp(GLOW_CHROMA_FLOOR, GLOW_CHROMA_CEILING),
+        params.sdr_white_nits,
+    );
+    // Reported for diagnostics only -- nothing is solved against it. A glow
+    // sits over the wallpaper, so this says how well it separates from it.
+    let glow = ThemeColor {
+        abs10k: glow_abs10k,
+        lc: apca_lc(
+            abs10k_to_display_srgb(glow_abs10k, params.sdr_white_nits),
+            backdrop_srgb,
+        ),
+    };
 
     let mut ansi = [ThemeColor { abs10k: [0.0; 3], lc: 0.0 }; 6];
     for (slot, reference) in ansi.iter_mut().zip(ANSI_REFERENCE) {
@@ -504,6 +745,11 @@ pub(crate) fn solve(palette: &Palette, params: &ThemeParams) -> Option<Theme> {
         muted,
         accent,
         border,
+        // Deliberately absent from `met_targets`: a glow that cannot clear its
+        // target against a blazing wallpaper is a cosmetic disappointment, not
+        // a readability failure, and folding it in would report a perfectly
+        // legible theme as broken.
+        glow,
         ansi,
         effective_background: effective,
         met_targets,
@@ -707,6 +953,194 @@ mod tests {
             theme.accent.abs10k[0] > theme.accent.abs10k[2] * 1.5,
             "accent {:?} should keep the red character of the minority swatch",
             theme.accent.abs10k
+        );
+    }
+
+    #[test]
+    fn the_border_colour_is_one_the_wallpaper_actually_contains() {
+        // A synthesized complement stands out but reads as an unrelated colour
+        // laid on top, because nothing else on screen is that hue. The border
+        // has to be a colour lifted out of the image.
+        use std::f32::consts::{PI, TAU};
+        let palette = ordinary_palette();
+        let theme = solve(&palette, &ThemeParams::default()).expect("solvable");
+        let glow_hue = hue_chroma(crate::palette::abs10k_to_ictcp(theme.glow.abs10k)).0;
+
+        let angle_between = |a: f32, b: f32| {
+            let mut d = (a - b) % TAU;
+            if d > PI {
+                d -= TAU;
+            } else if d < -PI {
+                d += TAU;
+            }
+            d.abs()
+        };
+
+        let nearest = palette
+            .swatches
+            .iter()
+            .map(|s| angle_between(glow_hue, hue_chroma(crate::palette::abs10k_to_ictcp(s.abs10k)).0))
+            .fold(f32::MAX, f32::min);
+        assert!(
+            nearest < 0.15,
+            "glow hue matches no swatch in the wallpaper; nearest is {nearest} rad away"
+        );
+    }
+
+    #[test]
+    fn the_border_is_never_sourced_from_a_near_black_swatch() {
+        // A dark swatch reports a hue, but at that luminance it is rounding
+        // error, and brightening a black colour leaves it black -- seven of
+        // ninety-seven real wallpapers produced a #0b0000 border this way.
+        let mostly_shadow = palette_of(
+            &[
+                ([0.00004, 0.00002, 0.00002], 0.62), // near-black, faint red cast
+                ([0.00008, 0.00003, 0.00003], 0.24), // also near-black
+                ([0.0070, 0.0052, 0.0016], 0.14),    // the one colour actually visible
+            ],
+            0.20,
+            0.40,
+            0.46,
+        );
+        let theme = solve(&mostly_shadow, &ThemeParams::default()).expect("solvable");
+        let srgb = abs10k_to_display_srgb(theme.glow.abs10k, 203.0);
+        let brightest = srgb.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            brightest > 0.5,
+            "border came out at {srgb:?}; no luminance setting rescues a black colour"
+        );
+    }
+
+    #[test]
+    fn a_neon_wallpaper_does_not_clip_the_accent_to_a_primary() {
+        // Pure reds and cyans put the accent's chroma outside the sRGB gamut.
+        // Solving intensity against it drives two channels past 1.0 and one
+        // below 0, and the clamp turns the hue into a screaming primary --
+        // one real wallpaper produced #ff00ff.
+        let neon = palette_of(
+            &[
+                ([0.0004, 0.0006, 0.0016], 0.36),
+                ([0.0113, 0.0000, 0.0004], 0.30), // pure red
+                ([0.0000, 0.0117, 0.0139], 0.34), // pure cyan
+            ],
+            0.30,
+            0.50,
+            0.60,
+        );
+        let theme = solve(&neon, &ThemeParams::default()).expect("solvable");
+        let raw = abs10k_to_display_srgb_unclamped(theme.accent.abs10k, 203.0);
+        assert!(
+            raw.iter().all(|&c| (-0.01..=1.01).contains(&c)),
+            "accent {raw:?} sits outside the gamut and will clamp to a primary"
+        );
+    }
+
+    #[test]
+    fn the_border_avoids_the_wallpapers_own_background_colour() {
+        // The most populous swatch is the wallpaper's background. A border in
+        // that colour cannot stand out, because it is the thing behind it.
+        use std::f32::consts::{PI, TAU};
+        let palette = palette_of(
+            &[
+                ([0.0010, 0.0010, 0.0011], 0.80), // dominant near-neutral
+                ([0.0090, 0.0012, 0.0015], 0.20), // vivid red minority
+            ],
+            0.30,
+            0.45,
+            0.50,
+        );
+        let theme = solve(&palette, &ThemeParams::default()).expect("solvable");
+        let glow_hue = hue_chroma(crate::palette::abs10k_to_ictcp(theme.glow.abs10k)).0;
+        let dominant_hue =
+            hue_chroma(crate::palette::abs10k_to_ictcp(palette.swatches[0].abs10k)).0;
+        let mut delta = (glow_hue - dominant_hue) % TAU;
+        if delta > PI {
+            delta -= TAU;
+        } else if delta < -PI {
+            delta += TAU;
+        }
+        assert!(
+            delta.abs() > 0.2,
+            "border took the wallpaper's own background hue; it cannot stand out against it"
+        );
+    }
+
+    #[test]
+    fn the_two_border_roles_stay_tellable_apart() {
+        // Both borders are themed now, so focus is marked by the difference
+        // between them rather than by one being coloured and one not. If the
+        // glow and the border role converge, focus becomes invisible on any
+        // window whose glow margin is zero.
+        use std::f32::consts::{PI, TAU};
+        let theme = solve(&ordinary_palette(), &ThemeParams::default()).expect("solvable");
+        let (glow_hue, glow_chroma) =
+            hue_chroma(crate::palette::abs10k_to_ictcp(theme.glow.abs10k));
+        let (border_hue, border_chroma) =
+            hue_chroma(crate::palette::abs10k_to_ictcp(theme.border.abs10k));
+
+        let mut delta = (glow_hue - border_hue) % TAU;
+        if delta > PI {
+            delta -= TAU;
+        } else if delta < -PI {
+            delta += TAU;
+        }
+        // Either a clear hue separation or a clear chroma one will do: what
+        // must not happen is the two being close on both counts.
+        let separated_by_hue = delta.abs() > 1.5;
+        let separated_by_chroma = glow_chroma > border_chroma * 2.0;
+        assert!(
+            separated_by_hue || separated_by_chroma,
+            "focused and unfocused borders are too alike: hue delta {} rad, chroma {} vs {}",
+            delta.abs(),
+            glow_chroma,
+            border_chroma
+        );
+    }
+
+    #[test]
+    fn the_glow_keeps_its_colour_instead_of_clipping_to_white() {
+        // The first implementation solved the glow for contrast the way text is
+        // solved, which drove intensity until every channel clipped and the
+        // hue washed out. Four of six real wallpapers produced pure white.
+        // A glow gets its separation from being drawn at HDR luminance, so what
+        // matters here is that it stays a colour at all.
+        for step in 0..24 {
+            let hue = -std::f32::consts::PI
+                + std::f32::consts::TAU * (step as f32) / 24.0;
+            let (abs10k, chroma) = solve_vivid(hue, 0.12, 203.0);
+            assert!(chroma > 0.0, "hue {hue} fell back to neutral");
+            let srgb = abs10k_to_display_srgb(abs10k, 203.0);
+            let max = srgb.iter().copied().fold(0.0f32, f32::max);
+            let min = srgb.iter().copied().fold(1.0f32, f32::min);
+            assert!(
+                max - min > 0.15,
+                "hue {hue} produced a near-neutral {srgb:?}; the glow has no colour"
+            );
+            assert!(
+                min < 0.97,
+                "hue {hue} clipped to white: {srgb:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_near_monochrome_wallpaper_still_gets_a_coloured_glow() {
+        // Scaling the accent's chroma alone yields a grey glow when the
+        // wallpaper has almost none of its own, which is exactly when a border
+        // most needs to be visible.
+        let grey = palette_of(
+            &[([0.0012, 0.0012, 0.0012], 0.7), ([0.0040, 0.0041, 0.0040], 0.3)],
+            0.30,
+            0.42,
+            0.46,
+        );
+        let theme = solve(&grey, &ThemeParams::default()).expect("solvable");
+        let srgb = abs10k_to_display_srgb(theme.glow.abs10k, 203.0);
+        let max = srgb.iter().copied().fold(0.0f32, f32::max);
+        let min = srgb.iter().copied().fold(1.0f32, f32::min);
+        assert!(
+            max - min > 0.10,
+            "glow {srgb:?} is grey on a grey wallpaper; the chroma floor did not hold"
         );
     }
 

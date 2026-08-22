@@ -246,6 +246,11 @@ pub struct ThemeConfig {
     pub on_change: Option<String>,
     /// Contrast target for body text, in APCA `Lc`. Clamped to `[0, 106]`.
     pub target_lc: f32,
+    /// Whether the focused window's border takes its colour from the wallpaper
+    /// instead of `[decoration] active_color`. `false` (the default) leaves an
+    /// explicitly configured border alone, because silently overriding a colour
+    /// the user typed is worse than doing nothing.
+    pub apply_to_borders: bool,
     /// Override for the solve's window opacity. `None` derives the worst case
     /// across the live active/inactive decoration styles -- see
     /// `worst_case_backdrop_params`.
@@ -315,6 +320,7 @@ fn resolve_theme(raw: RawTheme, sdr_white_nits: f32) -> ThemeConfig {
         opacity: raw.opacity,
         backdrop_cap_nits: raw.backdrop_cap_nits,
         backdrop_blurred: raw.backdrop_blurred,
+        apply_to_borders: raw.apply_to_borders,
         sdr_white_nits,
     }
 }
@@ -335,6 +341,8 @@ struct RawTheme {
     backdrop_cap_nits: Option<f32>,
     #[serde(default)]
     backdrop_blurred: Option<bool>,
+    #[serde(default)]
+    apply_to_borders: bool,
 }
 
 impl Default for RawTheme {
@@ -346,6 +354,7 @@ impl Default for RawTheme {
             target_lc: default_theme_target_lc(),
             opacity: None,
             backdrop_cap_nits: None,
+            apply_to_borders: false,
             backdrop_blurred: None,
         }
     }

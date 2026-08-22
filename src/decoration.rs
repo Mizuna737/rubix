@@ -406,6 +406,24 @@ pub(crate) fn style_for_window(state: &RubixState, id: u32, covered: f32) -> Win
     if state.fullscreen_windows.contains(&id) {
         style.opacity = 1.0;
     }
+    // The wallpaper-derived borders, when enabled, replace both configured
+    // colours -- the contrasting glow on the focused window, the muted border
+    // role on every other. Leaving the unfocused ring on a fixed colour would
+    // strand it as the one thing on screen not following the wallpaper, and it
+    // costs nothing to theme: focus is already marked by the chroma gap between
+    // the two roles and by the glow margin, which unfocused windows do not get.
+    //
+    // Done here rather than at the draw site because this is the single funnel
+    // every style passes through, so nothing can resolve a style and miss it.
+    if let Some((focused, unfocused)) = state.theme_border_colors {
+        let themed = if state.focused_window_id() == Some(id) { focused } else { unfocused };
+        style.color = smithay::backend::renderer::Color32F::new(
+            themed.r(),
+            themed.g(),
+            themed.b(),
+            style.color.a(),
+        );
+    }
     style
 }
 

@@ -209,6 +209,22 @@ pub struct RubixState {
     /// `apply_theme_update` and the `NavAction::Spawn`/startup spawn sites.
     pub theme_env: Vec<(String, String)>,
 
+    /// Border colours from the last solved theme, as `(focused, unfocused)`.
+    /// `None` when theming is off, `[theme] apply_to_borders` is false, or no
+    /// wallpaper has been themed yet -- in all of which cases the configured
+    /// `active_color` / `inactive_color` stand.
+    ///
+    /// Two roles rather than one shade of a single colour: the focused border
+    /// uses `glow`, which is picked to contrast with the wallpaper, while the
+    /// unfocused one uses `border`, which is on-hue and muted so it recedes.
+    /// Focus stays legible through that chroma gap and the glow margin, so
+    /// theming the unfocused ring costs nothing.
+    ///
+    /// Stored as display sRGB because that is what `WindowStyle::color` is; the
+    /// HDR luminance scaling happens later in `decoration::resolved_color`.
+    pub(crate) theme_border_colors:
+        Option<(smithay::backend::renderer::Color32F, smithay::backend::renderer::Color32F)>,
+
     // wlr-foreign-toplevel-management: bound managers plus what each window's
     // handles were last told, so `foreign_toplevel::refresh` can send deltas.
     pub(crate) foreign_toplevel: crate::foreign_toplevel::ForeignToplevelState,
@@ -515,6 +531,7 @@ impl RubixState {
             pending_config_errors: Vec::new(),
             wallpaper: crate::wallpaper::WallpaperManager::default(),
             theme_env: Vec::new(),
+            theme_border_colors: None,
             wallpaper_timer: None,
             config_reload_timer: None,
             foreign_toplevel: Default::default(),
@@ -1119,6 +1136,26 @@ impl RubixState {
             ("RUBIX_ACCENT".to_string(), crate::palette::preview_hex(theme.accent.abs10k, sdr_white_nits)),
         ];
 
+        // The glow is picked to contrast with the wallpaper rather than to
+        // recede into it, so it is the one theme colour that belongs on a
+        // border. Cleared rather than left stale when the option is off, so
+        // toggling it back to the configured colour takes effect on reload.
+        self.theme_border_colors = self.config.theme.apply_to_borders.then(|| {
+            // Alpha is the user's, not the theme's: each style's alpha is how
+            // that border's strength is dialled in, and replacing it would
+            // silently undo that tuning. So each role keeps the alpha of the
+            // style it is replacing.
+            let themed = |colour: &crate::theme::ThemeColor, alpha: f32| {
+                let [r, g, b] =
+                    crate::theme::abs10k_to_display_srgb(colour.abs10k, sdr_white_nits);
+                smithay::backend::renderer::Color32F::new(r, g, b, alpha)
+            };
+            (
+                themed(&theme.glow, self.config.decoration.active.color.a()),
+                themed(&theme.border, self.config.decoration.inactive.color.a()),
+            )
+        });
+
         if let Some(registry) = registry {
             crate::ipc::broadcast_theme_changed(registry, &json);
         }
@@ -1228,7 +1265,14 @@ impl RubixState {
         self.config.keybinds = new.keybinds;
         self.config.animation_duration = new.animation_duration;
         // Gaps are per-frame layout inputs, not structural like visible_columns --
-        // safe to swap live; the next apply_layout re-tiles with the new values.
+        // safe to swap live. Swapping them is not enough to SEE them, though:
+        // the geometry pass only runs when something asks for it, and a repaint
+        // redraws the existing rectangles rather than recomputing them. So a
+        // gap edit used to sit invisible in the config until an unrelated event
+        // -- opening or moving a window -- happened to re-tile. Remembered here
+        // and acted on below, once every field is swapped.
+        let gaps_changed =
+            new.outer_gap != self.config.outer_gap || new.inner_gap != self.config.inner_gap;
         self.config.outer_gap = new.outer_gap;
         self.config.inner_gap = new.inner_gap;
         self.config.outputs = new.outputs;
@@ -1275,6 +1319,13 @@ impl RubixState {
         // Last, so every field is already swapped and the report goes out through
         // the sink this edit asked for.
         self.report_config_diagnostics(problems);
+        // Re-tile only when the geometry inputs actually moved. Unconditional
+        // would resize every window on every config save -- including edits
+        // that touch nothing geometric, like a colour -- and a resize round-trip
+        // is visible churn in clients that redraw on configure.
+        if gaps_changed {
+            self.apply_layout();
+        }
         // Force a repaint so an sdr_white_nits edit is visible immediately,
         // same reasoning as the keybind path in dispatch_nav below.
         self.nudge_render();
@@ -2301,6 +2352,7 @@ fn theme_json(wallpaper_path: &std::path::Path, theme: &crate::theme::Theme, sdr
         "muted": colour(&theme.muted),
         "accent": colour(&theme.accent),
         "border": colour(&theme.border),
+        "glow": colour(&theme.glow),
         "ansi": ansi,
         "effective_background": theme.effective_background,
         "met_targets": theme.met_targets,

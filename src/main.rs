@@ -414,6 +414,7 @@ fn handle_theme_subcommand(args: &[String]) -> Option<i32> {
         "muted": colour_json(&theme.muted),
         "accent": colour_json(&theme.accent),
         "border": colour_json(&theme.border),
+        "glow": colour_json(&theme.glow),
         "ansi": ansi_json,
         "effective_background": theme.effective_background,
         "met_targets": theme.met_targets,

@@ -355,6 +355,7 @@ const THEME_SCHEMA: &[(&str, Schema)] = &[
     ("opacity", Schema::Leaf),
     ("backdrop_cap_nits", Schema::Leaf),
     ("backdrop_blurred", Schema::Leaf),
+    ("apply_to_borders", Schema::Leaf),
 ];
 
 const ROOT_SCHEMA: &[(&str, Schema)] = &[
