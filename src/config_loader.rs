@@ -267,6 +267,14 @@ enum Schema {
     Leaf,
 }
 
+// These lists stand in for `#[serde(deny_unknown_fields)]`, which is
+// deliberately absent (see `deserialize_merged`), and they are hand-maintained.
+// Adding a field to a `Raw*` struct in `config.rs` without adding it here does
+// not break the setting -- serde still reads it, and it works -- it just makes
+// the compositor report "unknown config key" on every single load. A config
+// that works while complaining about itself is a confusing thing to hand
+// someone, and it shipped exactly that way once. `the_schema_matches_the_raw_
+// structs` in the tests below now fails instead.
 const RULE_SCHEMA: &[(&str, Schema)] = &[
     ("app_id", Schema::Leaf),
     ("title", Schema::Leaf),
@@ -283,6 +291,8 @@ const RULE_SCHEMA: &[(&str, Schema)] = &[
     ("inactive_backdrop_tonemap", Schema::Leaf),
     ("active_backdrop_blur", Schema::Leaf),
     ("inactive_backdrop_blur", Schema::Leaf),
+    ("active_refract", Schema::Leaf),
+    ("inactive_refract", Schema::Leaf),
 ];
 
 const OUTPUT_SCHEMA: &[(&str, Schema)] = &[
@@ -315,6 +325,11 @@ const DECORATION_SCHEMA: &[(&str, Schema)] = &[
     ("inactive_backdrop_blur", Schema::Leaf),
     ("backdrop_blur_radius", Schema::Leaf),
     ("backdrop_luminance_nits", Schema::Leaf),
+    ("active_refract", Schema::Leaf),
+    ("inactive_refract", Schema::Leaf),
+    ("refract_strength", Schema::Leaf),
+    ("refract_facet_size", Schema::Leaf),
+    ("refract_dispersion", Schema::Leaf),
     ("rule", Schema::ArrayOfTables(RULE_SCHEMA)),
 ];
 

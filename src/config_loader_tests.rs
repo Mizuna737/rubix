@@ -187,3 +187,67 @@ fn a_known_key_never_gets_reported() {
     let prov = Provenance::new();
     assert!(check_unknown_keys(&table, &prov).is_empty());
 }
+
+/// Field names declared by a `Raw*` struct in `config.rs`.
+///
+/// Text-scraped rather than derived, because there is no reflection to derive
+/// it from: the raw structs only implement `Deserialize`, and adding
+/// `Serialize` purely to enumerate them would mean annotating every `Option`
+/// field to keep the TOML serializer happy. Scraping the source is uglier but
+/// it is complete, and it costs nothing at runtime.
+fn raw_struct_fields(src: &str, name: &str) -> Vec<String> {
+    let head = format!("struct {name} {{");
+    let start = src.find(&head).unwrap_or_else(|| panic!("no `{head}` in config.rs")) + head.len();
+    let body = &src[start..];
+    let end = body.find("\n}").expect("unterminated struct");
+    body[..end]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
+        .filter_map(|l| l.split(':').next())
+        .map(|l| l.trim_start_matches("pub(crate)").trim_start_matches("pub").trim())
+        .filter(|l| {
+            !l.is_empty() && l.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The schema lists stand in for `deny_unknown_fields` and are maintained by
+/// hand, so they drift silently. When they do, the setting still works -- serde
+/// reads it regardless -- and the only symptom is the compositor reporting
+/// "unknown config key" about its own valid config on every load. That shipped:
+/// the refraction keys were added to `RawDecoration` and to nothing else, and
+/// surfaced as a config error on every save of a file that was working fine.
+#[test]
+fn the_schema_matches_the_raw_structs() {
+    let src = include_str!("config.rs");
+    let pairs: &[(&str, &[(&str, Schema)])] = &[
+        ("RawDecoration", DECORATION_SCHEMA),
+        ("RawBorderRule", RULE_SCHEMA),
+        ("RawWallpaper", WALLPAPER_SCHEMA),
+        ("RawOutput", OUTPUT_SCHEMA),
+        ("RawLayout", LAYOUT_SCHEMA),
+        ("RawAnimation", ANIMATION_SCHEMA),
+        ("RawInput", INPUT_SCHEMA),
+        ("RawIdle", IDLE_SCHEMA),
+    ];
+
+    let mut problems = Vec::new();
+    for (struct_name, schema) in pairs {
+        let fields = raw_struct_fields(src, struct_name);
+        assert!(!fields.is_empty(), "scraped no fields from {struct_name}");
+        let names: Vec<&str> = schema.iter().map(|(n, _)| *n).collect();
+        for f in &fields {
+            if !names.contains(&f.as_str()) {
+                problems.push(format!("{struct_name}.{f} is missing from the schema"));
+            }
+        }
+        for n in &names {
+            if !fields.iter().any(|f| f == n) {
+                problems.push(format!("schema lists '{n}', which {struct_name} does not have"));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "config schema drift:\n  {}", problems.join("\n  "));
+}
