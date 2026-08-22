@@ -1001,17 +1001,25 @@ fn default_refract_strength() -> f32 {
     12.0
 }
 
-/// Cleavage-plane spacing for the backdrop refraction, in logical pixels.
+/// Cleavage-plane spacing for the backdrop refraction, in logical pixels of
+/// the window itself.
 ///
-/// Not the size of a face. Four plane families intersect at this spacing and a
-/// second octave runs at 3.3x it, so the visible faces come out several times
-/// finer than the number suggests. That is why this default is far larger than
-/// it looks like it should be: it was 90.0 under the old Voronoi field, where
-/// the value genuinely was the cell size, and carrying the same number across
-/// to the cleavage field left the faces small enough to read as cracked ice
-/// rather than as crystal.
+/// Not the size of a face: four plane families intersect at this spacing and a
+/// second octave runs at 3.3x it, so visible faces come out several times
+/// finer than the number suggests.
+///
+/// The default has moved twice, both times because the unit changed under it.
+/// It was 90.0 for the Voronoi field, where the value genuinely was a cell
+/// size. It then had to grow for the cleavage field. And it had to grow again
+/// -- by about 5x -- once the field was anchored to the window rather than to
+/// the wallpaper, because before that the coordinate advanced by only
+/// `window_width / output_width` per window pixel instead of by 1. The visible
+/// consequence of that bug is worth recording: facet size used to scale with
+/// window size, so a small window got proportionally coarser facets and a
+/// fullscreen one got them 1:1. It is now the same on every window, which is
+/// what makes this number mean anything.
 fn default_refract_facet_size() -> f32 {
-    350.0
+    750.0
 }
 
 /// Per-channel dispersion spread for the crystal-facet backdrop refraction,
