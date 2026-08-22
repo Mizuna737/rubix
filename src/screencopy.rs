@@ -28,12 +28,11 @@ use smithay::{
         allocator::Fourcc,
         renderer::{
             damage::OutputDamageTracker,
-            element::{surface::WaylandSurfaceRenderElement, AsRenderElements, RenderElement},
+            element::RenderElement,
             gles::GlesRenderbuffer,
             Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture, TextureMapping,
         },
     },
-    desktop::layer_map_for_output,
     output::Output,
     reexports::{
         wayland_protocols_wlr::screencopy::v1::server::{
@@ -45,11 +44,11 @@ use smithay::{
             Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
         },
     },
-    utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Transform},
+    utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Transform},
     wayland::shm::{with_buffer_contents, with_buffer_contents_mut},
 };
 
-use crate::cursor::{pointer_render_elements, RubixRenderElement};
+use crate::cursor::RubixRenderElement;
 use crate::RubixState;
 
 /// A capture waiting for the next presented frame. Built in the frame's `copy`
@@ -475,48 +474,6 @@ where
     // HDR surface present, so the overwhelmingly common all-SDR capture takes
     // exactly the path it always did.
     let tonemap = crate::udev::output_has_hdr_content(state, output);
-    let mut background: Vec<RubixRenderElement<R>> = Vec::new();
-    let mut bottom: Vec<RubixRenderElement<R>> = Vec::new();
-    let mut top: Vec<RubixRenderElement<R>> = Vec::new();
-    let mut overlay: Vec<RubixRenderElement<R>> = Vec::new();
-    {
-        use smithay::wayland::shell::wlr_layer::Layer;
-        let map = layer_map_for_output(output);
-        for layer in map.layers() {
-            let Some(geo) = map.layer_geometry(layer) else { continue };
-            let loc = geo.loc.to_physical_precise_round(scale);
-            let elems = layer.render_elements::<WaylandSurfaceRenderElement<R>>(
-                renderer,
-                loc,
-                Scale::from(scale),
-                1.0,
-            );
-            let surface = layer.wl_surface().clone();
-            let elems: Vec<RubixRenderElement<R>> = elems
-                .into_iter()
-                .map(|e| {
-                    if tonemap {
-                        crate::rounding::tonemap_sdr_element(
-                            renderer,
-                            &surface,
-                            e,
-                            scale,
-                            state.sdr_white_nits,
-                        )
-                    } else {
-                        RubixRenderElement::Surface(e)
-                    }
-                })
-                .collect();
-            match layer.layer() {
-                Layer::Background => background.extend(elems),
-                Layer::Bottom => bottom.extend(elems),
-                Layer::Top => top.extend(elems),
-                Layer::Overlay => overlay.extend(elems),
-            }
-        }
-    }
-
     // Without HDR content: RoundMode::Plain, since no colour conversion is in
     // play and a rounded element takes the plain texture program (falling back
     // to the batched call at corner_radius = 0). With it: each window resolved
@@ -526,47 +483,26 @@ where
     } else {
         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
     };
-    // A capture destination is always 8-bit sRGB, so this is the same
-    // `tonemap` flag used for layer surfaces and the wallpaper element below.
-    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
+
+    crate::compose::compose_output_elements(
         state,
         renderer,
         output,
-        scale,
-        space_mode,
-        tonemap,
-    );
-
-    let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
-    if overlay_cursor {
-        elements.extend(pointer_render_elements(
-            renderer,
-            &state.cursor_status,
-            state.pointer_location,
+        crate::compose::ComposeOptions {
             scale,
-        ));
-    }
-    elements.extend(overlay);
-    elements.extend(top);
-    elements.extend(space_elements);
-    elements.extend(backdrop_elements);
-    elements.extend(bottom);
-    elements.extend(background);
-    // A capture destination is always 8-bit sRGB, so `tonemap` is the same flag
-    // the surfaces above used: an HDR wallpaper is decoded and tone-mapped down
-    // rather than handed over as though it were sRGB. See src/wallpaper.rs.
-    if let Some(region) = state.space.output_geometry(output)
-        && let Some((_, wallpaper)) = state.wallpaper.element(
-            renderer,
-            &output.name(),
-            region.size,
-            scale,
-            tonemap,
-        )
-    {
-        elements.push(wallpaper);
-    }
-    elements
+            space_mode,
+            wrap: crate::compose::WrapMode::Sdr { tonemap },
+            include_wallpaper: true,
+            cursor: if overlay_cursor {
+                crate::compose::CursorMode::Global
+            } else {
+                crate::compose::CursorMode::Hidden
+            },
+            suppress_chrome: false,
+        },
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 #[cfg(test)]

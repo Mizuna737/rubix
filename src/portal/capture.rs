@@ -31,7 +31,6 @@ use smithay::{
             Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture, TextureMapping,
         },
     },
-    desktop::layer_map_for_output,
     utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform},
 };
 
@@ -131,69 +130,27 @@ where
     // on an HDR surface actually being present, so an all-SDR screenshare is
     // byte-for-byte the path it always took.
     let tonemap = crate::udev::output_has_hdr_content(state, &output);
-    let mut background: Vec<RubixRenderElement<R>> = Vec::new();
-    let mut bottom: Vec<RubixRenderElement<R>> = Vec::new();
-    let mut top: Vec<RubixRenderElement<R>> = Vec::new();
-    let mut overlay: Vec<RubixRenderElement<R>> = Vec::new();
-    {
-        use smithay::wayland::shell::wlr_layer::Layer;
-        let map = layer_map_for_output(&output);
-        for layer in map.layers() {
-            let Some(geo) = map.layer_geometry(layer) else { continue };
-            let loc = geo.loc.to_physical_precise_round(scale);
-            let elems = layer.render_elements::<WaylandSurfaceRenderElement<R>>(
-                renderer,
-                loc,
-                Scale::from(scale),
-                1.0,
-            );
-            let surface = layer.wl_surface().clone();
-            let elems: Vec<RubixRenderElement<R>> = elems
-                .into_iter()
-                .map(|e| {
-                    if tonemap {
-                        crate::rounding::tonemap_sdr_element(
-                            renderer,
-                            &surface,
-                            e,
-                            scale,
-                            state.sdr_white_nits,
-                        )
-                    } else {
-                        RubixRenderElement::Surface(e)
-                    }
-                })
-                .collect();
-            match layer.layer() {
-                Layer::Background => background.extend(elems),
-                Layer::Bottom => bottom.extend(elems),
-                Layer::Top => top.extend(elems),
-                Layer::Overlay => overlay.extend(elems),
-            }
-        }
-    }
-
     let space_mode = if tonemap {
         crate::rounding::SpaceMode::TonemapSdr
     } else {
         crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain)
     };
-    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
+
+    let elements = crate::compose::compose_output_elements(
         state,
         renderer,
         &output,
-        scale,
-        space_mode,
-        tonemap,
+        crate::compose::ComposeOptions {
+            scale,
+            space_mode,
+            wrap: crate::compose::WrapMode::Sdr { tonemap },
+            include_wallpaper: false,
+            cursor: crate::compose::CursorMode::Hidden,
+            suppress_chrome: false,
+        },
+        Vec::new(),
+        Vec::new(),
     );
-
-    let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
-    elements.extend(overlay);
-    elements.extend(top);
-    elements.extend(space_elements);
-    elements.extend(backdrop_elements);
-    elements.extend(bottom);
-    elements.extend(background);
 
     render_and_readback(renderer, phys, &elements)
 }

@@ -55,12 +55,11 @@ use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::damage::{Error as OutputDamageTrackerError, OutputDamageTracker};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
 use smithay::backend::renderer::utils::{with_renderer_surface_state, DamageBag};
 use smithay::backend::renderer::element::{
-    AsRenderElements, Element, Id, Kind, RenderElement, RenderElementPresentationState,
+    Element, Id, Kind, RenderElement, RenderElementPresentationState,
     RenderElementStates, RenderingReason, default_primary_scanout_output_compare,
 };
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
@@ -84,7 +83,6 @@ use smithay::desktop::utils::{
 };
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Subpixel};
-use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -103,7 +101,7 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::color_management::{surface_decode_kind, DecodeKind};
 use crate::rounding::RoundMode;
-use crate::cursor::{pointer_render_elements, RubixRenderElement};
+use crate::cursor::RubixRenderElement;
 use crate::hdr_shaders::{compile_hdr_shaders, sdr_solid_transform, HdrShaders};
 use crate::RubixState;
 
@@ -1369,48 +1367,6 @@ fn render_surface(
     // change, `MemoryRenderBuffer`'s damage bag carries the new frame's damage
     // into the tracker without anything else needing to know.
     state.wallpaper.advance_all(std::time::Instant::now());
-    let mut background: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
-    let mut bottom: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
-    let mut top: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
-    let mut overlay: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
-    {
-        let map = layer_map_for_output(&surface.output);
-        for layer in map.layers() {
-            let Some(geo) = map.layer_geometry(layer) else { continue };
-            let loc = geo.loc.to_physical_precise_round(scale);
-            let elems = layer.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'_>>>(
-                renderer,
-                loc,
-                Scale::from(scale),
-                1.0,
-            );
-            // The wallpaper is a background-layer surface, so this is the branch
-            // an HDR wallpaper actually goes through.
-            let layer_surface = layer.wl_surface().clone();
-            let elems: Vec<RubixRenderElement<RubixRenderer<'_>>> = elems
-                .into_iter()
-                .map(|e| {
-                    if sdr_tonemap {
-                        crate::rounding::tonemap_sdr_element(
-                            renderer,
-                            &layer_surface,
-                            e,
-                            scale,
-                            state.sdr_white_nits,
-                        )
-                    } else {
-                        RubixRenderElement::Surface(e)
-                    }
-                })
-                .collect();
-            match layer.layer() {
-                Layer::Background => background.extend(elems),
-                Layer::Bottom => bottom.extend(elems),
-                Layer::Top => top.extend(elems),
-                Layer::Overlay => overlay.extend(elems),
-            }
-        }
-    }
 
     // Rounding needs to know which texture program each window element would
     // otherwise be drawn with, because there is only one program slot per draw.
@@ -1426,14 +1382,6 @@ fn render_surface(
     } else {
         crate::rounding::SpaceMode::Fixed(RoundMode::Plain)
     };
-    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
-        state,
-        renderer,
-        &surface.output,
-        scale,
-        space_mode,
-        sdr_tonemap,
-    );
 
     // Decorated ghost + reveal-tween elements, built from `active_ghosts`/
     // `active_scales` (populated by `step_animations` right before this call,
@@ -1441,7 +1389,7 @@ fn render_surface(
     // windows stay above tiled windows but below chrome-style layer surfaces.
     // See `tween_elements` for the coordinate-space caveat (`pos` is not
     // region-local).
-    let (mut tween_elements, mut tween_backdrops) = crate::rounding::tween_elements(
+    let (tween_elements, tween_backdrops) = crate::rounding::tween_elements(
         state,
         renderer,
         &surface.output,
@@ -1450,78 +1398,21 @@ fn render_surface(
         sdr_tonemap,
     );
 
-    // Exclusive fullscreen: chrome above the game (layer-shell top/overlay,
-    // animation ghosts/reveal-tweens) must not render, both because it would
-    // be incorrect (waybar etc. shouldn't paint over a fullscreen game) and
-    // because anything above the candidate element in the final list is
-    // fatal to primary-plane promotion. `bottom`/`background` are left as
-    // built -- they're culled by `DrmCompositor`'s opaque short-circuit and
-    // are the fallback if promotion fails for some other reason.
-    if fullscreen_kind.is_some() {
-        top.clear();
-        overlay.clear();
-        tween_elements.clear();
-        tween_backdrops.clear();
-    }
-
-    // Cursor built last (it also needs `renderer`), same "collect before the
-    // combined render call" discipline as the ghost/layer lists above so the
-    // mutable borrow is released before `drm_output.render_frame` below.
-    // Only the output the pointer is actually over draws it, and the location is
-    // translated into that output's local space (subtract its geometry origin) --
-    // otherwise every output redraws the cursor at the raw global coordinate,
-    // producing a phantom cursor per extra monitor.
-    //
-    // The cursor is NOT suppressed under exclusive fullscreen. `DrmCompositor`
-    // assigns it to the hardware cursor plane from this element list
-    // (`FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT`), so a cursor element does not
-    // land in `primary_plane_elements` and does not block primary-plane
-    // promotion. There is no separate hw-cursor path to fall back on: dropping
-    // these elements drops the cursor outright, everywhere, for as long as any
-    // fullscreen window covers the output.
-    let output_geo = state.space.output_geometry(&surface.output);
-    let cursor_elements = match output_geo {
-        Some(geo) if geo.to_f64().contains(state.pointer_location) => {
-            let local = state.pointer_location - geo.loc.to_f64();
-            pointer_render_elements(renderer, &state.cursor_status, local, scale)
-        }
-        _ => Vec::new(),
-    };
-
-    // Cursor prepended -- front of the Vec is topmost, and it must draw above
-    // everything else, including overlay layers.
-    let mut elements: Vec<RubixRenderElement<RubixRenderer<'_>>> = Vec::new();
-    elements.extend(cursor_elements);
-    elements.extend(overlay);
-    elements.extend(top);
-    elements.extend(tween_elements);
-    elements.extend(tween_backdrops);
-    elements.extend(space_elements);
-    // Per-window backdrop quads (see src/wallpaper.rs). Deliberately below
-    // every window rather than interleaved per-window: the quad is opaque
-    // within its window's rect, so it occludes not just the wallpaper but
-    // anything else physically below that rect at this point in the list --
-    // layer-shell `bottom`/`background`, and (accepted simplification) any
-    // other window stacked further down that happens to overlap the same
-    // screen area. Frost only ever applies over wallpaper, never over another
-    // window's own content.
-    elements.extend(backdrop_elements);
-    elements.extend(bottom);
-    elements.extend(background);
-    // Last, so it sits under every client. Only wrapped in a tone-map program
-    // when this output is SDR and the image is not -- an HDR output installs
-    // its decode for the whole pass instead. See src/wallpaper.rs.
-    if let Some(region) = state.space.output_geometry(&surface.output)
-        && let Some((_, wallpaper)) = state.wallpaper.element(
-            renderer,
-            &surface.output.name(),
-            region.size,
+    let elements: Vec<RubixRenderElement<RubixRenderer<'_>>> = crate::compose::compose_output_elements(
+        &*state,
+        renderer,
+        &surface.output,
+        crate::compose::ComposeOptions {
             scale,
-            sdr_tonemap,
-        )
-    {
-        elements.push(wallpaper);
-    }
+            space_mode,
+            wrap: crate::compose::WrapMode::Sdr { tonemap: sdr_tonemap },
+            include_wallpaper: true,
+            cursor: crate::compose::CursorMode::OutputLocal,
+            suppress_chrome: fullscreen_kind.is_some(),
+        },
+        tween_elements,
+        tween_backdrops,
+    );
 
     // Connector color state follows the exclusive-fullscreen window's own
     // declared transfer function; on the desktop (no exclusive fullscreen) it
@@ -2000,19 +1891,20 @@ pub(crate) fn output_has_hdr_content(state: &RubixState, output: &Output) -> boo
 /// program (see `RoundedElement`), installed via `draw`'s
 /// `gles.override_default_tex_program` call.
 ///
-/// Space windows and their backdrop quads come from
-/// `crate::rounding::space_elements` with `SpaceMode::HdrComposite`, which
-/// resolves each window to `RoundMode::Decode(its own DecodeKind)` and each
-/// backdrop to `hdr_pass: true` -- the same per-window walk this function
-/// used to do by hand. Everything else in this pass -- cursor, the four
-/// layer-shell layers, ghosts, reveal-tween windows -- is wrapped here at
-/// radius 0 purely to install a program (`RoundedElement::with_program`):
-/// cursor and ghosts always as `Decode(Sdr)` (compositor chrome and
-/// animation copies, never client HDR content, same as before); layer
-/// surfaces from their own declaration (`surface_decode_kind`), since a
-/// layer surface that declares a transfer function -- an HDR wallpaper tool
-/// on the background layer is the real case -- has made a statement about
-/// its content that this pass must not ignore.
+/// Space windows and their backdrop quads, the cursor, the four layer-shell
+/// layers and the wallpaper are all assembled by
+/// `crate::compose::compose_output_elements` with `SpaceMode::HdrComposite`
+/// and `WrapMode::HdrComposite`, which resolves each window to
+/// `RoundMode::Decode(its own DecodeKind)`, each backdrop to `hdr_pass:
+/// true`, the cursor and layer surfaces to `Decode(Sdr)`/their own declared
+/// kind respectively (`surface_decode_kind`) -- since a layer surface that
+/// declares a transfer function, an HDR wallpaper tool on the background
+/// layer being the real case, has made a statement about its content this
+/// pass must not ignore -- and the wallpaper to the `DecodeKind` its own
+/// `element()` call returns. Only ghost + reveal-tween elements are gathered
+/// here, ahead of the call, because `SpaceMode::HdrComposite` makes
+/// `decorate_window`'s `needs_program` unconditional -- every tween element
+/// already carries its own program and must not be re-wrapped.
 fn gather_hdr_composite_elements<'a>(
     state: &RubixState,
     renderer: &mut RubixRenderer<'a>,
@@ -2029,57 +1921,6 @@ fn gather_hdr_composite_elements<'a>(
     // better fallback than drawing unwrapped, and `round_shaders` has
     // already logged the compile failure once.
     let round = crate::rounding::round_shaders(renderer.as_mut());
-
-    let mut background: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
-    let mut bottom: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
-    let mut top: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
-    let mut overlay: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
-    {
-        let map = layer_map_for_output(output);
-        for layer in map.layers() {
-            let Some(geo) = map.layer_geometry(layer) else { continue };
-            let loc = geo.loc.to_physical_precise_round(scale);
-            let kind = surface_decode_kind(layer.wl_surface());
-            let elems = layer.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
-                renderer,
-                loc,
-                Scale::from(scale),
-                1.0,
-            );
-            let wrapped: Vec<RubixRenderElement<RubixRenderer<'a>>> = match &round {
-                Some(shaders) => elems
-                    .into_iter()
-                    .map(|e| {
-                        RubixRenderElement::Rounded(crate::rounding::RoundedElement::with_program(
-                            e,
-                            shaders,
-                            crate::rounding::RoundMode::Decode(kind),
-                            Scale::from(scale),
-                            state.sdr_white_nits,
-                        ))
-                    })
-                    .collect(),
-                None => elems.into_iter().map(RubixRenderElement::Surface).collect(),
-            };
-            match layer.layer() {
-                Layer::Background => background.extend(wrapped),
-                Layer::Bottom => bottom.extend(wrapped),
-                Layer::Top => top.extend(wrapped),
-                Layer::Overlay => overlay.extend(wrapped),
-            }
-        }
-    }
-
-    let output_geo = state.space.output_geometry(output);
-
-    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
-        state,
-        renderer,
-        output,
-        scale,
-        crate::rounding::SpaceMode::HdrComposite,
-        wallpaper_sdr_tonemap,
-    );
 
     // Decorated ghost + reveal-tween elements. `SpaceMode::HdrComposite`
     // resolves each to its own declared `DecodeKind` the same way an
@@ -2098,82 +1939,23 @@ fn gather_hdr_composite_elements<'a>(
         wallpaper_sdr_tonemap,
     );
 
-    // Cursor rebuilt independently of `render_surface`'s own (untouched)
-    // cursor elements -- cheap (element structs referencing existing
-    // textures, no new GPU work). Already a `RubixRenderElement`, not a bare
-    // surface element, so it is re-wrapped by matching the variant rather
-    // than via `RoundedElement::with_program` directly -- there is no enum
-    // slot for "`RoundedElement` around the whole enum" (and adding one would
-    // be self-referential).
-    let cursor_elements: Vec<RubixRenderElement<RubixRenderer<'a>>> = match output_geo {
-        Some(geo) if geo.to_f64().contains(state.pointer_location) => {
-            let local = state.pointer_location - geo.loc.to_f64();
-            pointer_render_elements(renderer, &state.cursor_status, local, scale)
-                .into_iter()
-                .map(|e| match (&round, e) {
-                    (Some(shaders), RubixRenderElement::Surface(inner)) => {
-                        RubixRenderElement::Rounded(crate::rounding::RoundedElement::with_program(
-                            inner,
-                            shaders,
-                            crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
-                            Scale::from(scale),
-                            state.sdr_white_nits,
-                        ))
-                    }
-                    (Some(shaders), RubixRenderElement::Memory(inner)) => {
-                        RubixRenderElement::RoundedMemory(crate::rounding::RoundedElement::with_program(
-                            inner,
-                            shaders,
-                            crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
-                            Scale::from(scale),
-                            state.sdr_white_nits,
-                        ))
-                    }
-                    (_, other) => other,
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-
-    // Same front-to-back order as `render_surface`'s `elements`: cursor,
-    // overlay, top, tween elements, tween backdrops, space, backdrops,
-    // bottom, background, wallpaper.
-    let mut elements: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
-    elements.extend(cursor_elements);
-    elements.extend(overlay);
-    elements.extend(top);
-    elements.extend(tween_elements);
-    elements.extend(tween_backdrops);
-    elements.extend(space_elements);
-    // Per-window backdrop quads, spliced in exactly where `render_surface`
-    // puts them relative to `space_elements`'s output -- below every window,
-    // above `bottom`/`background`.
-    elements.extend(backdrop_elements);
-    elements.extend(bottom);
-    elements.extend(background);
-    // Bottom of the stack. `tonemap: false` -- this pass installs its own
-    // per-element decode below rather than asking `wallpaper::element` to
-    // tone-map, so the returned element is the bare, unwrapped one; wrap it
-    // here with the wallpaper's own `DecodeKind` like every other element in
-    // this pass.
-    if let Some(region) = output_geo
-        && let Some((kind, elem)) = state.wallpaper.element(renderer, &output.name(), region.size, scale, false)
-    {
-        let wrapped = match (&round, elem) {
-            (Some(shaders), RubixRenderElement::Memory(inner)) => {
-                RubixRenderElement::RoundedMemory(crate::rounding::RoundedElement::with_program(
-                    inner,
-                    shaders,
-                    crate::rounding::RoundMode::Decode(kind),
-                    Scale::from(scale),
-                    state.sdr_white_nits,
-                ))
-            }
-            (_, other) => other,
-        };
-        elements.push(wrapped);
-    }
+    let elements = crate::compose::compose_output_elements(
+        state,
+        renderer,
+        output,
+        crate::compose::ComposeOptions {
+            scale,
+            space_mode: crate::rounding::SpaceMode::HdrComposite,
+            wrap: crate::compose::WrapMode::HdrComposite { round: &round, wallpaper_sdr_tonemap },
+            include_wallpaper: true,
+            cursor: crate::compose::CursorMode::OutputLocal,
+            // No fullscreen suppression on this pass today -- exclusive
+            // fullscreen takes the direct-scanout path instead.
+            suppress_chrome: false,
+        },
+        tween_elements,
+        tween_backdrops,
+    );
     crate::decoration::prune_ring_cache(state);
     elements
 }

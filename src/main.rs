@@ -3,6 +3,7 @@
 mod handlers;
 
 mod color_management;
+mod compose;
 mod config;
 mod cursor;
 mod decoration;

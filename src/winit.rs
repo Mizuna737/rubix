@@ -2,21 +2,16 @@ use std::time::Duration;
 
 use smithay::{
     backend::{
-        renderer::{
-            damage::OutputDamageTracker,
-            element::{surface::WaylandSurfaceRenderElement, AsRenderElements},
-            gles::GlesRenderer,
-        },
+        renderer::{damage::OutputDamageTracker, gles::GlesRenderer},
         winit::{self, WinitEvent},
     },
     desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
-    utils::{Rectangle, Scale, Transform},
-    wayland::shell::wlr_layer::Layer,
+    utils::{Rectangle, Transform},
 };
 
-use crate::cursor::{pointer_render_elements, RubixRenderElement};
+use crate::cursor::RubixRenderElement;
 use crate::RubixState;
 
 pub fn init_winit(
@@ -97,51 +92,6 @@ pub fn init_winit(
                     // `OutputDamageTracker` directly is the only way to get the
                     // wallpaper beneath the tiled windows.
                     let scale = 1.0_f64;
-                    let mut background: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-                    let mut bottom: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-                    let mut top: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-                    let mut overlay: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-                    {
-                        let map = layer_map_for_output(&output);
-                        for layer in map.layers() {
-                            let Some(geo) = map.layer_geometry(layer) else { continue };
-                            let loc = geo.loc.to_physical_precise_round(scale);
-                            let elems = layer
-                                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                                    renderer,
-                                    loc,
-                                    Scale::from(scale),
-                                    1.0,
-                                );
-                            match layer.layer() {
-                                Layer::Background => background.extend(elems),
-                                Layer::Bottom => bottom.extend(elems),
-                                Layer::Top => top.extend(elems),
-                                Layer::Overlay => overlay.extend(elems),
-                            }
-                        }
-                    }
-
-                    // `space_render_elements` is intentionally not used here: as
-                    // of smithay 0.7 (wayland_frontend feature) it already folds
-                    // the output's LayerMap into its result, which would
-                    // double-render every layer surface if combined with the
-                    // pass above. `render_elements_for_region` gives the space's
-                    // own contribution alone.
-                    // RoundMode::Plain: no colour conversion is in play on this path, so a
-                    // rounded element takes the plain texture program rather than a decode
-                    // variant. Falls back to the batched call at corner_radius = 0.
-                    // winit is the dev backend: no HDR output, so the
-                    // destination-forced tonemap flag is always false here, same
-                    // as the wallpaper element below.
-                    let (space_elements, backdrop_elements) = crate::rounding::space_elements(
-                        data,
-                        renderer,
-                        &output,
-                        scale,
-                        crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain),
-                        false,
-                    );
 
                     // Decorated ghost + reveal-tween elements, built from
                     // `active_ghosts`/`active_scales` (populated by
@@ -159,47 +109,28 @@ pub fn init_winit(
                         false,
                     );
 
-                    // Cursor built last (it needs `renderer` too) so it stays
-                    // in the same "collect before the combined render call"
-                    // discipline as the ghost/layer lists above -- the
-                    // borrow is released before `damage_tracker.render_output`.
-                    let cursor_elements = pointer_render_elements(
-                        renderer,
-                        &data.cursor_status,
-                        data.pointer_location,
-                        scale,
-                    );
-
-                    // Collected before this point so the mutable `renderer`
-                    // borrow used to build each element list is released in
-                    // time for `damage_tracker.render_output` below. Cursor is
-                    // prepended -- front of the Vec is topmost, and it must
-                    // draw above everything else, including overlay layers.
-                    let mut elements: Vec<RubixRenderElement<GlesRenderer>> = Vec::new();
-                    elements.extend(cursor_elements);
-                    elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
-                    elements.extend(top.into_iter().map(RubixRenderElement::Surface));
-                    elements.extend(tween_elements);
-                    elements.extend(tween_backdrops);
-                    elements.extend(space_elements);
-                    elements.extend(backdrop_elements);
-                    elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
-                    elements.extend(background.into_iter().map(RubixRenderElement::Surface));
                     // winit is the dev backend: no HDR output, no capture, so
                     // the wallpaper is drawn plainly. An HDR image here is not
                     // tone-mapped (`tonemap: false`) -- the nested window has
                     // no colour pipeline to tone-map into.
-                    if let Some(region) = data.space.output_geometry(&output)
-                        && let Some((_, wallpaper)) = data.wallpaper.element(
+                    let elements: Vec<RubixRenderElement<GlesRenderer>> =
+                        crate::compose::compose_output_elements(
+                            data,
                             renderer,
-                            &output.name(),
-                            region.size,
-                            scale,
-                            false,
-                        )
-                    {
-                        elements.push(wallpaper);
-                    }
+                            &output,
+                            crate::compose::ComposeOptions {
+                                scale,
+                                space_mode: crate::rounding::SpaceMode::Fixed(
+                                    crate::rounding::RoundMode::Plain,
+                                ),
+                                wrap: crate::compose::WrapMode::Sdr { tonemap: false },
+                                include_wallpaper: true,
+                                cursor: crate::compose::CursorMode::Global,
+                                suppress_chrome: false,
+                            },
+                            tween_elements,
+                            tween_backdrops,
+                        );
 
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, [0.1, 0.1, 0.1, 1.0])
