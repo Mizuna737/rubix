@@ -24,6 +24,7 @@ mod rounding;
 mod foreign_toplevel;
 mod screencopy;
 mod state;
+mod text;
 mod udev;
 mod winit;
 
