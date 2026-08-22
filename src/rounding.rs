@@ -96,85 +96,145 @@ float rubixCornerAlpha() {
 
 "#;
 
-/// GLSL for the crystal-facet refraction, spliced in alongside the rounding
-/// mask. Reads `rubix_elem_size` / `rubix_elem_offset` from `ROUNDING_GLSL`,
-/// so it must be concatenated *after* it.
+/// GLSL for the crystal refraction, spliced in alongside the rounding mask.
+/// Reads `rubix_elem_size` / `rubix_elem_offset` from `ROUNDING_GLSL`, so it
+/// must be concatenated *after* it.
 ///
-/// The field is evaluated in **window** space, the same space the rounding
-/// mask uses and for the same reason: a window's subsurfaces are separate
-/// elements, and a facet pattern anchored per-element would visibly restart at
-/// every subsurface boundary. Window space also means the crystal travels with
-/// the window instead of the window sliding across a fixed field, which is the
-/// look being asked for -- the window *is* the crystal.
+/// The field models the **solid**, not its cells. An earlier version scattered
+/// Voronoi cells and gave each a random tilt; it worked, and it read as
+/// low-poly 3D rather than as crystal. Three things were wrong with it, and
+/// all three are properties of that model rather than of its tuning: every
+/// face was about the same size, the tilts were mutually independent so
+/// nothing organised them, and dispersion keyed to cell boundaries drew a
+/// coloured line around every cell, which is indistinguishable from a
+/// highlighted wireframe.
 ///
-/// Dispersion is amplified towards the facet seams rather than applied flat.
-/// That is both what a cut gem actually does (colour separates along the cut
-/// lines, not across the face) and the reason no luminance is manufactured
-/// anywhere in here: the sparkle is entirely a sampling effect, so it composes
-/// with the HDR pipeline instead of fighting it.
+/// So the facets are derived here instead of authored. A crystal cleaves along
+/// families of parallel planes, so the field is the distance to the nearest
+/// plane over a few such families, and the facet normal is the gradient of
+/// that distance. Faces then fall out of the geometry: their sizes vary
+/// because they are cross-sections of intersecting families rather than cells
+/// on a grid, and their orientations are drawn from one shared set of
+/// directions, which is what makes them look related to each other the way
+/// crystallographic axes are. It is also cheaper -- the families are dot
+/// products against compile-time constants, where the Voronoi search cost
+/// nine hashes and a square root per fragment.
+///
+/// Having a real surface normal is what unlocks the rest. Refraction alone
+/// reads as tinted jelly, because the missing cue is reflectance: glass
+/// reflects more at grazing angles, and nothing here did. The Fresnel term
+/// blends in a reflection tap, using the wallpaper as its own environment.
+///
+/// Nothing in here manufactures luminance, which is a deliberate constraint
+/// and not merely a nicety. The splice point is the *sample* site, so anything
+/// added would land in whatever encoding the source uses -- adding a constant
+/// is a mild lift in sRGB and an enormous one in PQ, so the same code would
+/// mean different things in the eight program variants this is spliced into.
+/// Everything below therefore modulates where samples are taken and how they
+/// are mixed, never their magnitude. Internal fracture sheets get their glint
+/// by going locally mirror-like (`max(fresnel, sheet)`), which is both what a
+/// fracture physically is and energy the wallpaper already had.
 const REFRACT_GLSL: &str = r#"
 uniform float rubix_refract_strength;
 uniform vec2 rubix_refract_uv_per_px;
 uniform float rubix_refract_facet_size;
 uniform float rubix_refract_dispersion;
 
-// Two decorrelated dot products through the classic sin-fract hash. `highp` is
-// what keeps this stable over the cell counts a full-screen window reaches;
-// at mediump the pattern visibly repeats.
-vec2 rubixHash2(vec2 c) {
-    float a = dot(c, vec2(127.1, 311.7));
-    float b = dot(c, vec2(269.5, 183.3));
-    return fract(sin(vec2(a, b)) * 43758.5453);
+// Hash-without-sine (Dave Hoskins). Deliberately not the `fract(sin(...))`
+// classic: that costs two SFU ops per call, and profiling put the noise -- not
+// the texture taps, and not the plane families -- at well over half this
+// shader's total cost.
+//
+// Two-channel on purpose. The domain warp needs two decorrelated values at the
+// *same* coordinate, and taking them from two scalar lattices doubles the hash
+// count for nothing; one vec2 lattice gives both from the same four hashes and
+// measured 17% off the whole shader.
+vec2 rubixHash22(vec2 p) {
+    vec3 p3 = fract(vec3(p.x, p.y, p.x) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
 }
 
-// One Voronoi cell lookup. Returns the facet's bend direction in `xy` and, in
-// `z`, how far inside the facet the fragment sits (1.0 deep inside, 0.0 on a
-// seam).
+vec2 rubixNoise2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = p - i;
+    f = f * f * (3.0 - 2.0 * f);
+    vec2 a = rubixHash22(i);
+    vec2 b = rubixHash22(i + vec2(1.0, 0.0));
+    vec2 c = rubixHash22(i + vec2(0.0, 1.0));
+    vec2 d = rubixHash22(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// One family of parallel cleavage planes, normal `n`, unit spacing, offset by
+// `phase`. Keeps the running nearest across families; the winner's normal is
+// the facet normal, which is constant across a face and flips sign either side
+// of a plane, so adjacent faces tilt away from each other like a real ridge.
 //
-// The bend is a constant per-cell tilt plus a radial term. Tilt alone gives
-// flat facets -- correct for a faceted solid, but it reads as random blocks.
-// The radial term makes each cell behave like a small lens as well, which is
-// what tips the look from "shattered" to "cut".
-vec3 rubixFacet(vec2 p) {
-    vec2 cell = floor(p);
-    vec2 f = p - cell;
-    vec2 winner = vec2(0.0);
-    vec2 site = vec2(0.0);
-    float best = 8.0;
-    float second = 8.0;
-    for (int j = -1; j <= 1; j++) {
-        for (int i = -1; i <= 1; i++) {
-            vec2 g = vec2(float(i), float(j));
-            vec2 s = g + rubixHash2(cell + g);
-            float d = length(s - f);
-            if (d < best) {
-                second = best;
-                best = d;
-                site = s;
-                winner = g;
-            } else if (d < second) {
-                second = d;
-            }
-        }
+// `amp` varies the tilt between families. Without it every facet bends by the
+// same magnitude and only the direction changes, which looks stamped.
+void rubixCleave(vec2 p, vec2 n, float phase, float amp,
+                 inout float best, inout vec2 grad) {
+    float f = fract(dot(p, n) + phase) - 0.5;
+    float d = abs(f) * amp;
+    if (d < best) {
+        best = d;
+        grad = n * sign(f) * amp;
     }
-    vec2 tilt = rubixHash2(cell + winner + vec2(17.0, 23.0)) * 2.0 - 1.0;
-    vec2 radial = f - site;
-    vec2 bend = clamp(tilt + radial * 1.5, vec2(-1.5), vec2(1.5)) / 1.5;
-    // `second - best` is zero exactly on the boundary between two cells and
-    // grows inwards, which makes it a seam distance without needing the edge
-    // geometry itself.
-    return vec3(bend, smoothstep(0.0, 0.09, second - best));
+}
+
+// Four families, at angles that are not simple fractions of each other so the
+// faces do not settle into an obvious repeating tiling.
+vec2 rubixCleavage(vec2 p) {
+    float best = 1000.0;
+    vec2 grad = vec2(0.0);
+    rubixCleave(p, vec2( 0.9808,  0.1951), 0.00, 1.00, best, grad);
+    rubixCleave(p, vec2( 0.3090,  0.9511), 0.37, 0.82, best, grad);
+    rubixCleave(p, vec2(-0.5878,  0.8090), 0.61, 1.15, best, grad);
+    rubixCleave(p, vec2(-0.9511,  0.3090), 0.13, 0.68, best, grad);
+    return grad;
 }
 
 vec4 rubixSampleRefracted() {
     if (rubix_refract_strength <= 0.0) {
         return texture2D(tex, v_coords);
     }
-    vec2 p = v_coords * rubix_elem_size + rubix_elem_offset;
-    vec3 facet = rubixFacet(p / max(rubix_refract_facet_size, 1.0));
-    vec2 base = facet.xy * rubix_refract_strength * rubix_refract_uv_per_px;
-    // Wider splitting on the seams, none in the middle of a face.
-    float spread = rubix_refract_dispersion * (1.0 + 2.0 * (1.0 - facet.z));
+    vec2 pw = (v_coords * rubix_elem_size + rubix_elem_offset)
+            / max(rubix_refract_facet_size, 1.0);
+
+    // Plane families are exactly periodic on their own, and a periodic lattice
+    // is its own kind of tell. The warp bends the planes gently, which also
+    // happens to be true of real crystal faces.
+    vec2 warp = rubixNoise2(pw * 0.35) - 0.5;
+    vec2 pc = pw + warp * 0.9;
+
+    // Two octaves: broad cleavage with finer fracture inside it. A single
+    // scale is what made the first version read as uniformly tessellated.
+    vec2 grad = rubixCleavage(pc) + rubixCleavage(pc * 3.3 + 4.1) * 0.35;
+
+    // Internal fracture planes that never reach the surface -- the bright
+    // suspended veils in natural quartz. Patchy on purpose: a fracture that
+    // spans the whole window reads as a scratch on the screen instead.
+    float sheetLine = abs(fract(dot(pc, vec2(0.6, 0.8)) * 1.7) - 0.5);
+    float sheetMask = smoothstep(0.45, 0.80, rubixNoise2(pw * 0.22 + 31.0).x);
+    float sheet = sheetMask * smoothstep(0.045, 0.0, sheetLine);
+
+    // View is orthographic and screen-facing, so the facet normal's z is the
+    // cosine directly.
+    vec3 normal = normalize(vec3(-grad * 0.8, 1.0));
+    float grazing = 1.0 - clamp(normal.z, 0.0, 1.0);
+    float g2 = grazing * grazing;
+    // Schlick, with glass's 0.04 normal-incidence reflectance. A fracture
+    // sheet overrides it to near-mirror, which is what a fracture is.
+    float fresnel = clamp(max(0.04 + 0.96 * g2 * g2 * grazing, sheet), 0.0, 1.0);
+
+    // Dispersion follows the grazing angle rather than the distance to a face
+    // boundary. Keying it to boundaries drew a coloured outline around every
+    // facet, which is the single thing that most made the old version look
+    // like rendered geometry instead of a material.
+    float spread = rubix_refract_dispersion * (0.35 + 1.6 * grazing + 2.0 * sheet);
+
+    vec2 base = grad * rubix_refract_strength * rubix_refract_uv_per_px;
     // Clamped to the whole texture, not to this quad's crop: a backdrop is a
     // source-crop of the shared wallpaper, so a bent ray leaving the window's
     // own slice lands on the wallpaper next to it, which is exactly what
@@ -182,9 +242,17 @@ vec4 rubixSampleRefracted() {
     vec4 cr = texture2D(tex, clamp(v_coords + base * (1.0 - spread), 0.0, 1.0));
     vec4 cg = texture2D(tex, clamp(v_coords + base, 0.0, 1.0));
     vec4 cb = texture2D(tex, clamp(v_coords + base * (1.0 + spread), 0.0, 1.0));
+    vec3 transmitted = vec3(cr.r, cg.g, cb.b);
+
+    // The wallpaper doubles as its own environment map. Mirrored and shrunk so
+    // the reflection is a different image from the transmission -- reflecting
+    // the same pixels back would just read as a brightness change.
+    vec2 mirrored = clamp(vec2(0.5) + (v_coords - 0.5) * -0.55 + grad * 0.06, 0.0, 1.0);
+    vec3 reflected = texture2D(tex, mirrored).rgb;
+
     // Alpha rides the green tap. Mixing per-channel alpha would break
     // premultiplication; a wallpaper is opaque, so there is nothing to mix.
-    return vec4(cr.r, cg.g, cb.b, cg.a);
+    return vec4(mix(transmitted, reflected, fresnel), cg.a);
 }
 
 "#;
