@@ -2102,56 +2102,7 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-/// Surface elements for every window mid-Reveal, each wrapped in a
-/// `RescaleRenderElement` about the window's own centre so it grows or shrinks
-/// in place rather than toward a corner.
-///
-/// These windows are unmapped from the `Space` for the whole tween (see
-/// `step_animations`), because `render_elements_for_region` draws the space in
-/// one call and cannot scale individual elements. So this is their ONLY draw --
-/// omitting this list from a render path makes revealing windows invisible for
-/// the length of the animation rather than merely unscaled. Mirrors the ghost
-/// path, including its 1.0 output scale assumption.
-use smithay::backend::renderer::{
-    element::{surface::WaylandSurfaceRenderElement, utils::RescaleRenderElement, AsRenderElements},
-    ImportAll, Renderer,
-};
-use smithay::utils::{ClockSource, Monotonic, Physical, Scale};
-
-pub(crate) fn reveal_scale_elements<R>(
-    state: &RubixState,
-    renderer: &mut R,
-) -> Vec<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>
-where
-    R: Renderer + ImportAll,
-    R::TextureId: Clone + 'static,
-{
-    let scaled: Vec<(Window, Pos, f32)> = state
-        .active_scales
-        .iter()
-        .filter_map(|(id, pos, factor)| state.windows.get(id).map(|w| (w.clone(), *pos, *factor)))
-        .collect();
-
-    let mut out = Vec::new();
-    for (window, pos, factor) in scaled {
-        // Fully collapsed: nothing worth drawing, and a zero scale degenerates
-        // the element geometry.
-        if factor <= 0.01 {
-            continue;
-        }
-        let size = window.geometry().size;
-        let origin = Point::<i32, Physical>::from((pos.x + size.w / 2, pos.y + size.h / 2));
-        for element in window.render_elements::<WaylandSurfaceRenderElement<R>>(
-            renderer,
-            Point::<i32, Physical>::from((pos.x, pos.y)),
-            Scale::from(1.0),
-            1.0,
-        ) {
-            out.push(RescaleRenderElement::from_element(element, origin, factor as f64));
-        }
-    }
-    out
-}
+use smithay::utils::{ClockSource, Monotonic};
 
 /// Pure policy backing `RubixState::any_output_off`: true if any listed
 /// output is off. Split out (mirroring `idle_timer_delay` below) so the

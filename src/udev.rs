@@ -105,7 +105,6 @@ use crate::color_management::{surface_decode_kind, DecodeKind};
 use crate::rounding::RoundMode;
 use crate::cursor::{pointer_render_elements, RubixRenderElement};
 use crate::hdr_shaders::{compile_hdr_shaders, sdr_solid_transform, HdrShaders};
-use crate::state::Pos;
 use crate::RubixState;
 
 // The four `DrmOutputManager`/`DrmOutput` generics never vary in this backend:
@@ -1436,48 +1435,33 @@ fn render_surface(
         sdr_tonemap,
     );
 
-    // Ghost elements for any in-flight rotation wrap, built from
-    // `active_ghosts` (populated by `step_animations` right before this call,
-    // same frame). Collect the (window, pos) pairs first so the immutable
-    // borrow of `state` is released before calling `render_elements`, which
-    // needs the separate `&mut renderer` already in scope. Output scale is 1.0
-    // here, so a logical Pos maps numerically to physical directly -- if that
-    // ever changes, this needs `.to_physical_precise_round(scale)` from a
-    // logical point instead. Rendered between top/overlay and the space so
-    // ghosts stay above tiled windows but below chrome-style layer surfaces.
-    let ghost_windows: Vec<(Window, Pos)> = state
-        .active_ghosts
-        .iter()
-        .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
-        .collect();
-    let mut ghosts: Vec<WaylandSurfaceRenderElement<RubixRenderer<'_>>> = Vec::new();
-    for (window, pos) in ghost_windows {
-        ghosts.extend(window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'_>>>(
-            renderer,
-            Point::<i32, Physical>::from((pos.x, pos.y)),
-            Scale::from(1.0),
-            1.0,
-        ));
-    }
-
-    // Windows mid-Reveal, drawn scaled about their own centre. They are
-    // unmapped from the Space for the tween's duration, so this list is their
-    // only draw -- dropping it makes them vanish for the animation rather than
-    // merely render unscaled. Same z-slot as the ghosts, for the same reason.
-    let mut scaled = crate::state::reveal_scale_elements(state, renderer);
+    // Decorated ghost + reveal-tween elements, built from `active_ghosts`/
+    // `active_scales` (populated by `step_animations` right before this call,
+    // same frame). Rendered between top/overlay and the space so tween
+    // windows stay above tiled windows but below chrome-style layer surfaces.
+    // See `tween_elements` for the coordinate-space caveat (`pos` is not
+    // region-local).
+    let (mut tween_elements, mut tween_backdrops) = crate::rounding::tween_elements(
+        state,
+        renderer,
+        &surface.output,
+        scale,
+        space_mode,
+        sdr_tonemap,
+    );
 
     // Exclusive fullscreen: chrome above the game (layer-shell top/overlay,
-    // animation ghosts) must not render, both because it would be incorrect
-    // (waybar etc. shouldn't paint over a fullscreen game) and because
-    // anything above the candidate element in the final list is fatal to
-    // primary-plane promotion. `bottom`/`background` are left as built --
-    // they're culled by `DrmCompositor`'s opaque short-circuit and are the
-    // fallback if promotion fails for some other reason.
+    // animation ghosts/reveal-tweens) must not render, both because it would
+    // be incorrect (waybar etc. shouldn't paint over a fullscreen game) and
+    // because anything above the candidate element in the final list is
+    // fatal to primary-plane promotion. `bottom`/`background` are left as
+    // built -- they're culled by `DrmCompositor`'s opaque short-circuit and
+    // are the fallback if promotion fails for some other reason.
     if fullscreen_kind.is_some() {
         top.clear();
         overlay.clear();
-        ghosts.clear();
-        scaled.clear();
+        tween_elements.clear();
+        tween_backdrops.clear();
     }
 
     // Cursor built last (it also needs `renderer`), same "collect before the
@@ -1510,8 +1494,8 @@ fn render_surface(
     elements.extend(cursor_elements);
     elements.extend(overlay);
     elements.extend(top);
-    elements.extend(ghosts.into_iter().map(RubixRenderElement::Surface));
-    elements.extend(scaled.into_iter().map(RubixRenderElement::Rescaled));
+    elements.extend(tween_elements);
+    elements.extend(tween_backdrops);
     elements.extend(space_elements);
     // Per-window backdrop quads (see src/wallpaper.rs). Deliberately below
     // every window rather than interleaved per-window: the quad is opaque
@@ -2097,35 +2081,22 @@ fn gather_hdr_composite_elements<'a>(
         wallpaper_sdr_tonemap,
     );
 
-    let ghost_windows: Vec<(Window, Pos)> = state
-        .active_ghosts
-        .iter()
-        .filter_map(|(id, pos)| state.windows.get(id).map(|w| (w.clone(), *pos)))
-        .collect();
-    let mut ghosts: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
-    for (window, pos) in ghost_windows {
-        let elems = window.render_elements::<WaylandSurfaceRenderElement<RubixRenderer<'a>>>(
-            renderer,
-            Point::<i32, Physical>::from((pos.x, pos.y)),
-            Scale::from(1.0),
-            1.0,
-        );
-        ghosts.extend(match &round {
-            Some(shaders) => elems
-                .into_iter()
-                .map(|e| {
-                    RubixRenderElement::Rounded(crate::rounding::RoundedElement::with_program(
-                        e,
-                        shaders,
-                        crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
-                        Scale::from(1.0),
-                        state.sdr_white_nits,
-                    ))
-                })
-                .collect::<Vec<_>>(),
-            None => elems.into_iter().map(RubixRenderElement::Surface).collect(),
-        });
-    }
+    // Decorated ghost + reveal-tween elements. `SpaceMode::HdrComposite`
+    // resolves each to its own declared `DecodeKind` the same way an
+    // ordinary window is, rather than the fixed `Decode(Sdr)` this branch
+    // used to hardcode for ghosts -- full parity means a ghost or reveal
+    // copy of an HDR client must decode as HDR here too. `decorate_window`'s
+    // `needs_program` is unconditional under `HdrComposite`, so every
+    // returned element already carries its own program; nothing here needs
+    // to re-wrap them.
+    let (tween_elements, tween_backdrops) = crate::rounding::tween_elements(
+        state,
+        renderer,
+        output,
+        scale,
+        crate::rounding::SpaceMode::HdrComposite,
+        wallpaper_sdr_tonemap,
+    );
 
     // Cursor rebuilt independently of `render_surface`'s own (untouched)
     // cursor elements -- cheap (element structs referencing existing
@@ -2165,38 +2136,15 @@ fn gather_hdr_composite_elements<'a>(
         _ => Vec::new(),
     };
 
-    // Windows mid-Reveal, drawn scaled about their own centre. They are
-    // unmapped from the Space for the tween's duration, so this list is their
-    // only draw -- dropping it makes them vanish for the animation rather than
-    // merely render unscaled. Same z-slot as the ghosts, for the same reason.
-    let scaled: Vec<RubixRenderElement<RubixRenderer<'a>>> = match &round {
-        Some(shaders) => crate::state::reveal_scale_elements(state, renderer)
-            .into_iter()
-            .map(|e| {
-                RubixRenderElement::RoundedRescaled(crate::rounding::RoundedElement::with_program(
-                    e,
-                    shaders,
-                    crate::rounding::RoundMode::Decode(DecodeKind::Sdr),
-                    Scale::from(1.0),
-                    state.sdr_white_nits,
-                ))
-            })
-            .collect(),
-        None => crate::state::reveal_scale_elements(state, renderer)
-            .into_iter()
-            .map(RubixRenderElement::Rescaled)
-            .collect(),
-    };
-
     // Same front-to-back order as `render_surface`'s `elements`: cursor,
-    // overlay, top, ghosts, scaled, space, backdrops, bottom, background,
-    // wallpaper.
+    // overlay, top, tween elements, tween backdrops, space, backdrops,
+    // bottom, background, wallpaper.
     let mut elements: Vec<RubixRenderElement<RubixRenderer<'a>>> = Vec::new();
     elements.extend(cursor_elements);
     elements.extend(overlay);
     elements.extend(top);
-    elements.extend(ghosts);
-    elements.extend(scaled);
+    elements.extend(tween_elements);
+    elements.extend(tween_backdrops);
     elements.extend(space_elements);
     // Per-window backdrop quads, spliced in exactly where `render_surface`
     // puts them relative to `space_elements`'s output -- below every window,

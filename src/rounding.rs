@@ -41,6 +41,7 @@
 use std::cell::RefCell;
 
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::gles::element::PixelShaderElement;
 use smithay::backend::renderer::gles::{
     GlesError, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
@@ -50,12 +51,14 @@ use smithay::backend::renderer::{Renderer, RendererSuper};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::{ImportAll, ImportMem};
 use smithay::backend::renderer::element::AsRenderElements;
+use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::utils::user_data::UserDataMap;
 
 use smithay::wayland::seat::WaylandFocus;
 use crate::color_management::DecodeKind;
+use crate::config::WindowStyle;
 use crate::cursor::RubixRenderElement;
 use crate::RubixState;
 use crate::hdr_shaders::{DECODE_HDR_PQ, DECODE_SDR, DECODE_WINDOWS_SCRGB};
@@ -943,6 +946,39 @@ fn backdrop_hdr_pass(mode: SpaceMode) -> bool {
     matches!(mode, SpaceMode::HdrComposite)
 }
 
+/// A tween window's on-screen rect: `RescaleRenderElement` scales geometry
+/// about `origin` by `factor`, so anything measured against the window has to
+/// be scaled the same way or it will be drawn for a size the window no longer
+/// has.
+pub(crate) fn rescaled_rect(
+    local_rect: Rectangle<i32, Logical>,
+    origin: Point<i32, Physical>,
+    factor: f64,
+    scale: f64,
+) -> Rectangle<i32, Logical> {
+    let origin_logical = Point::<f64, Logical>::from((origin.x as f64 / scale, origin.y as f64 / scale));
+    let rect = local_rect.to_f64();
+    let loc = Point::<f64, Logical>::from((
+        origin_logical.x + (rect.loc.x - origin_logical.x) * factor,
+        origin_logical.y + (rect.loc.y - origin_logical.y) * factor,
+    ));
+    let size = smithay::utils::Size::<f64, Logical>::from((rect.size.w * factor, rect.size.h * factor));
+    Rectangle::<f64, Logical>::new(loc, size).to_i32_round()
+}
+
+/// Corner radius for one window: forced to 0 when fullscreen (no corner to
+/// cut, and it disqualifies the window from primary-plane scanout anyway),
+/// then scaled down by a tween's rescale factor so corners shrink with a
+/// collapsing window instead of staying a fixed pixel size. Split out purely
+/// so the fullscreen/tween interaction is testable without a live renderer.
+fn effective_radius(radius: f32, fullscreen: bool, rescale_factor: Option<f64>) -> f32 {
+    let base = if fullscreen { 0.0 } else { radius };
+    match rescale_factor {
+        Some(factor) => base * factor as f32,
+        None => base,
+    }
+}
+
 /// `wallpaper_sdr_tonemap` is the same "destination is 8-bit sRGB, source is
 /// not" flag the caller already computes for the wallpaper element itself
 /// (`sdr_tonemap_needed`). A per-window backdrop quad sampling HDR wallpaper
@@ -990,7 +1026,6 @@ where
                     || s.glow_margin.is_some_and(|g| g > 0)
             })
         });
-    let hdr = matches!(mode, SpaceMode::Fixed(RoundMode::Decode(_)) | SpaceMode::HdrComposite);
     // Capture resolves a program per window, which the batched call cannot
     // express -- it hands back one flat element list with no window identity
     // left in it. So this forces the per-window walk below even with no chrome
@@ -1047,10 +1082,6 @@ where
         // border ring is built around and what the rounding mask is measured
         // against.
         let local_rect = Rectangle::<i32, Logical>::new(location - region.loc, geometry.size);
-        let window_rect = Rectangle::<i32, Physical>::new(
-            local_rect.loc.to_physical_precise_round(scale),
-            local_rect.size.to_physical_precise_round(scale),
-        );
 
         // Resolved once and shared by the border and the window's own surfaces,
         // so the two cannot disagree about which rule matched.
@@ -1059,99 +1090,197 @@ where
                 id,
                 occlusion.get(&id).copied().unwrap_or(0.0),
             ));
-        if let (Some(id), Some(style)) = (id, style.as_ref()) {
-            if let Some(ring) = crate::decoration::window_border_elements(
-                state, renderer, id, style, local_rect, hdr,
-            ) {
-                elements.push(RubixRenderElement::BorderRing(ring));
-            }
-        }
 
-        // A frosted/tone-mapped backdrop only makes sense for a window that is
-        // actually letting the wallpaper show through. `style.opacity < 1.0`
-        // is also what already excludes a fullscreen window here without a
-        // separate check -- `style_for_window` forces it back to `1.0` for
-        // exactly this reason.
-        if let Some(style) = style.as_ref().filter(|s| {
-            s.opacity < 1.0 && (s.backdrop_tonemap || s.backdrop_blur || s.refract)
-        }) {
-            let tonemap = style.backdrop_tonemap || wallpaper_sdr_tonemap;
-            // Scaled here rather than in `backdrop_element`, which does not
-            // otherwise need to know the output scale: the caller owns the
-            // look (strength, facet size, dispersion), the callee owns the
-            // geometry (`uv_per_px`, overwritten below).
-            let refraction = if style.refract {
-                Refraction {
-                    strength: deco.refract_strength * scale as f32,
-                    facet_size: deco.refract_facet_size * scale as f32,
-                    dispersion: deco.refract_dispersion,
-                    // Both filled in by `backdrop_element`, which is the only
-                    // place that knows the crop this quad samples through.
-                    uv_origin: (0.0, 0.0),
-                    uv_per_px: (0.0, 0.0), // filled in by backdrop_element
-                }
-            } else {
-                Refraction::NONE
-            };
-            // `hdr_pass` picks which wrapper program a tone-mapped quad gets
-            // (see `RoundMode::TonemapAbs10k`'s doc comment): `true` only for
-            // `SpaceMode::HdrComposite`, whose destination is the abs10k
-            // offscreen and must stay in that working space rather than
-            // collapse to sRGB. Every other mode here -- `TonemapSdr` (a
-            // genuinely SDR output, or a capture) and `Fixed` (including the
-            // `hdr = true`-output-no-HDR-client case, where `kind.is_hdr()`
-            // inside `backdrop_element` is false and this flag is never even
-            // consulted) -- is `false`. Getting this backwards produces
-            // `RoundMode::Tonemap` (collapse to sRGB) where `TonemapAbs10k`
-            // (stay in the working space) is wanted, which reads on screen as
-            // the backdrop crushing to white -- a bug already shipped once.
-            if let Some((_, quad)) = state.wallpaper.backdrop_element(
-                renderer,
-                &output.name(),
-                region.size,
-                local_rect,
-                scale,
-                tonemap,
-                style.backdrop_blur,
-                backdrop_hdr_pass(mode),
-                state.sdr_white_nits,
-                refraction,
-            ) {
-                backdrops.push(quad);
-            }
-        }
-
-        let opacity = style.as_ref().map_or(1.0, |s| s.opacity);
-        let surfaces = window.render_elements::<WaylandSurfaceRenderElement<R>>(
+        decorate_window(
+            state,
             renderer,
-            render_location.to_physical_precise_round(scale),
-            Scale::from(scale),
-            opacity,
+            output,
+            region,
+            scale,
+            mode,
+            wallpaper_sdr_tonemap,
+            round.as_ref(),
+            radius,
+            window,
+            id,
+            fullscreen,
+            local_rect,
+            render_location,
+            style,
+            None,
+            &mut elements,
+            &mut backdrops,
         );
-        let window_kind = window
-            .wl_surface()
-            .map(|s| crate::color_management::surface_decode_kind(&s))
-            .unwrap_or(DecodeKind::Sdr);
-        let elem_mode = resolve_elem_mode(mode, window_kind);
-        // A fullscreen window is never rounded -- it covers the output, so there
-        // is no corner to cut.
-        let elem_radius = if fullscreen { 0.0 } else { radius };
-        // An SDR window in a capture resolves to the plain program, which is what
-        // it would have been drawn with anyway; wrapping it would buy a program
-        // swap per element for nothing. `HdrComposite` is unconditional instead:
-        // that pass has no renderer-wide default program at all (every element
-        // installs its own -- see `udev::render_surface_hdr_zrun`), so even a
-        // `Decode(Sdr)`, radius-0, fullscreen window must still be wrapped or it
-        // silently draws with whatever program the previous element left active.
-        let needs_program = matches!(mode, SpaceMode::HdrComposite)
-            || matches!(
-                elem_mode,
-                RoundMode::Tonemap(DecodeKind::HdrPq) | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
-            );
-        let wrap = round
-            .as_ref()
-            .filter(|_| elem_radius > 0.0 || needs_program);
-        match wrap {
+    }
+    crate::decoration::prune_ring_cache(state);
+    (elements, backdrops)
+}
+
+/// Decorate one window -- border, backdrop, and the window's own surfaces,
+/// rounded and opacity-adjusted -- and push the results into `elements`/
+/// `backdrops`. Extracted from `space_elements`'s per-window loop so the same
+/// treatment can be given to a reveal-tween or ghost window, which is drawn
+/// by hand outside the `Space` (see `tween_elements`) and so never reaches
+/// that loop.
+///
+/// `rescale: None` is exactly `space_elements`'s original per-window
+/// behaviour -- `local_rect` is used as-is. `rescale: Some((origin, factor))`
+/// is a mid-tween window: every rect measured against it (the rounding
+/// mask's `window_rect`, the border ring, the backdrop crop) is scaled about
+/// `origin` by `factor` first (see `rescaled_rect`), and the surfaces
+/// themselves are wrapped in a `RescaleRenderElement` *inside* any
+/// `RoundedElement` wrapper -- `RoundedElement::new` reads the inner
+/// element's geometry at construction, so the rescale has to already be
+/// applied by the time it does.
+#[allow(clippy::too_many_arguments)]
+fn decorate_window<R>(
+    state: &RubixState,
+    renderer: &mut R,
+    output: &Output,
+    region: Rectangle<i32, Logical>,
+    scale: f64,
+    mode: SpaceMode,
+    wallpaper_sdr_tonemap: bool,
+    round: Option<&RoundShaders>,
+    radius: f32,
+    window: &Window,
+    id: Option<u32>,
+    fullscreen: bool,
+    local_rect: Rectangle<i32, Logical>,
+    render_location: Point<i32, Logical>,
+    style: Option<WindowStyle>,
+    rescale: Option<(Point<i32, Physical>, f64)>,
+    elements: &mut Vec<RubixRenderElement<R>>,
+    backdrops: &mut Vec<RubixRenderElement<R>>,
+) where
+    R: Renderer + ImportAll + ImportMem + GlesAccess,
+    R::TextureId: Send + Clone + 'static,
+    RubixRenderElement<R>: RenderElement<R>,
+{
+    let deco = &state.config.decoration;
+    let hdr = matches!(mode, SpaceMode::Fixed(RoundMode::Decode(_)) | SpaceMode::HdrComposite);
+
+    // The rect this window is actually being drawn at this frame. Identical
+    // to `local_rect` for a mapped window; scaled about the tween's origin
+    // for a mid-Reveal one.
+    let effective_rect = match rescale {
+        Some((origin, factor)) => rescaled_rect(local_rect, origin, factor, scale),
+        None => local_rect,
+    };
+    let window_rect = Rectangle::<i32, Physical>::new(
+        effective_rect.loc.to_physical_precise_round(scale),
+        effective_rect.size.to_physical_precise_round(scale),
+    );
+
+    if let (Some(id), Some(style)) = (id, style.as_ref()) {
+        if let Some(ring) = crate::decoration::window_border_elements(
+            state, renderer, id, style, effective_rect, hdr,
+        ) {
+            elements.push(RubixRenderElement::BorderRing(ring));
+        }
+    }
+
+    // A frosted/tone-mapped backdrop only makes sense for a window that is
+    // actually letting the wallpaper show through. `style.opacity < 1.0`
+    // is also what already excludes a fullscreen window here without a
+    // separate check -- `style_for_window` forces it back to `1.0` for
+    // exactly this reason.
+    if let Some(style) = style.as_ref().filter(|s| {
+        s.opacity < 1.0 && (s.backdrop_tonemap || s.backdrop_blur || s.refract)
+    }) {
+        let tonemap = style.backdrop_tonemap || wallpaper_sdr_tonemap;
+        // Scaled here rather than in `backdrop_element`, which does not
+        // otherwise need to know the output scale: the caller owns the
+        // look (strength, facet size, dispersion), the callee owns the
+        // geometry (`uv_per_px`, overwritten below).
+        let refraction = if style.refract {
+            Refraction {
+                strength: deco.refract_strength * scale as f32,
+                facet_size: deco.refract_facet_size * scale as f32,
+                dispersion: deco.refract_dispersion,
+                // Both filled in by `backdrop_element`, which is the only
+                // place that knows the crop this quad samples through.
+                uv_origin: (0.0, 0.0),
+                uv_per_px: (0.0, 0.0), // filled in by backdrop_element
+            }
+        } else {
+            Refraction::NONE
+        };
+        // `hdr_pass` picks which wrapper program a tone-mapped quad gets
+        // (see `RoundMode::TonemapAbs10k`'s doc comment): `true` only for
+        // `SpaceMode::HdrComposite`, whose destination is the abs10k
+        // offscreen and must stay in that working space rather than
+        // collapse to sRGB. Every other mode here -- `TonemapSdr` (a
+        // genuinely SDR output, or a capture) and `Fixed` (including the
+        // `hdr = true`-output-no-HDR-client case, where `kind.is_hdr()`
+        // inside `backdrop_element` is false and this flag is never even
+        // consulted) -- is `false`. Getting this backwards produces
+        // `RoundMode::Tonemap` (collapse to sRGB) where `TonemapAbs10k`
+        // (stay in the working space) is wanted, which reads on screen as
+        // the backdrop crushing to white -- a bug already shipped once.
+        if let Some((_, quad)) = state.wallpaper.backdrop_element(
+            renderer,
+            &output.name(),
+            region.size,
+            effective_rect,
+            scale,
+            tonemap,
+            style.backdrop_blur,
+            backdrop_hdr_pass(mode),
+            state.sdr_white_nits,
+            refraction,
+        ) {
+            backdrops.push(quad);
+        }
+    }
+
+    let opacity = style.as_ref().map_or(1.0, |s| s.opacity);
+    let surfaces = window.render_elements::<WaylandSurfaceRenderElement<R>>(
+        renderer,
+        render_location.to_physical_precise_round(scale),
+        Scale::from(scale),
+        opacity,
+    );
+    let window_kind = window
+        .wl_surface()
+        .map(|s| crate::color_management::surface_decode_kind(&s))
+        .unwrap_or(DecodeKind::Sdr);
+    let elem_mode = resolve_elem_mode(mode, window_kind);
+    let elem_radius = effective_radius(radius, fullscreen, rescale.map(|(_, factor)| factor));
+    // An SDR window in a capture resolves to the plain program, which is what
+    // it would have been drawn with anyway; wrapping it would buy a program
+    // swap per element for nothing. `HdrComposite` is unconditional instead:
+    // that pass has no renderer-wide default program at all (every element
+    // installs its own -- see `udev::render_surface_hdr_zrun`), so even a
+    // `Decode(Sdr)`, radius-0, fullscreen window must still be wrapped or it
+    // silently draws with whatever program the previous element left active.
+    let needs_program = matches!(mode, SpaceMode::HdrComposite)
+        || matches!(
+            elem_mode,
+            RoundMode::Tonemap(DecodeKind::HdrPq) | RoundMode::Tonemap(DecodeKind::WindowsScrgb)
+        );
+    let wrap = round.filter(|_| elem_radius > 0.0 || needs_program);
+
+    match rescale {
+        Some((origin, factor)) => match wrap {
+            Some(shaders) => elements.extend(surfaces.into_iter().map(|e| {
+                let rescaled = RescaleRenderElement::from_element(e, origin, factor);
+                RubixRenderElement::RoundedRescaled(RoundedElement::new(
+                    rescaled,
+                    shaders,
+                    elem_mode,
+                    elem_radius,
+                    window_rect,
+                    Scale::from(scale),
+                    state.sdr_white_nits,
+                    Refraction::NONE,
+                ))
+            })),
+            None => elements.extend(surfaces.into_iter().map(|e| {
+                RubixRenderElement::Rescaled(RescaleRenderElement::from_element(e, origin, factor))
+            })),
+        },
+        None => match wrap {
             Some(shaders) => elements.extend(surfaces.into_iter().map(|e| {
                 RubixRenderElement::Rounded(RoundedElement::new(
                     e,
@@ -1165,9 +1294,145 @@ where
                 ))
             })),
             None => elements.extend(surfaces.into_iter().map(RubixRenderElement::Surface)),
-        }
+        },
     }
-    crate::decoration::prune_ring_cache(state);
+}
+
+/// Decoration for every window mid-tween this frame: rotation-wrap ghosts
+/// (`state.active_ghosts`, `rescale: None`) and reveal-tween scaled windows
+/// (`state.active_scales`, `rescale: Some((window centre, factor))`). Both
+/// are unmapped from the `Space` for the tween's duration (see
+/// `RubixState::step_animations`), so this is their ONLY draw -- omitting it
+/// makes them invisible for the length of the animation rather than merely
+/// undecorated.
+///
+/// `pos` for both lists is in the SAME space `Space::element_location`
+/// reports windows in -- NOT output-region-local like `space_elements`'s
+/// `local_rect`/`render_location` are. That has always been true (the ghost
+/// and scale element lists this replaces drew at `Point::<Physical>::from((
+/// pos.x, pos.y))` directly, with no `region.loc` subtraction), and every
+/// caller of this function runs at `scale == 1.0` on a single-output setup
+/// where region-local and global coincide -- so reproducing that same
+/// non-subtraction here is what keeps a tween window from jumping.
+pub(crate) fn tween_elements<R>(
+    state: &RubixState,
+    renderer: &mut R,
+    output: &Output,
+    scale: f64,
+    mode: SpaceMode,
+    wallpaper_sdr_tonemap: bool,
+) -> (Vec<RubixRenderElement<R>>, Vec<RubixRenderElement<R>>)
+where
+    R: Renderer + ImportAll + ImportMem + GlesAccess,
+    R::TextureId: Send + Clone + 'static,
+    RubixRenderElement<R>: RenderElement<R>,
+{
+    let radius = state.config.decoration.corner_radius as f32;
+    let per_window_program = matches!(mode, SpaceMode::TonemapSdr | SpaceMode::HdrComposite);
+    let Some(region) = state.space.output_geometry(output) else {
+        return (Vec::new(), Vec::new());
+    };
+    let round = (radius > 0.0 || per_window_program)
+        .then(|| round_shaders(renderer.gles_renderer()))
+        .flatten();
+    let occlusion = crate::decoration::occlusion_map(state, output);
+
+    let mut elements = Vec::new();
+    let mut backdrops = Vec::new();
+
+    let ghost_windows: Vec<(u32, Window, Point<i32, Logical>)> = state
+        .active_ghosts
+        .iter()
+        .filter_map(|(id, pos)| {
+            state
+                .windows
+                .get(id)
+                .map(|w| (*id, w.clone(), Point::<i32, Logical>::from((pos.x, pos.y))))
+        })
+        .collect();
+    for (id, window, pos) in &ghost_windows {
+        let fullscreen = state.fullscreen_windows.contains(id);
+        let local_rect = Rectangle::<i32, Logical>::new(*pos, window.geometry().size);
+        let style = Some(crate::decoration::style_for_window(
+            state,
+            *id,
+            occlusion.get(id).copied().unwrap_or(0.0),
+        ));
+        decorate_window(
+            state,
+            renderer,
+            output,
+            region,
+            scale,
+            mode,
+            wallpaper_sdr_tonemap,
+            round.as_ref(),
+            radius,
+            window,
+            Some(*id),
+            fullscreen,
+            local_rect,
+            *pos,
+            style,
+            None,
+            &mut elements,
+            &mut backdrops,
+        );
+    }
+
+    let scaled_windows: Vec<(u32, Window, Point<i32, Logical>, f64)> = state
+        .active_scales
+        .iter()
+        .filter_map(|(id, pos, factor)| {
+            state.windows.get(id).map(|w| {
+                (*id, w.clone(), Point::<i32, Logical>::from((pos.x, pos.y)), *factor as f64)
+            })
+        })
+        .collect();
+    for (id, window, pos, factor) in &scaled_windows {
+        // Fully collapsed: nothing worth drawing, and a zero scale degenerates
+        // the element geometry -- mirrors the old `reveal_scale_elements`'s
+        // own guard.
+        if *factor <= 0.01 {
+            continue;
+        }
+        let fullscreen = state.fullscreen_windows.contains(id);
+        let size = window.geometry().size;
+        let local_rect = Rectangle::<i32, Logical>::new(*pos, size);
+        // The window's own centre -- `RescaleRenderElement` scales about this
+        // point so a Reveal grows/shrinks in place rather than toward a
+        // corner. Matches the old `reveal_scale_elements` exactly.
+        let origin = Point::<i32, Physical>::from((pos.x + size.w / 2, pos.y + size.h / 2));
+        let style = Some(crate::decoration::style_for_window(
+            state,
+            *id,
+            occlusion.get(id).copied().unwrap_or(0.0),
+        ));
+        decorate_window(
+            state,
+            renderer,
+            output,
+            region,
+            scale,
+            mode,
+            wallpaper_sdr_tonemap,
+            round.as_ref(),
+            radius,
+            window,
+            Some(*id),
+            fullscreen,
+            local_rect,
+            *pos,
+            style,
+            Some((origin, *factor)),
+            &mut elements,
+            &mut backdrops,
+        );
+    }
+
+    // Not pruned here: `space_elements` already does it once per frame, and
+    // every caller of `tween_elements` calls both in the same frame -- a
+    // second sweep would just be redundant work over the same cache.
     (elements, backdrops)
 }
 
@@ -1463,5 +1728,37 @@ mod tests {
         assert!(backdrop_hdr_pass(SpaceMode::HdrComposite));
         assert!(!backdrop_hdr_pass(SpaceMode::TonemapSdr));
         assert!(!backdrop_hdr_pass(SpaceMode::Fixed(RoundMode::Plain)));
+    }
+
+    #[test]
+    fn rescaled_rect_is_identity_at_factor_one() {
+        let local_rect = Rectangle::<i32, Logical>::new((10, 20).into(), (100, 50).into());
+        let origin = Point::<i32, Physical>::from((60, 45));
+        assert_eq!(rescaled_rect(local_rect, origin, 1.0, 1.0), local_rect);
+    }
+
+    // `origin` here is deliberately not this rect's own centre (which would
+    // be (60, 45)) -- a Reveal tween's origin is the *window's* centre, and a
+    // border or backdrop rect can sit anywhere relative to that. Pins that
+    // `rescaled_rect` scales about the given origin, not the rect's own.
+    #[test]
+    fn rescaled_rect_halves_and_pulls_toward_a_off_centre_origin() {
+        let local_rect = Rectangle::<i32, Logical>::new((10, 20).into(), (100, 50).into());
+        let origin = Point::<i32, Physical>::from((0, 0));
+        let out = rescaled_rect(local_rect, origin, 0.5, 1.0);
+        assert_eq!(out.loc, (5, 10).into());
+        assert_eq!(out.size, (50, 25).into());
+    }
+
+    #[test]
+    fn fullscreen_tween_window_still_gets_radius_zero() {
+        assert_eq!(effective_radius(12.0, true, Some(0.5)), 0.0);
+        assert_eq!(effective_radius(12.0, true, None), 0.0);
+    }
+
+    #[test]
+    fn tween_radius_shrinks_with_the_window() {
+        assert_eq!(effective_radius(12.0, false, Some(0.5)), 6.0);
+        assert_eq!(effective_radius(12.0, false, None), 12.0);
     }
 }

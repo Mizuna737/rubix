@@ -12,7 +12,7 @@ use smithay::{
     desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
-    utils::{Physical, Point, Rectangle, Scale, Transform},
+    utils::{Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
 };
 
@@ -143,33 +143,21 @@ pub fn init_winit(
                         false,
                     );
 
-                    // Ghost elements for any in-flight rotation wrap, built from
-                    // `active_ghosts` (populated by `step_animations` above, same
-                    // frame). Output scale is 1.0 here, so a logical Pos maps
-                    // numerically to physical directly -- if that ever changes,
-                    // this needs `.to_physical_precise_round(scale)` from a
-                    // logical point instead. Rendered between top/overlay and
-                    // the space so ghosts stay above tiled windows but below
-                    // chrome-style layer surfaces.
-                    let ghost_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = data
-                        .active_ghosts
-                        .iter()
-                        .filter_map(|(id, pos)| data.windows.get(id).map(|w| (w.clone(), *pos)))
-                        .flat_map(|(w, pos)| {
-                            w.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                                renderer,
-                                Point::<i32, Physical>::from((pos.x, pos.y)),
-                                Scale::from(1.0),
-                                1.0,
-                            )
-                        })
-                        .collect();
-
-                    // Windows mid-Reveal, drawn scaled about their own centre. They are
-                    // unmapped from the Space for the tween's duration, so this list is their
-                    // only draw -- dropping it makes them vanish for the animation rather than
-                    // merely render unscaled. Same z-slot as the ghosts, for the same reason.
-                    let scaled_elements = crate::state::reveal_scale_elements(data, renderer);
+                    // Decorated ghost + reveal-tween elements, built from
+                    // `active_ghosts`/`active_scales` (populated by
+                    // `step_animations` above, same frame). Rendered between
+                    // top/overlay and the space so tween windows stay above
+                    // tiled windows but below chrome-style layer surfaces. See
+                    // `tween_elements` for the coordinate-space caveat (`pos`
+                    // is not region-local, same as this replaced).
+                    let (tween_elements, tween_backdrops) = crate::rounding::tween_elements(
+                        data,
+                        renderer,
+                        &output,
+                        scale,
+                        crate::rounding::SpaceMode::Fixed(crate::rounding::RoundMode::Plain),
+                        false,
+                    );
 
                     // Cursor built last (it needs `renderer` too) so it stays
                     // in the same "collect before the combined render call"
@@ -191,8 +179,8 @@ pub fn init_winit(
                     elements.extend(cursor_elements);
                     elements.extend(overlay.into_iter().map(RubixRenderElement::Surface));
                     elements.extend(top.into_iter().map(RubixRenderElement::Surface));
-                    elements.extend(ghost_elements.into_iter().map(RubixRenderElement::Surface));
-                    elements.extend(scaled_elements.into_iter().map(RubixRenderElement::Rescaled));
+                    elements.extend(tween_elements);
+                    elements.extend(tween_backdrops);
                     elements.extend(space_elements);
                     elements.extend(backdrop_elements);
                     elements.extend(bottom.into_iter().map(RubixRenderElement::Surface));
