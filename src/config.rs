@@ -1001,11 +1001,17 @@ fn default_refract_strength() -> f32 {
     12.0
 }
 
-/// Facet cell size for the crystal-facet backdrop refraction, in logical
-/// pixels. Coarse enough that individual facets are visible on an ordinary
-/// window rather than dissolving into noise.
+/// Cleavage-plane spacing for the backdrop refraction, in logical pixels.
+///
+/// Not the size of a face. Four plane families intersect at this spacing and a
+/// second octave runs at 3.3x it, so the visible faces come out several times
+/// finer than the number suggests. That is why this default is far larger than
+/// it looks like it should be: it was 90.0 under the old Voronoi field, where
+/// the value genuinely was the cell size, and carrying the same number across
+/// to the cleavage field left the faces small enough to read as cracked ice
+/// rather than as crystal.
 fn default_refract_facet_size() -> f32 {
-    90.0
+    350.0
 }
 
 /// Per-channel dispersion spread for the crystal-facet backdrop refraction,
