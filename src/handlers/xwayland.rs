@@ -1,5 +1,6 @@
 use smithay::{
     desktop::Window,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Rectangle},
     wayland::{
         seat::WaylandFocus,
@@ -20,6 +21,22 @@ impl XWaylandShellHandler for RubixState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
     }
+
+    // Completion of the focus handover started in `map_window_request`, not a
+    // new focus-stealing path: at map time the `wl_surface` didn't exist yet,
+    // so `focus_by_id` there silently resolved to nothing and recorded its
+    // intent in `pending_x11_focus`. This fires once that surface exists. Only
+    // the window whose focus attempt was actually lost is re-focused here --
+    // every other surface association is left alone.
+    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, window: X11Surface) {
+        if let Some(id) = self.window_id_for_x11(&window) {
+            if self.pending_x11_focus == Some(id) {
+                self.pending_x11_focus = None;
+                self.focus_by_id(id);
+                self.ipc_dirty = true;
+            }
+        }
+    }
 }
 
 // Reverse-lookup the tracked id whose `Window` wraps this X11 surface (by
@@ -30,6 +47,15 @@ impl XWaylandShellHandler for RubixState {
 // `space.refresh()` to prune it on its own.
 fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
     let target = window.wl_surface();
+    // `target.as_ref()` below compares `Option<&WlSurface> == Option<&WlSurface>`,
+    // so a `None` target would match the first tracked window that also has no
+    // surface -- an arbitrary victim, since `self.windows` is a HashMap and its
+    // iteration order isn't stable. Smithay detaches the wl_surface right after
+    // `unmapped_window` returns, so this is defensive rather than a live path
+    // today, but the failure mode it prevents is evicting an unrelated window.
+    if target.is_none() {
+        return;
+    }
     let id = state
         .windows
         .iter()
@@ -102,10 +128,23 @@ impl XwmHandler for RubixState {
                 monitor.add_window(direction, id, focused_id.unwrap_or(0));
             }
         }
-        self.apply_layout();
+        // Focus BEFORE laying out. `apply_layout` emits a rect for a fullscreen
+        // window only while it is focused, so laying out first hands a window
+        // that mapped already fullscreen no rect at all -- it never reaches the
+        // Space, and `sync_x11_iconic` immediately hides it for good measure.
         // Focus follows spawn (mirrors xdg_shell::new_toplevel): name the new id
         // directly, since the focus-agnostic model won't surface it via re-derive.
         self.focus_by_id(id);
+        // XWayland associates the `wl_surface` in a separate ClientMessage that
+        // usually lands after this one, and focus is resolved by matching that
+        // surface -- so the focus above quietly went nowhere. Record the intent
+        // and let `surface_associated` finish the job. Left unrecorded, a window
+        // that maps fullscreen is never the focused window, never gets a rect,
+        // and is iconified before it has drawn a frame.
+        if self.focused_window_id() != Some(id) {
+            self.pending_x11_focus = Some(id);
+        }
+        self.apply_layout();
         self.ipc_dirty = true;
         tracing::info!(
             "new X11 toplevel -> window {id} ({} tracked, {} mapped in space)",

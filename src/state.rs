@@ -256,6 +256,11 @@ pub struct RubixState {
     // layout pass sends no property writes.
     pub(crate) iconified: HashSet<u32>,
 
+    // An X11 window that was focused at map time before its `wl_surface` had
+    // been associated, so the focus never resolved. `surface_associated`
+    // consumes this to complete the handover once the surface exists.
+    pub(crate) pending_x11_focus: Option<u32>,
+
     // How far the focused window is currently blown up, if at all. See
     // [`MaximizeState`].
     pub(crate) maximized: MaximizeState,
@@ -542,6 +547,7 @@ impl RubixState {
             active_scales: Vec::new(),
             fullscreen_windows: HashSet::new(),
             iconified: HashSet::new(),
+            pending_x11_focus: None,
             maximized: MaximizeState::None,
             last_configured: HashMap::new(),
 
@@ -1899,8 +1905,11 @@ impl RubixState {
     /// `_NET_WM_STATE_FULLSCREEN` and a game sets it straight back (Against the
     /// Storm re-asserted ~3s later, taking the output with it). `WM_STATE =
     /// IconicState` is a state it will respect, because the correct response to
-    /// being minimized is to stop rather than to argue. This leaves the client's
-    /// own idea of being fullscreen intact, so navigating back restores it.
+    /// being minimized is to stop rather than to argue. Hiding it is done by
+    /// unmapping the frame ourselves rather than by asking the client to iconify
+    /// itself: a client that reads IconicState and unmaps its own window in
+    /// response is treated as withdrawn, and a withdrawn window cannot be
+    /// recovered.
     ///
     /// Driven by visibility rather than by the nav paths, since the grid hides
     /// windows several ways -- scrolling past `visible_columns`, a non-active
@@ -1912,9 +1921,42 @@ impl RubixState {
         let mut changed: Vec<(u32, bool)> = Vec::new();
         for (id, window) in &self.windows {
             if let WindowSurface::X11(x11) = window.underlying_surface() {
+                // Override-redirect windows own their own geometry and never
+                // appear in `targets`, so a visibility diff would read as
+                // "always hidden" and try to iconify a menu or tooltip. They
+                // also have no frame to unmap -- `set_mapped` rejects them
+                // outright.
+                if x11.is_override_redirect() {
+                    continue;
+                }
                 let hidden = !visible.contains(id);
                 if self.iconified.contains(id) != hidden {
-                    let _ = x11.set_hidden(hidden);
+                    if hidden {
+                        // Unmap the FRAME, then set the property. The frame is
+                        // what leaves the screen, and the client's own window is
+                        // never unmapped, so XWayland delivers no UnmapNotify
+                        // for it. That is the whole point: smithay reads a
+                        // client unmap as a withdraw and responds by destroying
+                        // the frame and detaching the wl_surface, which strands
+                        // the window with nothing left to map back. Setting the
+                        // property alone invites exactly that -- a game reads
+                        // IconicState, unmaps itself, and is gone for good.
+                        //
+                        // `set_mapped(false)` writes WithdrawnState, so
+                        // `set_hidden` runs second to land WM_STATE on
+                        // IconicState. It still writes, because `mapped_onto` is
+                        // only cleared by a real UnmapNotify, which this path no
+                        // longer provokes.
+                        let _ = x11.set_mapped(false);
+                        let _ = x11.set_hidden(true);
+                    } else {
+                        // Clear the property first: `set_mapped` chooses
+                        // NormalState vs IconicState by reading
+                        // _NET_WM_STATE_HIDDEN back out, so a stale HIDDEN here
+                        // would restore the frame still flagged iconic.
+                        let _ = x11.set_hidden(false);
+                        let _ = x11.set_mapped(true);
+                    }
                     changed.push((*id, hidden));
                 }
             }

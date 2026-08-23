@@ -3,6 +3,7 @@ use smithay::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
+    desktop::WindowSurface,
     input::{
         keyboard::{
             keysyms::{KEY_XF86Switch_VT_1, KEY_XF86Switch_VT_12},
@@ -628,6 +629,19 @@ impl RubixState {
             let Some(toplevel) = w.toplevel() else { return; };
             toplevel.send_pending_configure();
         });
+        // A Globally Active X11 client (WM_HINTS input=False plus WM_TAKE_FOCUS)
+        // never has focus forced on it -- smithay only offers, and the client
+        // takes focus by its own XSetInputFocus. A client that believes it is
+        // iconified declines that offer, and hiding is exactly what Rubix just
+        // did to it. So make the window viewable again BEFORE offering focus;
+        // offering first is offering to a client that is certain to refuse, and
+        // the refusal is silent.
+        if self.iconified.remove(&id) {
+            if let Some(WindowSurface::X11(x11)) = self.windows.get(&id).map(|w| w.underlying_surface()) {
+                let _ = x11.set_hidden(false);
+                let _ = x11.set_mapped(true);
+            }
+        }
         keyboard.set_focus(self, Some(target), serial);
         self.reconcile_focus_state();
 
