@@ -73,3 +73,7 @@ focus_follows_mouse = false
 # Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the
 # chord's final token must be the shifted form (matching Alt+Shift+H / +L above).
 "Alt+Shift+Q" = "Quit"
+# Closes the focused window, then unconditionally detaches it from the model
+# regardless of whether the client actually exits -- the escape hatch for a
+# dead or unresponsive window that would otherwise sit on screen forever.
+"Super+Escape" = "RemoveWindow"

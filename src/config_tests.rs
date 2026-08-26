@@ -11,7 +11,7 @@
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.visible_columns, 3);
         assert_eq!(cfg.keybinds.len(), bind_count, "a keybind was dropped during resolution");
-        assert_eq!(bind_count, 26);
+        assert_eq!(bind_count, 27);
     }
 
     // The defaults read off disk as four separate files must resolve to

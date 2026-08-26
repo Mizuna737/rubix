@@ -50,6 +50,7 @@ pub enum NavAction {
     ToggleMaximize,        // cycle the focused window group -> monitor -> none; releases on focus change
     ToggleMaximizeReverse, // the same cycle walked backwards: straight to monitor, then group, then none
     FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
+    RemoveWindow,      // close (politely) then unconditionally detach the focused window
     ToggleFocusFollowsMouse, // flip hover-to-focus live; config re-seeds it on save
     IncreaseSdrWhite,
     DecreaseSdrWhite,
@@ -428,6 +429,9 @@ impl RubixState {
         // Motion actions reposition the active column/group, so keyboard focus
         // should follow to whatever now sits in the active slot. Spawn (its focus
         // is a separate on-map concern) and the MoveToNewColumn stub do not.
+        // RemoveWindow belongs here too: it evicts the focused window, so seat
+        // focus is left pointing at a dead surface unless something moves it to
+        // whatever the model now considers active in that slot.
         let refocus = matches!(
             action,
             NavAction::RotateColumnsLeft
@@ -437,6 +441,7 @@ impl RubixState {
                 | NavAction::MoveActiveColumnLeft
                 | NavAction::MoveActiveColumnRight
                 | NavAction::NewGroup
+                | NavAction::RemoveWindow
         );
 
         // Maximize is transient: anything that moves through the layout drops it,
@@ -530,6 +535,25 @@ impl RubixState {
             NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),
             NavAction::MoveFocusedWindowLeft => self.move_focused_window_by_direction(Direction::Left),
             NavAction::MoveFocusedWindowRight => self.move_focused_window_by_direction(Direction::Right),
+            NavAction::RemoveWindow => {
+                if let Some(id) = self.focused_window_id() {
+                    // Ask nicely first -- send_close/close are requests, not
+                    // guarantees, which is exactly why the eviction below is
+                    // unconditional: a dead or unresponsive client must not be
+                    // able to keep its frame on screen (window 74, the
+                    // undismissable blank box left behind by the 2026-08-25
+                    // XWayland crash, is what this exists to fix).
+                    if let Some(window) = self.windows.get(&id) {
+                        if let Some(toplevel) = window.toplevel() {
+                            toplevel.send_close();
+                        } else if let Some(x11) = window.x11_surface() {
+                            let _ = x11.close();
+                        }
+                    }
+                    self.remove_window_by_id(id);
+                    tracing::info!("window {id} removed via RemoveWindow ({} tracked)", self.windows.len());
+                }
+            },
             NavAction::IncreaseSdrWhite => {
                 self.sdr_white_nits = (self.sdr_white_nits + SDR_WHITE_STEP).clamp(80.0, 300.0);
                 // apply_layout below doesn't touch geometry for this action, so
