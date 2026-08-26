@@ -17,6 +17,12 @@ use crate::{
     RubixState,
 };
 
+/// Below this gap between two XWayland exits, a respawn counts as "rapid" --
+/// see `XwmHandler::disconnected`.
+const XWAYLAND_MIN_RESPAWN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Give up respawning after this many rapid exits in a row.
+const XWAYLAND_MAX_RESPAWN_ATTEMPTS: u32 = 3;
+
 impl XWaylandShellHandler for RubixState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
@@ -63,20 +69,19 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
         .map(|(id, _)| *id);
 
     if let Some(id) = id {
-        // No-op if this id was never added to the tiling model (OR windows). A
-        // destroyed window may be on any monitor, not just the active one --
-        // remove_window is id-based and a no-op when absent, so sweeping all
-        // monitors is safe.
-        for monitor in &mut state.workspace.monitors {
-            monitor.remove_window(id);
-        }
-        if let Some(win) = state.windows.remove(&id) {
-            state.space.unmap_elem(&win);
-        }
-        state.fullscreen_windows.remove(&id);
-        state.iconified.remove(&id);
+        // No-op if this id was never added to the tiling model (OR windows) --
+        // `remove_window_by_id` is id-based throughout.
+        state.remove_window_by_id(id);
         state.apply_layout();
         state.ipc_dirty = true;
+        // Mirrors the `new X11 toplevel` log at `map_window_request` below --
+        // this is the other half of that accounting, and previously logged
+        // nothing at all.
+        tracing::info!(
+            "X11 window destroyed -> window {id} ({} tracked, {} mapped in space)",
+            state.windows.len(),
+            state.space.elements().count(),
+        );
     }
 }
 
@@ -173,6 +178,60 @@ impl XwmHandler for RubixState {
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
         remove_x11_window(self, &window);
+    }
+
+    // Fires when the X11 connection to XWayland breaks -- the only signal
+    // smithay gives for XWayland dying after `XWaylandEvent::Ready` fired
+    // (that event source disables itself for good once Ready has fired once,
+    // see smithay's `xwayland/xserver.rs`; there is no `Exited`/`Error` variant
+    // for a post-Ready death). Root cause of the 2026-08-25 incident: Xwayland
+    // crashed, nobody noticed, and three X11 windows (including an
+    // undismissable blank box) sat in the model with no client behind them
+    // because `destroyed_window` never fires for a server that's gone.
+    fn disconnected(&mut self, _xwm: XwmId) {
+        self.xwm = None;
+        self.xdisplay = None;
+
+        // Sweep every tracked X11 window -- `destroyed_window` will never
+        // fire for these now that the server that would report it is gone.
+        let stale: Vec<u32> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.x11_surface().is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        let evicted = stale.len();
+        for id in stale {
+            self.remove_window_by_id(id);
+        }
+        if evicted > 0 {
+            self.apply_layout();
+            self.ipc_dirty = true;
+        }
+        tracing::warn!("XWayland connection lost; evicted {evicted} X11 window(s)");
+
+        // Crash-loop guard: an XWayland that dies immediately and repeatedly
+        // (bad binary, broken install) must not spin the event loop
+        // respawning it forever.
+        let now = std::time::Instant::now();
+        let rapid = self
+            .xwayland_last_exit
+            .is_some_and(|t| now.duration_since(t) < XWAYLAND_MIN_RESPAWN_INTERVAL);
+        self.xwayland_last_exit = Some(now);
+        self.xwayland_respawn_attempts = if rapid { self.xwayland_respawn_attempts + 1 } else { 1 };
+        if self.xwayland_respawn_attempts > XWAYLAND_MAX_RESPAWN_ATTEMPTS {
+            tracing::warn!(
+                "XWayland exited {} times within {:?} of each other; giving up on X11 app support for this session",
+                self.xwayland_respawn_attempts,
+                XWAYLAND_MIN_RESPAWN_INTERVAL,
+            );
+            return;
+        }
+
+        tracing::info!("respawning XWayland (attempt {})", self.xwayland_respawn_attempts);
+        let loop_handle = self.loop_handle.clone();
+        let display_handle = self.display_handle.clone();
+        crate::init_xwayland(&loop_handle, &display_handle);
     }
 
     fn configure_request(

@@ -209,6 +209,14 @@ pub struct RubixState {
     /// `apply_theme_update` and the `NavAction::Spawn`/startup spawn sites.
     pub theme_env: Vec<(String, String)>,
 
+    /// The most recently solved theme, kept whole. `theme_env` and
+    /// `theme_border_colors` are derivatives of this and are computed once
+    /// at solve time; this is the source they came from, for consumers that
+    /// need a role we did not pre-derive -- compositor-drawn chrome asking
+    /// for `foreground` or `surface` in abs10k. `None` until the first
+    /// wallpaper is themed, and whenever `[theme] enable` is false.
+    pub(crate) theme: Option<crate::theme::Theme>,
+
     /// Border colours from the last solved theme, as `(focused, unfocused)`.
     /// `None` when theming is off, `[theme] apply_to_borders` is false, or no
     /// wallpaper has been themed yet -- in all of which cases the configured
@@ -224,6 +232,13 @@ pub struct RubixState {
     /// HDR luminance scaling happens later in `decoration::resolved_color`.
     pub(crate) theme_border_colors:
         Option<(smithay::backend::renderer::Color32F, smithay::backend::renderer::Color32F)>,
+
+    /// Rasterizer for compositor-drawn text. `RefCell` because the render
+    /// path composes from `&RubixState` while the rasterizer must mutate its
+    /// own cache -- the alternative is widening every compose signature to
+    /// `&mut` for one cache insert. Single-threaded: the compositor's event
+    /// loop is the only borrower, and the only borrow site is the bar.
+    pub(crate) text: std::cell::RefCell<crate::text::TextRenderer>,
 
     // wlr-foreign-toplevel-management: bound managers plus what each window's
     // handles were last told, so `foreign_toplevel::refresh` can send deltas.
@@ -288,6 +303,16 @@ pub struct RubixState {
     pub xwm: Option<X11Wm>,
     // Display number (e.g. `1` for `:1`), stored for logging/env once XWayland is ready.
     pub xdisplay: Option<u32>,
+    // Gates `data.config.startup` in the `Ready` handler to a single run.
+    // XWayland can now respawn after crashing (see XwmHandler::disconnected in
+    // xwayland.rs), so `Ready` firing a second time must NOT relaunch Max's
+    // entire startup set on top of his already-running session.
+    pub(crate) xwayland_started_once: bool,
+    // Crash-loop guard for XWayland respawn: an immediate, repeated exit (bad
+    // config, missing binary) must not spin the event loop respawning it
+    // forever. Reset to 0 on the next successful `Ready`.
+    pub(crate) xwayland_respawn_attempts: u32,
+    pub(crate) xwayland_last_exit: Option<std::time::Instant>,
     pub shm_state: ShmState,
     pub viewporter_state: ViewporterState,
     pub output_manager_state: OutputManagerState,
@@ -536,7 +561,9 @@ impl RubixState {
             pending_config_errors: Vec::new(),
             wallpaper: crate::wallpaper::WallpaperManager::default(),
             theme_env: Vec::new(),
+            theme: None,
             theme_border_colors: None,
+            text: std::cell::RefCell::new(crate::text::TextRenderer::new()),
             wallpaper_timer: None,
             config_reload_timer: None,
             foreign_toplevel: Default::default(),
@@ -560,6 +587,9 @@ impl RubixState {
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
+            xwayland_started_once: false,
+            xwayland_respawn_attempts: 0,
+            xwayland_last_exit: None,
             shm_state,
             output_manager_state,
             seat_state,
@@ -1112,6 +1142,13 @@ impl RubixState {
         self.config.theme.enable.then(|| self.config.theme.solve_params(&self.config.decoration))
     }
 
+    /// The last solved theme, or `None` when theming is disabled or no
+    /// wallpaper has been themed yet. Callers must have a fallback: a
+    /// compositor that has not solved a theme still has to draw.
+    pub(crate) fn theme(&self) -> Option<&crate::theme::Theme> {
+        self.theme.as_ref()
+    }
+
     /// Emit a freshly solved theme to every configured surface: the JSON file
     /// (atomically), IPC subscribers, and the environment newly spawned
     /// children inherit.
@@ -1132,6 +1169,8 @@ impl RubixState {
         if let Err(e) = write_theme_file(&self.config.theme.output_path, &json) {
             tracing::warn!("theme: failed to write {}: {e}", self.config.theme.output_path.display());
         }
+
+        self.theme = Some(theme.clone());
 
         // Only affects processes started from here on -- see the doc comment
         // on `theme_env` itself.
@@ -1382,12 +1421,31 @@ impl RubixState {
         // overlapping the bar. `zone.loc` carries the top/left inset, so offset
         // it by the output's global position.
         let zone = smithay::desktop::layer_map_for_output(&output).non_exclusive_zone();
-        let bounds = Rect {
+        let mut bounds = Rect {
             x: (output_geo.loc.x + zone.loc.x).max(0) as u32,
             y: (output_geo.loc.y + zone.loc.y).max(0) as u32,
             width: zone.size.w.max(0) as u32,
             height: zone.size.h.max(0) as u32,
         };
+        // The compositor-drawn bar (src/bar.rs) has no layer surface, so
+        // `non_exclusive_zone()` above knows nothing about it -- its strip has
+        // to be subtracted by hand, alongside the layer-shell zone rather than
+        // instead of it. Saturating throughout: a bar taller than the
+        // reserved area clamps to a zero-height bounds rather than wrapping
+        // `u32` on subtraction.
+        if self.config.bar.enabled {
+            let bar_height = self.config.bar.height;
+            match self.config.bar.position {
+                crate::config::BarPosition::Top => {
+                    let consumed = bar_height.min(bounds.height);
+                    bounds.y = bounds.y.saturating_add(consumed);
+                    bounds.height = bounds.height.saturating_sub(consumed);
+                }
+                crate::config::BarPosition::Bottom => {
+                    bounds.height = bounds.height.saturating_sub(bar_height);
+                }
+            }
+        }
         Some(bounds)
     }
     
@@ -1970,6 +2028,28 @@ impl RubixState {
                 self.iconified.remove(&id);
             }
         }
+    }
+
+    // Evict a window from every place its id can linger: the tiling model, the
+    // registry, the render space, and the fullscreen/iconified sets. Shared by
+    // both destroy paths (xdg_shell::toplevel_destroyed, xwayland's
+    // remove_x11_window) and the eviction Change 3/Change 4 need, so there is
+    // one place that knows the full teardown instead of four that might drift.
+    // Deliberately does NOT call `apply_layout`/set `ipc_dirty` -- callers that
+    // evict a batch (the Xwayland-crash sweep) need exactly one re-tile for the
+    // whole batch, not one per window.
+    pub(crate) fn remove_window_by_id(&mut self, id: u32) {
+        // A window may be on any monitor, not just the active one --
+        // remove_window is id-based and a no-op when absent, so sweeping all
+        // monitors is safe.
+        for monitor in &mut self.workspace.monitors {
+            monitor.remove_window(id);
+        }
+        if let Some(win) = self.windows.remove(&id) {
+            self.space.unmap_elem(&win);
+        }
+        self.fullscreen_windows.remove(&id);
+        self.iconified.remove(&id);
     }
 
     pub fn apply_layout(&mut self) {

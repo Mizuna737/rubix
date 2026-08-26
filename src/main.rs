@@ -1,6 +1,7 @@
 #![allow(irrefutable_let_patterns)]
 
 mod handlers;
+mod bar;
 
 mod color_management;
 mod compose;
@@ -29,7 +30,7 @@ mod udev;
 mod winit;
 
 use smithay::reexports::{
-    calloop::EventLoop,
+    calloop::{EventLoop, LoopHandle},
     wayland_server::{Display, DisplayHandle},
 };
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
@@ -125,8 +126,18 @@ fn init_config_watch(event_loop: &EventLoop<RubixState>) {
 /// Spawn XWayland and wire up the `X11Wm` once it signals readiness.
 /// Best-effort: any failure to spawn just logs and leaves X11 app support
 /// off for this run -- XWayland is a convenience layer, never a hard
-/// dependency for the wayland-native compositor to start.
-fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &DisplayHandle) {
+/// dependency for the wayland-native compositor to start. Also the respawn
+/// path: `XwmHandler::disconnected` (xwayland.rs) calls this again after
+/// evicting the dead server's windows, so it takes a bare `LoopHandle`
+/// rather than the `EventLoop` itself -- that's all a respawn from deep in
+/// an event callback has access to.
+pub(crate) fn init_xwayland(loop_handle: &LoopHandle<'static, RubixState>, display_handle: &DisplayHandle) {
+    // Append, not truncate -- tracing already holds the same path open for
+    // its own writer (see `open_log_file`), and a respawn must not stomp on
+    // what it already wrote.
+    let stderr = log_file_path()
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+        .map_or(Stdio::null(), Stdio::from);
     let (xwayland, xclient) = match XWayland::spawn(
         display_handle,
         None,
@@ -134,7 +145,7 @@ fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &D
         std::iter::empty::<String>(),
         true,
         Stdio::null(),
-        Stdio::null(),
+        stderr,
         |_| {},
     ) {
         Ok(pair) => pair,
@@ -144,9 +155,9 @@ fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &D
         }
     };
 
-    let loop_handle = event_loop.handle();
+    let loop_handle = loop_handle.clone();
     let display_handle = display_handle.clone();
-    let registered = event_loop.handle().insert_source(xwayland, move |event, _, data| match event {
+    let registered = loop_handle.clone().insert_source(xwayland, move |event, _, data| match event {
         XWaylandEvent::Ready { x11_socket, display_number } => {
             match X11Wm::start_wm(loop_handle.clone(), &display_handle, x11_socket, xclient.clone()) {
                 Ok(wm) => {
@@ -158,21 +169,33 @@ fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &D
                     // spawn time (see NavAction::Spawn in input.rs).
                     data.xdisplay = Some(display_number);
                     tracing::info!("XWayland ready on :{display_number}");
+                    // A clean Ready means the new server is up and stable enough
+                    // to have started the WM -- forgive whatever rapid-exit count
+                    // a prior crash burst left behind, so it doesn't count against
+                    // a later, unrelated crash burst hours from now.
+                    data.xwayland_respawn_attempts = 0;
 
-                    // Fire configured startup commands once, now that the
+                    // Fire configured startup commands once ever, now that the
                     // compositor is fully up: the Wayland socket is published
                     // (children inherit WAYLAND_DISPLAY) and XWayland is ready
-                    // (DISPLAY set explicitly, as in NavAction::Spawn). `Ready`
-                    // is a one-shot event, so this runs exactly once.
-                    for command in &data.config.startup {
-                        let mut cmd = std::process::Command::new("sh");
-                        cmd.arg("-c").arg(command);
-                        cmd.env("DISPLAY", format!(":{display_number}"));
-                        // Newly launched apps pick up the current wallpaper
-                        // theme this way; see `RubixState::theme_env`.
-                        cmd.envs(data.theme_env.iter().cloned());
-                        cmd.spawn().ok();
-                        tracing::info!("ran startup command: {command}");
+                    // (DISPLAY set explicitly, as in NavAction::Spawn). Gated on
+                    // `xwayland_started_once` rather than relying on `Ready`
+                    // being one-shot: a crash-respawn (see XwmHandler::disconnected
+                    // in xwayland.rs) fires `Ready` again, and replaying the
+                    // startup set on top of Max's running session would relaunch
+                    // his whole session over itself.
+                    if !data.xwayland_started_once {
+                        data.xwayland_started_once = true;
+                        for command in &data.config.startup {
+                            let mut cmd = std::process::Command::new("sh");
+                            cmd.arg("-c").arg(command);
+                            cmd.env("DISPLAY", format!(":{display_number}"));
+                            // Newly launched apps pick up the current wallpaper
+                            // theme this way; see `RubixState::theme_env`.
+                            cmd.envs(data.theme_env.iter().cloned());
+                            cmd.spawn().ok();
+                            tracing::info!("ran startup command: {command}");
+                        }
                     }
                 }
                 Err(e) => {
@@ -191,18 +214,27 @@ fn init_xwayland(event_loop: &EventLoop<'static, RubixState>, display_handle: &D
     }
 }
 
-/// Open `$XDG_CACHE_HOME/rubix/rubix.log` (or `~/.cache/rubix/rubix.log`),
-/// creating the directory. Returns `None` if neither env var is set or the file
-/// can't be created -- logging then falls back to stderr only. On the TTY backend
-/// stderr scrolls off an unreachable console, so the file is the only way to see
-/// what happened; this makes a log exist without the user having to redirect.
-fn open_log_file() -> Option<std::fs::File> {
+/// `$XDG_CACHE_HOME/rubix/rubix.log` (or `~/.cache/rubix/rubix.log`), creating
+/// the directory. `None` if neither env var is set or the directory can't be
+/// created. Shared by `open_log_file` (truncates, for tracing's own writer at
+/// startup) and Xwayland's stderr redirect (appends, so respawns don't
+/// clobber what tracing already wrote to the same file).
+fn log_file_path() -> Option<std::path::PathBuf> {
     let dir = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?
         .join("rubix");
     std::fs::create_dir_all(&dir).ok()?;
-    std::fs::File::create(dir.join("rubix.log")).ok()
+    Some(dir.join("rubix.log"))
+}
+
+/// Open `$XDG_CACHE_HOME/rubix/rubix.log` (or `~/.cache/rubix/rubix.log`).
+/// Returns `None` if neither env var is set or the file can't be created --
+/// logging then falls back to stderr only. On the TTY backend stderr scrolls
+/// off an unreachable console, so the file is the only way to see what
+/// happened; this makes a log exist without the user having to redirect.
+fn open_log_file() -> Option<std::fs::File> {
+    std::fs::File::create(log_file_path()?).ok()
 }
 
 // `rubix screen ...` -- a tight `hyprctl`/`niri msg`-style client for
@@ -719,7 +751,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    init_xwayland(&event_loop, &data.display_handle);
+    init_xwayland(&event_loop.handle(), &data.display_handle);
 
     init_config_watch(&event_loop);
 

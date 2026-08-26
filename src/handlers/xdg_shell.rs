@@ -79,6 +79,10 @@ impl XdgShellHandler for RubixState {
             // scanout target iterate it regardless of whether the id is
             // actually a live, tracked window.
             self.fullscreen_windows.remove(&id);
+            tracing::info!(
+                "unmapped toplevel destroyed -> window {id} ({} still pending)",
+                self.unmapped.len(),
+            );
             return;
         }
 
@@ -92,14 +96,7 @@ impl XdgShellHandler for RubixState {
             .map(|(id, _)| *id);
 
         if let Some(id) = destroyed_id {
-            // A destroyed window may be on any monitor, not just the active
-            // one -- remove_window is id-based and a no-op when absent, so
-            // sweeping all monitors is safe.
-            for monitor in &mut self.workspace.monitors {
-                monitor.remove_window(id);
-            }
-            self.windows.remove(&id);
-            self.fullscreen_windows.remove(&id);
+            self.remove_window_by_id(id);
             self.apply_layout();
             self.ipc_dirty = true;
             tracing::info!(
