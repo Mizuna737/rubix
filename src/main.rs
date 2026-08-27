@@ -791,6 +791,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Same signal, second audience: the status bar over IPC, window
             // lists (rofi, taskbars) over wlr-foreign-toplevel.
             crate::foreign_toplevel::refresh(data);
+            // The flush above already ran this iteration, so the events these
+            // two just queued would otherwise sit in their buffers until the
+            // next loop wake-up -- an idle compositor may not have one for a
+            // while, which shows up as a status bar or window list lagging the
+            // cube by a keystroke. (Announcing toplevels to a newly bound
+            // manager is NOT handled here; that has to happen synchronously in
+            // the bind handler -- see foreign_toplevel::bind.)
+            let _ = data.display_handle.flush_clients();
         }
         // Separate from the snapshot push above: config problems are discrete
         // events tied to one edit, not cube state, so they are neither coalesced

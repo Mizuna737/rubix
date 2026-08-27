@@ -82,9 +82,16 @@ impl GlobalDispatch<ZwlrForeignToplevelManagerV1, ()> for RubixState {
     ) {
         let manager = data_init.init(resource, ());
         state.foreign_toplevel.managers.push(manager);
-        // A newly bound manager has been told nothing, so the next refresh must
-        // announce every existing window to it.
-        state.ipc_dirty = true;
+        // Announce every existing window synchronously, here in the bind
+        // handler, rather than deferring to the next `ipc_dirty` refresh.
+        // wlroots does the same, and clients depend on it: a client binds the
+        // manager and then does ONE `wl_display.sync`, expecting the toplevel
+        // events to have arrived by the time that callback fires. `wlrctl
+        // toplevel list` calls `stop()` immediately after that roundtrip and
+        // exits, so anything announced on a later event-loop pass reaches a
+        // manager that is already finished -- it printed an empty list. rofi
+        // never noticed because it outlives the roundtrip.
+        refresh(state);
     }
 }
 
