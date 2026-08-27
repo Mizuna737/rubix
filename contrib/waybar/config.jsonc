@@ -5,6 +5,12 @@
 // Rubix delivering frame callbacks to layer surfaces (the layer send_frame fix)
 // so their live updates actually repaint.
 {
+  // Watch the stylesheet and re-apply it in place. rubixTheme.py rewrites it on
+  // every wallpaper change, and the alternative -- SIGUSR2 -- tears the bar down
+  // and rebuilds it, which momentarily drops the layer surface's exclusive zone
+  // and shoves every tiled window a few pixels.
+  "reload_style_on_change": true,
+
   "layer": "top",
   "position": "top",
   "height": 24,

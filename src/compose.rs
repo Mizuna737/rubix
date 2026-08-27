@@ -83,6 +83,19 @@ where
                 sdr_white_nits,
             ))
         }
+        // Compositor-drawn solid chrome (the bar background). Without this arm
+        // a solid rect reaches the HDR composite pass carrying no program and
+        // draws through whatever the previous element left in the slot --
+        // correct on SDR, wrong on the HDR output, and silent on both.
+        (Some(shaders), RubixRenderElement::Solid(inner)) => {
+            RubixRenderElement::RoundedSolid(crate::rounding::RoundedElement::with_program(
+                inner,
+                shaders,
+                crate::rounding::RoundMode::Decode(kind),
+                Scale::from(scale),
+                sdr_white_nits,
+            ))
+        }
         (_, other) => other,
     }
 }
@@ -204,10 +217,23 @@ where
     let mut tweens = tweens;
     let mut tween_backdrops = tween_backdrops;
 
+    // Compositor-drawn bar: above every window and animation, below
+    // layer-shell top/overlay (notifications, launchers still draw over it).
+    let mut bar = crate::bar::bar_elements(state, renderer, output, opts.scale);
+    // Compositor chrome, never client HDR content, so it is always wrapped
+    // `Decode(Sdr)` on the HDR composite pass -- same treatment as the cursor.
+    bar = match opts.wrap {
+        WrapMode::HdrComposite { round, .. } => bar
+            .into_iter()
+            .map(|e| wrap_decode(e, round, DecodeKind::Sdr, opts.scale, state.sdr_white_nits))
+            .collect(),
+        WrapMode::Sdr { .. } => bar,
+    };
+
     // Exclusive fullscreen: chrome above the game (layer-shell top/overlay,
-    // animation ghosts/reveal-tweens) must not render, both because it would
-    // be incorrect (waybar etc. shouldn't paint over a fullscreen game) and
-    // because anything above the candidate element in the final list is
+    // animation ghosts/reveal-tweens, the bar) must not render, both because
+    // it would be incorrect (a bar shouldn't paint over a fullscreen game)
+    // and because anything above the candidate element in the final list is
     // fatal to primary-plane promotion. `bottom`/`background` are left as
     // built -- they're culled by `DrmCompositor`'s opaque short-circuit and
     // are the fallback if promotion fails for some other reason.
@@ -216,6 +242,7 @@ where
         overlay.clear();
         tweens.clear();
         tween_backdrops.clear();
+        bar.clear();
     }
 
     // Cursor built last (it also needs `renderer`), same "collect before the

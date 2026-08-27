@@ -1,0 +1,24 @@
+# Compositor-drawn status bar: one strip, one background colour, one label.
+#
+# This is a deliberately minimal first slice -- no clock, no modules, no
+# per-monitor configuration. Every output gets the same strip.
+
+[bar]
+# Turn the bar on. Off by default: this is an early feature landing in a
+# daily-driver compositor, and it must not change what you see until you ask
+# for it.
+enabled = false
+
+# Which edge the strip sits on: "Top" or "Bottom".
+position = "Top"
+
+# Strip thickness in logical pixels. Windows tile beneath it, never under it.
+height = 32
+
+# Text size in logical pixels.
+font_size = 14.0
+
+# The text drawn in the bar. Fixed for now -- live content (a clock, workspace
+# indicators, ...) arrives with the widget system this slice is paving the way
+# for.
+label = "rubix"

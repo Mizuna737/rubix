@@ -1,6 +1,15 @@
-/* Waybar styling for the Rubix bar -- static gruvbox-ish palette (pywal wiring
- * intentionally skipped). Per-pip emphasis in custom/rubix is pango markup in
- * the module text; the classes below reflect whole-module state. */
+/* Waybar styling for the Rubix bar.
+ *
+ * Layout and state classes live here; colours are referenced only by
+ * @define-color name. rubixTheme.py regenerates those definitions from the
+ * wallpaper on every theme change and prepends them to this file, writing the
+ * result to ~/.cache/rubix/waybar-style.css -- which is what the waybar unit
+ * actually loads. Editing this file directly is right for layout; the colours
+ * come from rubix.
+ *
+ * Per-pip emphasis in custom/rubix is pango markup in the module text; the
+ * classes below reflect whole-module state.
+ */
 
 * {
   font-family: "JetBrainsMono Nerd Font", monospace;
@@ -9,8 +18,8 @@
 }
 
 window#waybar {
-  background: #1d2021;
-  color: #ebdbb2;
+  background: @background;
+  color: @foreground;
   border-radius: 6px;
 }
 
@@ -28,43 +37,44 @@ window#waybar {
 }
 
 /* --- Cube pips --- */
-#custom-rubix.focused { color: #ebdbb2; }
-#custom-rubix.empty { color: #a89984; }
-#custom-rubix.disconnected { color: #928374; }
+#custom-rubix.focused { color: @foreground; }
+#custom-rubix.empty { color: @muted; }
+#custom-rubix.disconnected { color: @border; }
 
 /* --- workAssistant status --- */
-#custom-waStatus.recording { color: #fb4934; font-weight: bold; }
-#custom-waStatus.transcribing { color: #fabd2f; }
-#custom-waStatus.notes { color: #83a598; }
+#custom-waStatus.recording { color: @red; font-weight: bold; }
+#custom-waStatus.transcribing { color: @yellow; }
+#custom-waStatus.notes { color: @blue; }
 #custom-waStatus.idle { padding: 0; }
 
 /* --- Focused class (center) --- */
 #custom-focusedClass {
   font-size: 14px;
-  color: #ebdbb2;
+  color: @foreground;
 }
-#custom-focusedClass.empty { color: #928374; }
+#custom-focusedClass.empty { color: @muted; }
 
 /* --- System stats --- */
-#cpu { color: #b8bb26; }
-#memory { color: #8ec07c; }
-#network { color: #83a598; }
+#cpu { color: @green; }
+#memory { color: @cyan; }
+#network { color: @blue; }
 
 /* --- Volume: grow/shrink + accent on change, then settle --- */
 #custom-volume {
-  color: #a89984;
+  color: @muted;
   font-size: 13px;
   padding: 0 8px;
   /* Transition drives the port of the wibar's animate_widget_size grow/shrink. */
   transition: font-size 250ms ease, color 250ms ease, padding 250ms ease;
 }
 #custom-volume.active {
-  color: #8ec07c;   /* border_focus analog */
+  /* The same accent the focused window border uses. */
+  color: @accent;
   font-size: 15px;
   padding: 0 12px;
 }
 #custom-volume.muted {
-  color: #cc241d;
+  color: @red;
 }
 
 /* --- Tray --- */
@@ -72,6 +82,6 @@ window#waybar {
 
 /* --- Date/time --- */
 #custom-clock {
-  color: #a89984;
+  color: @muted;
   padding: 0 10px;
 }

@@ -232,6 +232,7 @@ fn the_schema_matches_the_raw_structs() {
         ("RawInput", INPUT_SCHEMA),
         ("RawIdle", IDLE_SCHEMA),
         ("RawTheme", THEME_SCHEMA),
+        ("RawBar", BAR_SCHEMA),
     ];
 
     let mut problems = Vec::new();

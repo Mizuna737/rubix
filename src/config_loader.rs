@@ -358,6 +358,14 @@ const THEME_SCHEMA: &[(&str, Schema)] = &[
     ("apply_to_borders", Schema::Leaf),
 ];
 
+const BAR_SCHEMA: &[(&str, Schema)] = &[
+    ("enabled", Schema::Leaf),
+    ("position", Schema::Leaf),
+    ("height", Schema::Leaf),
+    ("font_size", Schema::Leaf),
+    ("label", Schema::Leaf),
+];
+
 const ROOT_SCHEMA: &[(&str, Schema)] = &[
     ("layout", Schema::Table(LAYOUT_SCHEMA)),
     ("animation", Schema::Table(ANIMATION_SCHEMA)),
@@ -371,6 +379,7 @@ const ROOT_SCHEMA: &[(&str, Schema)] = &[
     ("wallpaper", Schema::Table(WALLPAPER_SCHEMA)),
     ("idle", Schema::Table(IDLE_SCHEMA)),
     ("theme", Schema::Table(THEME_SCHEMA)),
+    ("bar", Schema::Table(BAR_SCHEMA)),
 ];
 
 /// Report every key in `table` that `RawConfig` does not recognise, naming

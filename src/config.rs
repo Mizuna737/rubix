@@ -179,6 +179,33 @@ pub struct Config {
     /// active wallpaper and re-derived whenever it changes. Off by default --
     /// see `ThemeConfig::enable`.
     pub theme: ThemeConfig,
+
+    /// Compositor-drawn status bar. Off by default -- see `BarConfig::enabled`.
+    pub bar: BarConfig,
+}
+
+/// Which screen edge the bar occupies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub enum BarPosition {
+    Top,
+    Bottom,
+}
+
+/// Resolved `[bar]`. See `config/default/bar.toml` for the on-disk defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarConfig {
+    /// Master switch. `false` draws no bar and reserves no strip, so windows
+    /// tile to the full output.
+    pub enabled: bool,
+    /// Which edge the strip sits on.
+    pub position: BarPosition,
+    /// Strip thickness in logical pixels. Windows tile beneath it.
+    pub height: u32,
+    /// Text size in logical pixels.
+    pub font_size: f32,
+    /// The text drawn in the bar. A fixed string for now -- live content
+    /// arrives with the widget system.
+    pub label: String,
 }
 
 /// Resolved `[idle]`. See `config/default/` for the on-disk defaults.
@@ -464,6 +491,11 @@ struct RawConfig {
     // no solve, no file write, no spawn. See `ThemeConfig::enable`.
     #[serde(default)]
     theme: RawTheme,
+    // Optional section: a config omitting [bar] draws no bar at all -- an
+    // unfinished feature landing in a daily-driver compositor must not change
+    // what the user sees until they opt in.
+    #[serde(default)]
+    bar: RawBar,
 }
 
 #[derive(Deserialize, Default)]
@@ -567,6 +599,55 @@ fn default_screen_off_seconds() -> u64 {
     600
 }
 
+// Optional section: a config omitting `[bar]` parses fine, taking the
+// defaults below -- `enabled = false`, so the bar is invisible until the user
+// opts in.
+#[derive(Deserialize)]
+struct RawBar {
+    #[serde(default = "default_bar_enabled")]
+    enabled: bool,
+    #[serde(default = "default_bar_position")]
+    position: BarPosition,
+    #[serde(default = "default_bar_height")]
+    height: u32,
+    #[serde(default = "default_bar_font_size")]
+    font_size: f32,
+    #[serde(default = "default_bar_label")]
+    label: String,
+}
+
+impl Default for RawBar {
+    fn default() -> Self {
+        RawBar {
+            enabled: default_bar_enabled(),
+            position: default_bar_position(),
+            height: default_bar_height(),
+            font_size: default_bar_font_size(),
+            label: default_bar_label(),
+        }
+    }
+}
+
+fn default_bar_enabled() -> bool {
+    false
+}
+
+fn default_bar_position() -> BarPosition {
+    BarPosition::Top
+}
+
+fn default_bar_height() -> u32 {
+    32
+}
+
+fn default_bar_font_size() -> f32 {
+    14.0
+}
+
+fn default_bar_label() -> String {
+    "rubix".to_string()
+}
+
 fn default_duration_ms() -> u64 {
     250
 }
@@ -663,6 +744,16 @@ impl Config {
                 screen_off_seconds: raw.idle.screen_off_seconds,
             },
             theme: resolve_theme(raw.theme, sdr_white_nits),
+            bar: BarConfig {
+                enabled: raw.bar.enabled,
+                position: raw.bar.position,
+                // Clamped rather than rejected: a `0` height would mean "no
+                // strip reserved but still drawn", which is a worse failure
+                // mode than just floor-clamping the knob.
+                height: raw.bar.height.max(1),
+                font_size: raw.bar.font_size.max(1.0),
+                label: raw.bar.label,
+            },
         }
     }
 

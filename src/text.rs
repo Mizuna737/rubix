@@ -26,6 +26,35 @@ use smithay::utils::Transform;
 /// a float-hashing crate.
 type CacheKey = (String, i32, [u8; 4]);
 
+/// A rasterized run plus everything a caller needs to place it.
+///
+/// `buffer` is cropped to ink extents, so its size is **not** the run's
+/// layout size. `ink_offset` is where that crop sits relative to the
+/// layout origin: drawing `buffer` at `origin + ink_offset` reproduces the
+/// position cosmic-text laid the glyphs out at. Placing `buffer` at
+/// `origin` directly is the jitter bug -- two strings of the same length
+/// have different ink extents ("11:59" vs "12:00"), so a bar clock would
+/// bounce every minute.
+#[derive(Clone, Debug)]
+pub(crate) struct TextRun {
+    pub buffer: MemoryRenderBuffer,
+    /// Ink-box origin relative to the layout origin, in pixels.
+    pub ink_offset: (i32, i32),
+    /// Ink-box size in pixels. Redundant with the buffer's own size, kept
+    /// so a caller can lay out without querying the buffer.
+    pub ink_size: (u32, u32),
+    /// Horizontal advance of the whole run: the width a container should
+    /// budget, which is not the ink width (it includes side bearings and
+    /// any trailing space).
+    pub advance_width: f32,
+    /// Baseline-to-baseline distance, i.e. the row height to reserve.
+    pub line_height: f32,
+    /// Distance from the layout origin down to the baseline. Vertically
+    /// centring a run means centring `line_height`, then placing at the
+    /// resulting top edge -- never centring `ink_size`.
+    pub ascent: f32,
+}
+
 fn quantize_size(size_px: f32) -> i32 {
     (size_px * 1000.0).round() as i32
 }
@@ -35,7 +64,7 @@ fn quantize_size(size_px: f32) -> i32 {
 pub(crate) struct TextRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
-    cache: HashMap<CacheKey, MemoryRenderBuffer>,
+    cache: HashMap<CacheKey, TextRun>,
 }
 
 impl TextRenderer {
@@ -56,25 +85,37 @@ impl TextRenderer {
         text: &str,
         size_px: f32,
         color: [u8; 4],
-    ) -> Option<MemoryRenderBuffer> {
+    ) -> Option<TextRun> {
         let key: CacheKey = (text.to_owned(), quantize_size(size_px), color);
-        if let Some(buffer) = self.cache.get(&key) {
-            return Some(buffer.clone());
+        if let Some(run) = self.cache.get(&key) {
+            return Some(run.clone());
         }
 
-        let (pixels, width, height) =
+        let rasterized =
             rasterize(&mut self.font_system, &mut self.swash_cache, text, size_px, color)?;
 
         let buffer = MemoryRenderBuffer::from_memory(
-            MemoryBuffer::from_slice(&pixels, Fourcc::Argb8888, (width as i32, height as i32)),
+            MemoryBuffer::from_slice(
+                &rasterized.pixels,
+                Fourcc::Argb8888,
+                (rasterized.width as i32, rasterized.height as i32),
+            ),
             1,
             Transform::Normal,
             // No opaque-region hint: unlike a wallpaper, a text run's alpha
             // genuinely varies texel to texel.
             None,
         );
-        self.cache.insert(key, buffer.clone());
-        Some(buffer)
+        let run = TextRun {
+            buffer,
+            ink_offset: (rasterized.min_x, rasterized.min_y),
+            ink_size: (rasterized.width, rasterized.height),
+            advance_width: rasterized.advance_width,
+            line_height: rasterized.line_height,
+            ascent: rasterized.ascent,
+        };
+        self.cache.insert(key, run.clone());
+        Some(run)
     }
 }
 
@@ -87,17 +128,31 @@ struct InkTexel {
     color: [u8; 4],
 }
 
+/// Everything `rasterize` produces: the cropped pixels plus the layout
+/// metrics a caller needs to place them. See [`TextRun`] for what each field
+/// means -- this is its pre-`MemoryRenderBuffer` twin.
+struct Rasterized {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    min_x: i32,
+    min_y: i32,
+    advance_width: f32,
+    line_height: f32,
+    ascent: f32,
+}
+
 /// Shapes and rasterizes `text`, returning premultiplied Argb8888 pixels
-/// tightly cropped to the run's ink extents, plus that crop's width and
-/// height. Split out from `render` so tests can assert on raw pixels without
-/// going through `MemoryRenderBuffer`.
+/// tightly cropped to the run's ink extents, plus the layout metrics needed
+/// to place that crop. Split out from `render` so tests can assert on raw
+/// pixels without going through `MemoryRenderBuffer`.
 fn rasterize(
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
     text: &str,
     size_px: f32,
     color: [u8; 4],
-) -> Option<(Vec<u8>, u32, u32)> {
+) -> Option<Rasterized> {
     if text.is_empty() || size_px <= 0.0 {
         return None;
     }
@@ -160,6 +215,18 @@ fn rasterize(
         return None;
     }
 
+    // Take the max run width rather than assuming exactly one layout run, so
+    // an unexpected wrap cannot silently truncate the advance budget. The
+    // baseline (`ascent`) comes from the first run: a bar label is one line,
+    // and there is no meaningful single baseline for a wrapped multi-line
+    // run anyway.
+    let mut layout_runs = buffer.layout_runs();
+    let first_run = layout_runs.next()?;
+    let ascent = first_run.line_y;
+    let advance_width = std::iter::once(first_run.line_w)
+        .chain(layout_runs.map(|r| r.line_w))
+        .fold(f32::MIN, f32::max);
+
     // Zero-initialised: every texel starts as exactly [0, 0, 0, 0] and stays
     // that way unless ink actually lands on it. This is the transparency
     // invariant the tests check -- see the module doc on why a stray nonzero
@@ -179,7 +246,16 @@ fn rasterize(
         out[idx + 3] = ta;
     }
 
-    Some((out, width, height))
+    Some(Rasterized {
+        pixels: out,
+        width,
+        height,
+        min_x,
+        min_y,
+        advance_width,
+        line_height: metrics.line_height,
+        ascent,
+    })
 }
 
 /// Multiplies a non-premultiplied channel by alpha, rounding to nearest.
@@ -206,20 +282,21 @@ mod tests {
     fn plain_ascii_produces_nonempty_dimensions() {
         let mut font_system = FontSystem::new();
         let mut swash_cache = SwashCache::new();
-        let (_, width, height) =
+        let rasterized =
             rasterize(&mut font_system, &mut swash_cache, "Hi", 24.0, [255, 255, 255, 255])
                 .expect("plain ASCII should rasterize to something");
-        assert!(width > 0);
-        assert!(height > 0);
+        assert!(rasterized.width > 0);
+        assert!(rasterized.height > 0);
     }
 
     #[test]
     fn transparent_texels_are_exactly_zero() {
         let mut font_system = FontSystem::new();
         let mut swash_cache = SwashCache::new();
-        let (pixels, width, height) =
+        let rasterized =
             rasterize(&mut font_system, &mut swash_cache, "Hi", 24.0, [200, 100, 50, 255])
                 .expect("plain ASCII should rasterize to something");
+        let (pixels, width, height) = (rasterized.pixels, rasterized.width, rasterized.height);
 
         let mut saw_transparent = false;
         for y in 0..height {
@@ -242,9 +319,9 @@ mod tests {
         let mut font_system = FontSystem::new();
         let mut swash_cache = SwashCache::new();
         let color = [10, 200, 30, 255];
-        let (pixels, width, height) =
-            rasterize(&mut font_system, &mut swash_cache, "M", 32.0, color)
-                .expect("plain ASCII should rasterize to something");
+        let rasterized = rasterize(&mut font_system, &mut swash_cache, "M", 32.0, color)
+            .expect("plain ASCII should rasterize to something");
+        let (pixels, width, height) = (rasterized.pixels, rasterized.width, rasterized.height);
 
         // At alpha 255, premultiplication is a no-op, so a fully opaque
         // texel must equal the requested colour exactly, not the colour
@@ -274,13 +351,13 @@ mod tests {
     fn identical_requests_produce_identical_dimensions() {
         let mut font_system = FontSystem::new();
         let mut swash_cache = SwashCache::new();
-        let (_, w1, h1) =
+        let r1 =
             rasterize(&mut font_system, &mut swash_cache, "clock", 18.0, [255, 255, 255, 255])
                 .unwrap();
-        let (_, w2, h2) =
+        let r2 =
             rasterize(&mut font_system, &mut swash_cache, "clock", 18.0, [255, 255, 255, 255])
                 .unwrap();
-        assert_eq!((w1, h1), (w2, h2));
+        assert_eq!((r1.width, r1.height), (r2.width, r2.height));
     }
 
     #[test]
@@ -297,5 +374,31 @@ mod tests {
         renderer.render("clock", 18.0, [255, 255, 255, 255]).unwrap();
         renderer.render("clock", 20.0, [255, 255, 255, 255]).unwrap();
         assert_eq!(renderer.cache.len(), 2);
+    }
+
+    #[test]
+    fn ink_offset_is_returned_not_discarded() {
+        let mut font_system = FontSystem::new();
+        let mut swash_cache = SwashCache::new();
+        // A descender-heavy glyph sits below the layout origin, so its ink
+        // box starts partway down the line -- exactly the offset that gets
+        // discarded if a caller only keeps the crop.
+        let rasterized = rasterize(&mut font_system, &mut swash_cache, "g", 32.0, [255, 255, 255, 255])
+            .expect("'g' should rasterize to something");
+        assert!(rasterized.min_y > 0, "expected a positive ink offset for a descender glyph");
+    }
+
+    #[test]
+    fn runs_of_equal_length_share_advance_width() {
+        let mut font_system = FontSystem::new();
+        let mut swash_cache = SwashCache::new();
+        let a = rasterize(&mut font_system, &mut swash_cache, "11:59", 18.0, [255, 255, 255, 255])
+            .expect("'11:59' should rasterize to something");
+        let b = rasterize(&mut font_system, &mut swash_cache, "12:00", 18.0, [255, 255, 255, 255])
+            .expect("'12:00' should rasterize to something");
+        assert_eq!(
+            a.advance_width, b.advance_width,
+            "monospace runs of equal length must share advance_width regardless of ink extents"
+        );
     }
 }
