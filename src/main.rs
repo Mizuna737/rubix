@@ -815,6 +815,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((path, theme)) = data.wallpaper.take_theme_update() {
             data.apply_theme_update(&path, &theme, ipc_clients.as_ref());
         }
+        // Chord echo: drained every cycle like the other discrete IPC events
+        // above, not coalesced -- a listen-mode editor needs one message per
+        // physical chord, not a collapsed summary of a burst.
+        if !data.pending_chords.is_empty() {
+            let chords = std::mem::take(&mut data.pending_chords);
+            if let Some(clients) = &ipc_clients {
+                for (chord, action) in &chords {
+                    crate::ipc::broadcast_chord(clients, chord, action.as_ref());
+                }
+            }
+        }
     })?;
 
     Ok(())

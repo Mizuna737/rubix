@@ -34,6 +34,10 @@ pub(crate) struct ClientEntry {
     id: u64,
     write_stream: UnixStream,
     subscribed: Rc<Cell<bool>>,
+    // Separate opt-in from `subscribed`: a client can want the coalesced
+    // snapshot stream, the chord echo, both, or neither. See
+    // `broadcast_chord`'s doc comment for why this is gated at all.
+    chords_subscribed: Rc<Cell<bool>>,
 }
 
 /// Shared client registry: accept-loop inserts, per-client read callbacks
@@ -48,6 +52,7 @@ struct ClientIo {
     stream: UnixStream,
     buf: Vec<u8>,
     subscribed: Rc<Cell<bool>>,
+    chords_subscribed: Rc<Cell<bool>>,
     registry: ClientRegistry,
 }
 
@@ -88,6 +93,11 @@ enum Request {
     // The change is not written back to the config, so a reload restores
     // whatever the file says. See src/wallpaper.rs.
     SetWallpaper { path: String, output: Option<String> },
+    // Opt in to `Reply::Chord` (see `broadcast_chord`). Independent of
+    // `Subscribe` -- a listen-mode editor wants chords, not the cube
+    // snapshot stream, so the two are separate flags rather than one
+    // subscription covering everything.
+    SubscribeChords,
 }
 
 #[derive(Serialize)]
@@ -115,6 +125,12 @@ enum Reply {
     // subscriber and a file-watcher agree on one format. As with
     // `ConfigError`, a bar reading this stream must match on `type`.
     ThemeChanged { theme: serde_json::Value },
+    // Pushed unsolicited to clients that sent `subscribe_chords`, one per
+    // resolved key press -- see `broadcast_chord` for the modifier gate that
+    // keeps this from being a keylogger. `action` is `None` when the chord
+    // matched no bind (still useful for listen-mode: it tells the editor the
+    // physical chord it just saw, even unbound).
+    Chord { chord: String, matched: bool, action: Option<NavAction> },
     Error { message: String },
 }
 
@@ -266,6 +282,10 @@ fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
                 client.subscribed.set(true);
                 Reply::State(build_snapshot(data))
             }
+            Ok(Request::SubscribeChords) => {
+                client.chords_subscribed.set(true);
+                Reply::Ok
+            }
             Ok(Request::SetScreenPower { on, output }) => {
                 data.set_screen_power(on, output.as_deref());
                 Reply::Ok
@@ -336,6 +356,30 @@ pub(crate) fn broadcast_theme_changed(registry: &ClientRegistry, theme: &serde_j
     line.push('\n');
     clients.retain_mut(|client| {
         if !client.subscribed.get() {
+            return true;
+        }
+        client.write_stream.write_all(line.as_bytes()).is_ok()
+    });
+}
+
+/// Push one resolved chord to every `subscribe_chords` client, out of band
+/// from the snapshot stream -- same shape as `broadcast_theme_changed`. Only
+/// called for chords that already passed the modifier gate in
+/// `input.rs::process_input_event` (Super/Control/Alt present); this function
+/// does not re-check that, so every caller of this function is a keylogger
+/// surface if that gate is ever weakened -- see the comment at the call site.
+pub(crate) fn broadcast_chord(registry: &ClientRegistry, chord: &str, action: Option<&NavAction>) {
+    let mut clients = registry.borrow_mut();
+    if !clients.iter().any(|c| c.chords_subscribed.get()) {
+        return;
+    }
+    let reply = Reply::Chord { chord: chord.to_string(), matched: action.is_some(), action: action.cloned() };
+    let Ok(mut line) = serde_json::to_string(&reply) else {
+        return;
+    };
+    line.push('\n');
+    clients.retain_mut(|client| {
+        if !client.chords_subscribed.get() {
             return true;
         }
         client.write_stream.write_all(line.as_bytes()).is_ok()
@@ -458,16 +502,19 @@ pub fn init_ipc(
                         let id = next_id.get();
                         next_id.set(id + 1);
                         let subscribed = Rc::new(Cell::new(false));
+                        let chords_subscribed = Rc::new(Cell::new(false));
                         registry_for_accept.borrow_mut().push(ClientEntry {
                             id,
                             write_stream,
                             subscribed: subscribed.clone(),
+                            chords_subscribed: chords_subscribed.clone(),
                         });
                         let client_io = ClientIo {
                             id,
                             stream,
                             buf: Vec::new(),
                             subscribed,
+                            chords_subscribed,
                             registry: registry_for_accept.clone(),
                         };
                         let insert = accept_handle.insert_source(

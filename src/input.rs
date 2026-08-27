@@ -7,7 +7,8 @@ use smithay::{
     input::{
         keyboard::{
             keysyms::{KEY_XF86Switch_VT_1, KEY_XF86Switch_VT_12},
-            FilterResult,
+            xkb::{self, Keysym},
+            FilterResult, ModifiersState,
         },
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
     },
@@ -18,7 +19,7 @@ use smithay::{
     },
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::focus::KeyboardFocusTarget;
 use crate::state::{MaximizeState, RubixState, Transition};
@@ -28,7 +29,13 @@ use crate::model::grid::{Direction, RevealKind};
 /// is this variant's exact name -- serde deserializes it straight into the enum,
 /// so there is no chord-name translation table in code. The direction is baked
 /// into the variant name; the motion sign is derived once at the dispatch site.
-#[derive(Debug, Clone, Deserialize)]
+/// `Serialize` is the wire format `Reply::Chord` and the listen-mode editor
+/// consume (see ipc.rs's `broadcast_chord`) -- unit variants serialize as
+/// their bare name and `Spawn` as `{"Spawn":"cmd"}`, the same vocabulary
+/// `input.toml` already uses on the way in. No `rename_all`/`rename`: the
+/// exact Rust identifier IS the config syntax, so any attribute here would
+/// silently fork the two.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum NavAction {
     ScrollColumnDown,   // scroll rows within the active column
     ScrollColumnUp,     //  "
@@ -72,6 +79,31 @@ const SDR_WHITE_STEP: f32 = 10.0;
 enum KeyAction {
     Nav(NavAction),
     SwitchVt(i32),
+}
+
+/// Render a chord the same way `config::parse_chord` reads one, so a
+/// listen-mode editor can feed what it sees straight back into
+/// `input.toml`/`triggers.toml`: modifier tokens in a fixed order (Super,
+/// Control, Alt, Shift), joined with `+`, ending in the xkb keysym name for
+/// the resolved (modified) symbol -- e.g. Shift+1 comes out `Super+Control+
+/// Shift+exclam`, not `Super+Control+Shift+1`, because `handle.modified_sym`
+/// already applied Shift before this runs.
+fn format_chord(mods: &ModifiersState, keysym: Keysym) -> String {
+    let mut chord = String::new();
+    if mods.logo {
+        chord.push_str("Super+");
+    }
+    if mods.ctrl {
+        chord.push_str("Control+");
+    }
+    if mods.alt {
+        chord.push_str("Alt+");
+    }
+    if mods.shift {
+        chord.push_str("Shift+");
+    }
+    chord.push_str(&xkb::keysym_get_name(keysym));
+    chord
 }
 
 impl RubixState {
@@ -145,7 +177,24 @@ impl RubixState {
                             let vt = (sym - KEY_XF86Switch_VT_1 + 1) as i32;
                             return FilterResult::Intercept(KeyAction::SwitchVt(vt));
                         }
-                        match state.config.keybinds.iter().find(|kb| kb.matches(mods, sym)) {
+                        let matched_kb = state.config.keybinds.iter().find(|kb| kb.matches(mods, sym));
+
+                        // SECURITY: chord-echo is IPC-visible to any process that can
+                        // open the socket (see `Request::SubscribeChords`), so it must
+                        // never carry ordinary typing. Gate on the *modifier state*,
+                        // not on whether a bind matched -- an unbound Super+X is still
+                        // a deliberate chord and safe to report; a bare letter or
+                        // Shift+letter is prose and must never reach this branch. Only
+                        // the press edge is echoed (release is swallowed by the
+                        // `key_state == Pressed` check below the filter), and the
+                        // string is only built once the gate passes, so ordinary typing
+                        // never allocates here.
+                        if key_state == KeyState::Pressed && (mods.logo || mods.ctrl || mods.alt) {
+                            let chord = format_chord(mods, handle.modified_sym());
+                            state.pending_chords.push((chord, matched_kb.map(|kb| kb.action.clone())));
+                        }
+
+                        match matched_kb {
                             Some(kb) => FilterResult::Intercept(KeyAction::Nav(kb.action.clone())),
                             None => FilterResult::Forward,
                         }

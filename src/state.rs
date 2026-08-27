@@ -47,6 +47,7 @@ use smithay::{
 
 use crate::{
     config::Config,
+    input::NavAction,
     model::{
         geometry::Rect,
         grid::Workspace,
@@ -166,6 +167,15 @@ pub struct RubixState {
     // `session.change_vt` (the session lives in the backend, not here). winit
     // never reads it. `Option` so a single chord fires exactly one switch.
     pub pending_vt: Option<i32>,
+
+    // Chords resolved (and modifier-gated -- see input.rs::process_input_event)
+    // since the last drain, for main.rs's run-loop callback to hand off to
+    // `ipc::broadcast_chord`. Same hand-off shape as `pending_vt`: the input
+    // filter doesn't hold the IPC `ClientRegistry`, so it stashes here instead
+    // of threading the registry into the input path. A `Vec` (not `Option`,
+    // unlike `pending_vt`) because more than one gated chord can land between
+    // two dispatch-cycle wake-ups.
+    pub pending_chords: Vec<(String, Option<NavAction>)>,
 
     // User configuration (keybinds + layout), resolved at startup.
     pub config: Config,
@@ -564,6 +574,7 @@ impl RubixState {
             space,
             loop_signal,
             pending_vt: None,
+            pending_chords: Vec::new(),
             socket_name,
 
             config,
