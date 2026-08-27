@@ -404,9 +404,17 @@ pub fn init_ipc(
     };
     let path = std::path::Path::new(&runtime_dir).join(&sock_name);
 
-    // A previous crashed run leaves this file behind; bind() fails on
-    // EADDRINUSE otherwise. Best-effort unlink -- if it fails, bind() below
-    // will and we report that instead.
+    // A stale file from a crashed run leaves this path behind; bind() fails
+    // on EADDRINUSE otherwise. But the path can *also* belong to a live
+    // instance -- unlinking unconditionally steals its socket out from under
+    // it (observed: the status bar sat disconnected for ~24h after a second
+    // `rubix` launch). Probe with a connect first: success means someone is
+    // listening, so leave the file alone and disable IPC for this run
+    // instead of clobbering the running instance's.
+    if UnixStream::connect(&path).is_ok() {
+        tracing::warn!("IPC socket at {path:?} is already live (another rubix instance); IPC disabled for this run");
+        return None;
+    }
     let _ = std::fs::remove_file(&path);
 
     let listener = match UnixListener::bind(&path) {
