@@ -30,8 +30,9 @@ use smithay::{
         },
     },
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     render_elements,
-    utils::{Logical, Point, Transform},
+    utils::{IsAlive, Logical, Point, Transform},
     wayland::compositor,
 };
 
@@ -97,6 +98,13 @@ render_elements! {
     // element and this one wraps a memory buffer, not a surface.
     // See wallpaper.rs.
     RoundedMemory = RoundedElement<MemoryRenderBufferRenderElement<R>>,
+    // The bar background, wrapped for the same reason `RoundedMemory` is: the
+    // HDR composite pass installs no pass-wide program, so a solid colour
+    // reaching it undecoded draws through whatever program the previous
+    // element left active. A separate variant because `RoundedElement` is
+    // generic over its inner element and this one wraps a solid colour, not a
+    // surface or a memory buffer. See src/bar.rs.
+    RoundedSolid = RoundedElement<SolidColorRenderElement>,
     Rescaled = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
     // A reveal-tween window wrapped the same way as `Rounded`, for the HDR
     // composite pass: that pass installs no renderer-wide default program, so
@@ -253,4 +261,32 @@ where
             })
         }
     }
+}
+
+/// Render elements for the DnD ghost icon, positioned at `pointer_location +
+/// offset` -- `offset` is the accumulated buffer-delta correction tracked in
+/// `handlers/compositor.rs` `commit`, same purpose as the cursor hotspot
+/// above. Empty if the icon surface has already been destroyed mid-drag
+/// (`alive()` check, matching anvil's winit.rs) -- rendering a dead surface
+/// tree would otherwise walk a torn-down compositor state.
+pub fn dnd_icon_render_elements<R>(
+    renderer: &mut R,
+    surface: &WlSurface,
+    offset: Point<i32, Logical>,
+    pointer_location: Point<f64, Logical>,
+    scale: f64,
+) -> Vec<RubixRenderElement<R>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Texture + Clone + Send + 'static,
+{
+    if !surface.alive() {
+        return Vec::new();
+    }
+    let loc =
+        (pointer_location + offset.to_f64()).to_physical_precise_round::<f64, i32>(scale);
+    render_elements_from_surface_tree(renderer, surface, loc, scale, 1.0, Kind::Unspecified)
+        .into_iter()
+        .map(RubixRenderElement::Surface)
+        .collect()
 }

@@ -462,6 +462,26 @@ impl RubixState {
 // DndGrabHandler` (plus `DndFocus<D>` on the pointer/touch focus types, which
 // is blanket-implemented for `WlSurface` given `SeatHandler + DataDeviceHandler`
 // -- both already implemented for `RubixState` in `handlers/mod.rs`).
-// `DndGrabHandler`'s `dropped`/`cancelled` hooks default to no-ops; Rubix owns
-// layout/focus itself and doesn't need custom XWayland drag'n'drop behavior.
-impl smithay::input::dnd::DndGrabHandler for RubixState {}
+// Rubix owns layout/focus itself and doesn't need custom XWayland
+// drag'n'drop behavior, but both hooks below must clear `dnd_icon` -- left at
+// the default no-op, a drag ending here (or being torn down some other way)
+// would leave the ghost icon stuck on screen forever.
+impl smithay::input::dnd::DndGrabHandler for RubixState {
+    fn dropped(
+        &mut self,
+        _target: Option<smithay::input::dnd::DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: smithay::input::Seat<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        self.dnd_icon = None;
+    }
+
+    fn cancelled(
+        &mut self,
+        _seat: smithay::input::Seat<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        self.dnd_icon = None;
+    }
+}

@@ -13,7 +13,8 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState,
+            get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
+            CompositorState, SurfaceAttributes,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -39,6 +40,22 @@ impl CompositorHandler for RubixState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // The DnD icon surface re-attaches its buffer like any other surface
+        // as the drag progresses, each time reporting where the new buffer
+        // sits relative to the old one (`buffer_delta`). Accumulate it into
+        // the tracked offset so the icon holds its position under the cursor
+        // instead of drifting -- same trick anvil uses (anvil/src/shell/mod.rs).
+        if let Some(icon) = self.dnd_icon.as_mut() {
+            if &icon.surface == surface {
+                let delta = with_states(surface, |states| {
+                    states.cached_state.get::<SurfaceAttributes>().current().buffer_delta.take()
+                })
+                .unwrap_or_default();
+                icon.offset += delta;
+            }
+        }
+
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {

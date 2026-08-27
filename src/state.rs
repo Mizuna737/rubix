@@ -143,6 +143,16 @@ impl MaximizeState {
     }
 }
 
+// The client's DnD icon surface, tracked while a drag is in progress.
+// `offset` accumulates the surface's buffer deltas as the client re-attaches
+// (handlers/compositor.rs `commit`) so the icon stays put under the cursor
+// instead of drifting -- same trick the cursor hotspot uses for the same
+// reason.
+pub struct DndIcon {
+    pub surface: WlSurface,
+    pub offset: Point<i32, Logical>,
+}
+
 pub struct RubixState {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -344,6 +354,12 @@ pub struct RubixState {
     // The client-requested cursor image (named/surface/hidden), set by the
     // `SeatHandler::cursor_image` callback in handlers/mod.rs.
     pub cursor_status: CursorImageStatus,
+    // The drag icon surface for an in-progress DnD session, set by
+    // `WaylandDndGrabHandler::dnd_requested` (handlers/mod.rs) and cleared on
+    // `dropped`/`cancelled` (handlers/xwayland.rs). `None` outside a drag --
+    // the overwhelmingly common case, so the render path must stay
+    // allocation-free when this is `None`.
+    pub dnd_icon: Option<DndIcon>,
     // Surface-local position a pointer-locking client says it is drawing its own
     // cursor at. Recorded while the lock is active so the real pointer can be
     // warped there when the lock ends (handlers/pointer_constraints.rs).
@@ -605,6 +621,7 @@ impl RubixState {
 
             pointer_location,
             cursor_status: CursorImageStatus::default_named(),
+            dnd_icon: None,
             cursor_position_hint: None,
             focus_follows_mouse,
             pending_screencopy: Vec::new(),

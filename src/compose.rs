@@ -13,7 +13,7 @@ use smithay::desktop::layer_map_for_output;
 use smithay::utils::Scale;
 
 use crate::color_management::DecodeKind;
-use crate::cursor::{pointer_render_elements, RubixRenderElement};
+use crate::cursor::{dnd_icon_render_elements, pointer_render_elements, RubixRenderElement};
 use crate::rounding::{GlesAccess, SpaceMode};
 use crate::state::RubixState;
 
@@ -290,12 +290,60 @@ where
         WrapMode::Sdr { .. } => cursor_elements,
     };
 
+    // DnD ghost icon, built right after the cursor and with exactly the same
+    // per-output/translation rules (see the cursor block above): it must
+    // appear only on the one output the pointer is actually over, translated
+    // into that output's local space, and not at all under `CursorMode::Hidden`
+    // (portal capture) -- getting either wrong paints a phantom icon on every
+    // extra monitor, same failure mode the cursor comment warns about.
+    // `dnd_icon` is `None` outside a drag (the overwhelming common case), so
+    // this is a field check away from a no-op in the hot path -- kept a
+    // separate Vec/variable rather than folded into `cursor_elements` because
+    // that one can be promoted to the hardware cursor plane
+    // (`ALLOW_CURSOR_PLANE_SCANOUT`), and a client surface tree must not land
+    // there.
+    let dnd_icon_elements = match (&opts.cursor, state.dnd_icon.as_ref()) {
+        (CursorMode::Hidden, _) | (_, None) => Vec::new(),
+        (CursorMode::Global, Some(icon)) => dnd_icon_render_elements(
+            renderer,
+            &icon.surface,
+            icon.offset,
+            state.pointer_location,
+            opts.scale,
+        ),
+        (CursorMode::OutputLocal, Some(icon)) => {
+            let output_geo = state.space.output_geometry(output);
+            match output_geo {
+                Some(geo) if geo.to_f64().contains(state.pointer_location) => {
+                    let local = state.pointer_location - geo.loc.to_f64();
+                    dnd_icon_render_elements(renderer, &icon.surface, icon.offset, local, opts.scale)
+                }
+                _ => Vec::new(),
+            }
+        }
+    };
+    // The icon is compositor-mediated chrome on this pass (it never reaches
+    // the client's own HDR content pipeline), so it gets the same `Decode(Sdr)`
+    // wrap as the cursor -- otherwise it comes out colour-mangled on an HDR
+    // output.
+    let dnd_icon_elements: Vec<RubixRenderElement<R>> = match opts.wrap {
+        WrapMode::HdrComposite { round, .. } => dnd_icon_elements
+            .into_iter()
+            .map(|e| wrap_decode(e, round, DecodeKind::Sdr, opts.scale, state.sdr_white_nits))
+            .collect(),
+        WrapMode::Sdr { .. } => dnd_icon_elements,
+    };
+
     // Cursor prepended -- front of the Vec is topmost, and it must draw above
-    // everything else, including overlay layers.
+    // everything else, including overlay layers. The DnD icon goes directly
+    // after it (under the cursor, above everything else) and is never merged
+    // into `cursor_elements` -- see the comment on `dnd_icon_elements` above.
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
     elements.extend(cursor_elements);
+    elements.extend(dnd_icon_elements);
     elements.extend(overlay);
     elements.extend(top);
+    elements.extend(bar);
     elements.extend(tweens);
     elements.extend(tween_backdrops);
     elements.extend(space_elements);
