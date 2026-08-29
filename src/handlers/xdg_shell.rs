@@ -27,8 +27,10 @@ use crate::{
     model::{
         tiling::SplitDirection,
         geometry::Rect,
-        grid::Direction,
+        grid::{Direction, RevealKind},
+        cube::find_target_by_direction,
     },
+    state::Transition,
     RubixState,
 };
 
@@ -383,10 +385,54 @@ impl RubixState {
     // holds true after nav (nav mutates + refocuses the active monitor).
     // Click-to-focus on another head not yet syncing active_monitor is a
     // known follow-up, not addressed here.
-    pub fn move_focused_window_to_new_column(&mut self) {
+    /// Promote the focused window into a fresh column on one side of the active
+    /// one, widening the visible band so it stays on screen.
+    pub fn move_focused_window_to_new_column(&mut self, to_left: bool) {
         let Some(id) = self.focused_window_id() else { return };
         if let Some(monitor) = self.workspace.active_monitor_mut() {
-            monitor.move_window_to_new_column(id);
+            monitor.move_window_to_new_column(id, to_left);
+        }
+        self.apply_layout();
+    }
+
+    /// Move the cursor to another monitor, wrapping. No-op on a single head.
+    pub fn focus_monitor_by_offset(&mut self, motion: isize) {
+        let Some(id) = self.workspace.monitor_id_by_offset(motion) else { return };
+        self.set_active_monitor(id);
+        self.apply_layout();
+    }
+
+    /// Carry the focused window to another monitor, cursor following it there.
+    pub fn move_focused_window_to_monitor(&mut self, motion: isize) {
+        let Some(id) = self.focused_window_id() else { return };
+        let Some(dest_id) = self.workspace.monitor_id_by_offset(motion) else { return };
+        // Split beside whatever is focused on the DESTINATION, along that
+        // window's longer axis -- the rule new windows follow. Its rect has to be
+        // computed against the destination's own output bounds, so `window_rect`
+        // is no help: that one is scoped to the active monitor, which is still
+        // the source at this point.
+        let split = self.workspace.monitors.iter()
+            .find(|m| m.id == dest_id)
+            .and_then(|monitor| {
+                let bounds = self.output_bounds_for(monitor.id)?;
+                let active = monitor.active_window()?;
+                monitor
+                    .compute_layout(bounds, self.config.outer_gap, self.config.inner_gap)
+                    .into_iter()
+                    .find(|(wid, _)| *wid == active)
+                    .map(|(_, rect)| rect)
+            })
+            .map(Rect::longer_axis)
+            .unwrap_or(SplitDirection::Horizontal);
+        self.workspace.move_window_to_monitor(id, dest_id, split);
+        self.apply_layout();
+    }
+
+    /// Trade the active group with its neighbour in `direction`, cursor
+    /// following the group that moved.
+    pub fn swap_active_group_by_direction(&mut self, direction: Direction) {
+        if let Some(monitor) = self.workspace.active_monitor_mut() {
+            monitor.swap_active_group(direction);
         }
         self.apply_layout();
     }
@@ -397,6 +443,50 @@ impl RubixState {
             monitor.flip_split_direction(id);
         }
         self.apply_layout();
+    }
+
+    /// Move keyboard focus to the nearest window in `direction`, crossing group
+    /// and column divides and wrapping at the edges of the cube.
+    ///
+    /// The destination is resolved geometrically against the cube plane (see
+    /// `model::cube`), which spans every column and row -- including the ones
+    /// off screen -- so a single press can reach a window the renderer has never
+    /// drawn. `reveal_slot` is what then brings it into view, scrolling its
+    /// column or spinning the cube as needed.
+    ///
+    /// Focus itself is left to `dispatch_nav`'s refocus tail: this function only
+    /// moves the model's cursor and arms the transition.
+    pub fn focus_window_by_direction(&mut self, direction: Direction) {
+        // Read phase. focused_window_id may be None (nothing focused yet) or name
+        // a fullscreen window, which sits outside the grid and so never appears
+        // on the plane; find_target_by_direction falls back to the active slot in
+        // both cases rather than giving up.
+        let focused_id = self.focused_window_id();
+        let Some(monitor) = self.workspace.active_monitor() else { return };
+        let Some(bounds) = self.output_bounds_for(monitor.id) else { return };
+        let Some(target) = find_target_by_direction(monitor, bounds, focused_id, direction) else { return };
+
+        let Some(monitor) = self.workspace.active_monitor_mut() else { return };
+        // Reveal first, THEN place the cursor: the rotation branch relocates the
+        // group, so the slot to point at is the one reveal_slot reports, not the
+        // one the target named.
+        let Some((kind, col, row)) = monitor.reveal_slot(target.column, target.row, Some(direction)) else { return };
+        match target.window {
+            // The window nav actually chose, not the group's remembered one --
+            // stepping one window right must not leapfrog into whatever that
+            // group was last focused on. focus_window sets all three pointers.
+            Some(id) => { monitor.focus_window(id); }
+            // An empty group: nothing to focus, so just park the cursor there.
+            None => { monitor.set_active_slot(col, row); }
+        }
+
+        // Armed before apply_layout, which consumes pending_transition via take().
+        match kind {
+            RevealKind::Scrolled { down } => self.pending_transition = Some(Transition::Scroll { down }),
+            RevealKind::Rotated => self.pending_transition = Some(Transition::Rotate),
+            RevealKind::Swapped => self.pending_transition = Some(Transition::Reveal),
+            RevealKind::AlreadyVisible => {}
+        }
     }
 
     pub fn move_focused_window_by_direction(&mut self,direction: Direction) {

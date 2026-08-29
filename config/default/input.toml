@@ -35,16 +35,20 @@ mouse_follows_focus = false
 # Alt-based defaults so the binds survive nested testing under a host WM that
 # grabs Super; switch to Super for a real TTY session.
 [keybinds]
-"Alt+h" = "RotateColumnsLeft"
-"Alt+l" = "RotateColumnsRight"
-"Alt+j" = "ScrollColumnDown"
-"Alt+k" = "ScrollColumnUp"
-"Alt+Return" = "MoveToNewColumn"
+# Move focus to the nearest window in a direction. These navigate the WHOLE cube:
+# past group and column divides, into columns that are off screen (the cube spins
+# to bring them in), and wrapping at the far edge -- right from the rightmost
+# window lands on the leftmost, down from the bottom row wraps within the column.
+"Alt+h" = "FocusWindowLeft"
+"Alt+l" = "FocusWindowRight"
+"Alt+j" = "FocusWindowDown"
+"Alt+k" = "FocusWindowUp"
+"Alt+Return" = "MoveToNewColumnRight"
 "Alt+Shift+H" = "MoveActiveColumnLeft"
 "Alt+Shift+L" = "MoveActiveColumnRight"
 # Relocate the focused window across the group grid: h/l cross columns (landing in
 # the destination column's active row), j/k walk rows within the column. j=Down /
-# k=Up to match the ScrollColumn binds above.
+# k=Up to match the FocusWindow binds above.
 "Alt+Control+h" = "MoveFocusedWindowLeft"
 "Alt+Control+l" = "MoveFocusedWindowRight"
 "Alt+Control+j" = "MoveFocusedWindowDown"
@@ -53,6 +57,11 @@ mouse_follows_focus = false
 "Alt+Shift+J" = "IncrementVisibleColumns"
 "Alt+Shift+K" = "DecrementVisibleColumns"
 "Alt+n" = "NewGroup"
+# Multi-head: step the cursor to the next monitor, or carry the focused window
+# over to it. Both wrap, and both no-op on a single head. Order is output
+# discovery order, not spatial left-to-right.
+"Alt+o" = "FocusNextMonitor"
+"Alt+Shift+O" = "MoveWindowToNextMonitor"
 # Flip the focused window's parent split between horizontal and vertical.
 "Alt+r" = "FlipSplitDirection"
 "Alt+Shift+space" = { Spawn = "alacritty" }

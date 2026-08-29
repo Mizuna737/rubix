@@ -44,7 +44,21 @@ pub enum NavAction {
     ScrollColumnUp,     //  "
     RotateColumnsRight, // rotate active groups across columns
     RotateColumnsLeft,  //  "
-    MoveToNewColumn,    // Promote the focused window into a new column
+    // Promote the focused window into a brand-new column on one side of the
+    // active one, widening the visible band so it stays on screen.
+    MoveToNewColumnLeft,
+    MoveToNewColumnRight,
+    // Move the cursor to the next monitor, wrapping; and carry the focused
+    // window over to it. Order is the model's monitor list (output discovery
+    // order), not spatial left-to-right.
+    FocusNextMonitor,
+    MoveWindowToNextMonitor,
+    // Trade the active group with the one next to it, cursor following the group
+    // that moved. Does not wrap, and horizontal swaps stay inside the visible band.
+    SwapGroupUp,
+    SwapGroupDown,
+    SwapGroupLeft,
+    SwapGroupRight,
     MoveActiveColumnRight, // move the active_column pointer through the list of visible columns
     MoveActiveColumnLeft,  // without actually mutating the list.
     NewGroup,           // insert a fresh empty group after the active one and make it active
@@ -57,6 +71,14 @@ pub enum NavAction {
     MoveFocusedWindowDown,
     MoveFocusedWindowLeft,
     MoveFocusedWindowRight,
+    // Move focus to the nearest window in a direction, crossing group and column
+    // divides and wrapping at the edges. Unlike the Move/Rotate/Scroll chords
+    // these navigate the WHOLE cube, so they can reach a window that is off
+    // screen -- the compositor then scrolls or rotates to bring it into view.
+    FocusWindowUp,
+    FocusWindowDown,
+    FocusWindowLeft,
+    FocusWindowRight,
     ToggleMaximize,        // cycle the focused window group -> monitor -> none; releases on focus change
     ToggleMaximizeReverse, // the same cycle walked backwards: straight to monitor, then group, then none
     FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
@@ -509,8 +531,8 @@ impl RubixState {
         let origin_before = focus_before.and_then(|id| self.settled_window_location(id));
 
         // Motion actions reposition the active column/group, so keyboard focus
-        // should follow to whatever now sits in the active slot. Spawn (its focus
-        // is a separate on-map concern) and the MoveToNewColumn stub do not.
+        // should follow to whatever now sits in the active slot. Spawn does not
+        // (its focus is a separate on-map concern).
         // RemoveWindow belongs here too: it evicts the focused window, so seat
         // focus is left pointing at a dead surface unless something moves it to
         // whatever the model now considers active in that slot.
@@ -524,6 +546,16 @@ impl RubixState {
                 | NavAction::MoveActiveColumnRight
                 | NavAction::NewGroup
                 | NavAction::RemoveWindow
+                | NavAction::FocusWindowUp
+                | NavAction::FocusWindowDown
+                | NavAction::FocusWindowLeft
+                | NavAction::FocusWindowRight
+                | NavAction::SwapGroupUp
+                | NavAction::SwapGroupDown
+                | NavAction::SwapGroupLeft
+                | NavAction::SwapGroupRight
+                | NavAction::FocusNextMonitor
+                | NavAction::MoveWindowToNextMonitor
         );
 
         // Maximize is transient: anything that moves through the layout drops it,
@@ -580,7 +612,14 @@ impl RubixState {
                 // Takes effect on the next focus change rather than warping
                 // immediately -- turning it on should not itself move the pointer.
             }
-            NavAction::MoveToNewColumn => { self.move_focused_window_to_new_column() },
+            NavAction::MoveToNewColumnLeft => self.move_focused_window_to_new_column(true),
+            NavAction::MoveToNewColumnRight => self.move_focused_window_to_new_column(false),
+            NavAction::FocusNextMonitor => self.focus_monitor_by_offset(1),
+            NavAction::MoveWindowToNextMonitor => self.move_focused_window_to_monitor(1),
+            NavAction::SwapGroupUp => self.swap_active_group_by_direction(Direction::Up),
+            NavAction::SwapGroupDown => self.swap_active_group_by_direction(Direction::Down),
+            NavAction::SwapGroupLeft => self.swap_active_group_by_direction(Direction::Left),
+            NavAction::SwapGroupRight => self.swap_active_group_by_direction(Direction::Right),
             NavAction::MoveActiveColumnLeft => {
                 if let Some(monitor) = self.workspace.active_monitor_mut() { monitor.move_active_column(-1); }
             },
@@ -624,8 +663,12 @@ impl RubixState {
             NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),
             NavAction::MoveFocusedWindowLeft => self.move_focused_window_by_direction(Direction::Left),
             NavAction::MoveFocusedWindowRight => self.move_focused_window_by_direction(Direction::Right),
-            NavAction::RemoveWindow => {
-                if let Some(id) = self.focused_window_id() {
+            NavAction::FocusWindowUp => self.focus_window_by_direction(Direction::Up),
+            NavAction::FocusWindowDown => self.focus_window_by_direction(Direction::Down),
+            NavAction::FocusWindowLeft => self.focus_window_by_direction(Direction::Left),
+            NavAction::FocusWindowRight => self.focus_window_by_direction(Direction::Right),
+            NavAction::RemoveWindow => match self.focused_window_id() {
+                Some(id) => {
                     // Ask nicely first -- send_close/close are requests, not
                     // guarantees, which is exactly why the eviction below is
                     // unconditional: a dead or unresponsive client must not be
@@ -641,6 +684,18 @@ impl RubixState {
                     }
                     self.remove_window_by_id(id);
                     tracing::info!("window {id} removed via RemoveWindow ({} tracked)", self.windows.len());
+                }
+                // Nothing focused means the cursor is parked on an empty group --
+                // focus_active_window clears the seat there. So the same chord
+                // prunes the empty slot, and the column with it when that was
+                // the column's last group. The refocus tail below then re-seats
+                // focus on whatever the cursor lands on.
+                None => {
+                    if let Some(monitor) = self.workspace.active_monitor_mut() {
+                        if monitor.remove_active_group() {
+                            tracing::info!("empty group removed via RemoveWindow");
+                        }
+                    }
                 }
             },
             NavAction::IncreaseSdrWhite => {
@@ -729,9 +784,14 @@ impl RubixState {
             Some(RevealKind::Scrolled { down }) => {
                 self.pending_transition = Some(Transition::Scroll { down });
             }
-            // The swap trades two non-adjacent groups, so there is no edge to
-            // slide toward: the revealed group grows in place while the
-            // displaced one shrinks away.
+            // Reaching an off-screen column spins the whole cube, so every
+            // visible column slides -- the same motion the RotateColumns chords
+            // produce, not a single group appearing in place.
+            Some(RevealKind::Rotated) => {
+                self.pending_transition = Some(Transition::Rotate);
+            }
+            // A far jump traded two non-adjacent groups: the arriving one grows
+            // in place while the displaced one shrinks away.
             Some(RevealKind::Swapped) => {
                 self.pending_transition = Some(Transition::Reveal);
             }
@@ -789,7 +849,7 @@ impl RubixState {
         let crossed_fullscreen = self.fullscreen_windows.contains(&id)
             || previous_focus.is_some_and(|prev| self.fullscreen_windows.contains(&prev));
         if crossed_fullscreen
-            || matches!(revealed, Some(RevealKind::Scrolled { .. }) | Some(RevealKind::Swapped))
+            || matches!(revealed, Some(RevealKind::Scrolled { .. }) | Some(RevealKind::Rotated) | Some(RevealKind::Swapped))
         {
             self.apply_layout();
         }

@@ -715,10 +715,10 @@
     }
 
     #[test]
-    fn the_last_visible_column_scrolls_rather_than_swapping() {
+    fn the_last_visible_column_scrolls_rather_than_rotating() {
         // Boundary guard for `col < visible_columns`: index visible_columns - 1
         // is still on screen, so it must take the scroll branch and the group
-        // must not move. An off-by-one here would restructure the grid whenever
+        // must not move. An off-by-one here would spin the whole cube whenever
         // the rightmost visible column changed rows.
         let mut mon = four_by_three();
         assert!(matches!(mon.reveal_window(9), Some(RevealKind::Scrolled { down: true })));
@@ -726,38 +726,147 @@
     }
 
     #[test]
-    fn the_first_offscreen_column_swaps_into_the_active_slot() {
+    fn the_first_offscreen_column_rotates_into_the_visible_band() {
         // Other side of the same boundary: index == visible_columns is the first
         // column compute_layout drops, and it is by far the most common reveal
         // target. With `<=` it would have taken the scroll branch and stayed
         // invisible.
+        //
+        // Rotation lands it in the RIGHTMOST visible column, not the active one:
+        // the cube spins just far enough to bring it on screen, so it enters from
+        // the edge it was hiding behind.
         let mut mon = four_by_three();
-        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Swapped)));
-        assert_eq!(mon.locate(10), Some((0, 0)));
-        assert_eq!(mon.locate(1), Some((3, 0)), "displaced group takes the vacated slot");
+        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Rotated)));
+        assert_eq!(mon.locate(10), Some((2, 0)));
+        assert_eq!(mon.locate(1), Some((3, 0)), "the leftmost active group wraps to the end");
+        assert_eq!(mon.locate(4), Some((0, 0)), "every other active group shifts one column left");
         assert!(laid_out_ids(&mon).contains(&10));
     }
 
     #[test]
-    fn reveal_swap_trades_at_the_active_row_of_each_column() {
-        // The swap is between the two ACTIVE slots, not row 0 of each column:
-        // target 12 sits at (3, 2) and the cursor at (0, 1), so they exchange.
+    fn reveal_scrolls_the_target_column_before_rotating_it() {
+        // rotate_columns only carries each column's ACTIVE group, so revealing a
+        // window on any other row has to scroll its column first or the target
+        // holds still while the cube turns around it. Window 12 sits at (3, 2),
+        // whose column is on row 0 -- without the pre-scroll, 10 would arrive
+        // instead.
         let mut mon = four_by_three();
-        assert!(mon.focus_window(2));
-        assert!(matches!(mon.reveal_window(12), Some(RevealKind::Swapped)));
-        assert_eq!(mon.locate(12), Some((0, 1)));
-        assert_eq!(mon.locate(2), Some((3, 2)));
+        assert!(matches!(mon.reveal_window(12), Some(RevealKind::Rotated)));
+        assert_eq!(mon.locate(12), Some((2, 0)));
+        assert!(laid_out_ids(&mon).contains(&12));
     }
 
     #[test]
-    fn reveal_swap_seeds_an_empty_active_column_instead_of_panicking() {
-        // Covers the `let _ = self.active_group_mut()` line, which looks
-        // deletable but is the only thing standing between an active column with
-        // no groups at all and an index panic on the swap.
+    fn reveal_rotation_reports_the_slot_the_group_landed_in() {
+        // reveal_slot's coordinates are the contract for empty destinations,
+        // which have no window id to re-locate afterwards. They must name where
+        // the group ENDED, not where it was asked for.
+        let mut mon = four_by_three();
+        let (kind, col, row) = mon.reveal_slot(3, 2, Some(Direction::Right)).expect("slot exists");
+        assert!(matches!(kind, RevealKind::Rotated));
+        assert_eq!((col, row), (2, 0));
+        assert_eq!(mon.locate(12), Some((col, row)));
+    }
+
+    #[test]
+    fn reveal_travelling_right_enters_from_the_right_edge() {
+        // A rightward step should slide the target in from the side it was
+        // hiding behind, so it lands in the LAST visible column.
+        let mut mon = four_by_three();
+        assert_eq!(mon.reveal_slot(3, 0, Some(Direction::Right)), Some((RevealKind::Rotated, 2, 0)));
+        assert_eq!(mon.locate(10), Some((2, 0)));
+    }
+
+    #[test]
+    fn reveal_travelling_left_wraps_the_last_column_into_the_first_slot() {
+        // The wrap case: stepping Left off column 0 targets the LAST column.
+        // Rotation is cyclic, so that is one step to the RIGHT, not a long spin
+        // back across the cube -- and it enters at slot 0, the edge the user
+        // was travelling toward.
+        let mut mon = four_by_three();
+        assert_eq!(mon.reveal_slot(3, 0, Some(Direction::Left)), Some((RevealKind::Rotated, 0, 0)));
+        assert_eq!(mon.locate(10), Some((0, 0)));
+    }
+
+    #[test]
+    fn reveal_without_a_direction_takes_the_cheaper_rotation() {
+        // Activation requests and clicks carry no sense of travel. Column 3 with
+        // two visible is two steps left but only one right, so it wraps in.
+        let mut mon = monitor_with_visible(&[&[1], &[2], &[3], &[4]], 2);
+        assert_eq!(mon.reveal_slot(3, 0, None), Some((RevealKind::Rotated, 0, 0)));
+        assert_eq!(mon.locate(4), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_distant_column_swaps_instead_of_spinning() {
+        // Six columns, two visible: column 3 is two steps left and three right,
+        // so the cheapest rotation is still more than one. Spinning that far
+        // drags every other column across the screen for what the user
+        // experienced as a jump to one window, so it trades places instead.
+        let mut mon = monitor_with_visible(&[&[1], &[2], &[3], &[4], &[5], &[6]], 2);
+        assert_eq!(mon.reveal_slot(3, 0, None), Some((RevealKind::Swapped, 0, 0)));
+        assert_eq!(mon.locate(4), Some((0, 0)));
+        assert_eq!(mon.locate(1), Some((3, 0)), "the displaced group takes the vacated slot");
+        assert!(laid_out_ids(&mon).contains(&4));
+    }
+
+    #[test]
+    fn every_single_nav_step_stays_within_one_rotation() {
+        // The property that keeps ordinary navigation out of the swap branch:
+        // whichever way you travel, the first off-screen column in that
+        // direction is exactly one rotation away.
+        let mut mon = monitor_with_visible(&[&[1], &[2], &[3], &[4], &[5], &[6]], 3);
+        assert!(matches!(mon.reveal_slot(3, 0, Some(Direction::Right)), Some((RevealKind::Rotated, ..))));
+        let mut mon = monitor_with_visible(&[&[1], &[2], &[3], &[4], &[5], &[6]], 3);
+        assert!(matches!(mon.reveal_slot(5, 0, Some(Direction::Left)), Some((RevealKind::Rotated, ..))));
+    }
+
+    #[test]
+    fn reveal_slot_rejects_coordinates_outside_the_grid() {
+        let mut mon = four_by_three();
+        assert!(mon.reveal_slot(9, 0, None).is_none());
+        assert!(mon.reveal_slot(0, 9, None).is_none());
+    }
+
+    #[test]
+    fn reveal_is_focus_neutral_even_when_it_rotates() {
+        // Every branch touches active_row and group placement, never
+        // active_column -- which is what lets attention requests reveal a window
+        // without stealing the cursor.
+        let mut mon = four_by_three();
+        assert!(mon.focus_window(2));
+        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Rotated)));
+        assert_eq!(mon.active_column, 0, "reveal must not move the cursor");
+    }
+
+    #[test]
+    fn set_active_slot_points_the_cursor_at_an_empty_group() {
+        let mut mon = four_by_three();
+        mon.columns[2].groups.push(Group::empty());
+        assert!(mon.set_active_slot(2, 3));
+        assert_eq!(mon.active_column, 2);
+        assert_eq!(mon.columns[2].active_row, 3);
+        assert_eq!(mon.active_window(), None, "an empty slot focuses nothing");
+    }
+
+    #[test]
+    fn set_active_slot_rejects_coordinates_outside_the_grid() {
+        let mut mon = four_by_three();
+        assert!(!mon.set_active_slot(9, 0));
+        assert!(!mon.set_active_slot(0, 9));
+        assert_eq!(mon.active_column, 0);
+    }
+
+    #[test]
+    fn rotation_seeds_a_column_with_no_groups_instead_of_panicking() {
+        // rotate_columns indexes groups[active_row] on EVERY column, so one with
+        // none at all is an index panic -- a wider blast radius than the old swap,
+        // which only touched two columns. seed_empty_columns is what keeps it safe.
         let mut mon = four_by_three();
         mon.columns[0].groups.clear();
-        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Swapped)));
-        assert_eq!(mon.locate(10), Some((0, 0)));
+        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Rotated)));
+        assert_eq!(mon.locate(10), Some((2, 0)));
+        assert!(!mon.columns[0].groups.is_empty(), "the empty column is seeded, not skipped");
     }
 
     #[test]
@@ -771,12 +880,13 @@
     fn reveal_then_focus_puts_an_offscreen_window_on_screen_and_under_the_cursor() {
         // The composition the plumbing performs, in the order it must happen.
         // reveal relocates the group, so focus_window runs second to pick up the
-        // post-swap coordinates from locate; reversing them would write the
-        // pre-swap column and leave the cursor pointing at the displaced group.
+        // post-rotation coordinates from locate; reversing them would write the
+        // pre-rotation column and leave the cursor pointing at whatever spun into
+        // its place.
         let mut mon = four_by_three();
-        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Swapped)));
+        assert!(matches!(mon.reveal_window(10), Some(RevealKind::Rotated)));
         assert!(mon.focus_window(10));
-        assert_eq!(mon.active_column, 0);
+        assert_eq!(mon.active_column, 2);
         assert_eq!(mon.active_window(), Some(10));
         assert!(laid_out_ids(&mon).contains(&10));
     }
@@ -797,29 +907,30 @@
     }
 
     #[test]
-    fn reveal_swap_survives_an_active_column_outside_the_visible_range() {
-        // Regression: reveal_window assumed active_column < visible_columns,
-        // which move_active_column's rem_euclid used to guarantee. Two things
-        // broke that: DecrementVisibleColumns shrinks the visible range without
-        // clamping active_column, and focus_window sets it with no bound at all.
-        // With active_column >= col, split_at_mut(col) puts the destination in
-        // the RIGHT half and left[active_column] indexes past the end.
+    fn reveal_survives_an_active_column_outside_the_visible_range() {
+        // Regression from the swap era: reveal assumed active_column <
+        // visible_columns, which move_active_column's rem_euclid used to
+        // guarantee. Two things broke that: DecrementVisibleColumns shrinks the
+        // visible range without clamping active_column, and focus_window sets it
+        // with no bound at all. Rotation is immune -- it never reads
+        // active_column -- but the case is worth keeping pinned.
         let mut mon = four_by_three();
         mon.visible_columns = 2;   // as DecrementVisibleColumns leaves it
         mon.active_column = 2;     // still pointing at a now-off-screen column
-        assert!(matches!(mon.reveal_window(7), Some(RevealKind::Swapped)));
+        assert!(matches!(mon.reveal_window(7), Some(RevealKind::Rotated)));
         assert!(laid_out_ids(&mon).contains(&7), "revealed window must be on screen");
     }
 
     #[test]
-    fn reveal_swap_seeds_an_empty_destination_column() {
-        // The destination is not necessarily the active column any more, so
-        // seeding only the active column is not enough to keep the index safe.
+    fn rotation_seeds_every_empty_column_it_passes_through() {
+        // Rotation carries groups across the whole row of columns, so seeding
+        // just the source and destination is not enough.
         let mut mon = four_by_three();
         mon.visible_columns = 2;
         mon.active_column = 2;
         mon.columns[1].groups.clear();
-        assert!(matches!(mon.reveal_window(7), Some(RevealKind::Swapped)));
+        assert!(matches!(mon.reveal_window(7), Some(RevealKind::Rotated)));
+        assert!(laid_out_ids(&mon).contains(&7));
     }
 
     // ---- visible-band cursor clamping ----
@@ -871,4 +982,250 @@
             Some(1),
             "the cursor must address the one visible column"
         );
+    }
+
+    // ---- swap_active_group ----
+
+    #[test]
+    fn swapping_up_trades_rows_and_carries_the_cursor() {
+        // Focus follows the group that moved: after trading with the row above,
+        // the cursor sits on the row the group travelled to, still showing it.
+        let mut mon = four_by_three();
+        mon.columns[0].active_row = 1;      // group holding window 2
+        assert!(mon.swap_active_group(Direction::Up));
+        assert_eq!(mon.locate(2), Some((0, 0)));
+        assert_eq!(mon.locate(1), Some((0, 1)), "the displaced group takes the vacated row");
+        assert_eq!(mon.columns[0].active_row, 0);
+        assert_eq!(mon.active_window(), Some(2), "the cursor follows the group it moved");
+    }
+
+    #[test]
+    fn swapping_right_trades_columns_at_their_active_rows() {
+        // Horizontal swaps hit the destination column's ACTIVE row -- the group
+        // actually on screen beside you, not the one sharing your row index.
+        let mut mon = four_by_three();
+        mon.columns[1].active_row = 2;      // column 1 is showing window 6
+        assert!(mon.swap_active_group(Direction::Right));
+        assert_eq!(mon.locate(1), Some((1, 2)));
+        assert_eq!(mon.locate(6), Some((0, 0)));
+        assert_eq!(mon.active_column, 1);
+        assert_eq!(mon.active_window(), Some(1));
+    }
+
+    #[test]
+    fn swapping_left_trades_columns_in_the_other_order() {
+        // The split_at_mut halves swap roles depending on which column is lower;
+        // getting the row pairing backwards here reads the wrong group out.
+        let mut mon = four_by_three();
+        assert!(mon.focus_window(4));       // column 1, row 0
+        assert!(mon.swap_active_group(Direction::Left));
+        assert_eq!(mon.locate(4), Some((0, 0)));
+        assert_eq!(mon.locate(1), Some((1, 0)));
+        assert_eq!(mon.active_column, 0);
+        assert_eq!(mon.active_window(), Some(4));
+    }
+
+    #[test]
+    fn swapping_does_not_wrap_at_an_edge() {
+        // Unlike directional focus: flinging a group across the whole cube is
+        // not what "trade with the one beside me" means.
+        let mut mon = four_by_three();
+        assert!(!mon.swap_active_group(Direction::Up), "row 0 has nothing above");
+        assert!(!mon.swap_active_group(Direction::Left), "column 0 has nothing left");
+        assert_eq!(mon.locate(1), Some((0, 0)), "a refused swap changes nothing");
+    }
+
+    #[test]
+    fn swapping_right_stops_at_the_visible_band() {
+        // Sending your own group off screen and following it there is never the
+        // intent, so horizontal swaps are capped to what is drawn.
+        let mut mon = four_by_three();       // 4 columns, 3 visible
+        mon.active_column = 2;               // last visible column
+        assert!(!mon.swap_active_group(Direction::Right));
+        assert_eq!(mon.locate(7), Some((2, 0)));
+        assert_eq!(mon.active_column, 2);
+    }
+
+    #[test]
+    fn swapping_works_against_an_empty_group() {
+        // Trading into an empty slot is the useful case: it is how a group gets
+        // moved somewhere there is room for it.
+        let mut mon = four_by_three();
+        mon.columns[0].groups.push(Group::empty());
+        assert!(mon.swap_active_group(Direction::Down) || mon.columns[0].active_row == 0);
+        mon.columns[0].active_row = 2;
+        assert!(mon.swap_active_group(Direction::Down));
+        assert_eq!(mon.columns[0].active_row, 3);
+        assert_eq!(mon.active_window(), Some(3));
+    }
+
+    // ---- move_window_to_new_column ----
+
+    #[test]
+    fn promoting_to_the_right_inserts_after_the_active_column() {
+        let mut mon = four_by_three();
+        let visible_before = mon.visible_columns();
+        mon.move_window_to_new_column(1, false);
+        assert_eq!(mon.locate(1), Some((1, 0)));
+        assert_eq!(mon.active_column, 1, "the cursor lands on the new column");
+        assert_eq!(mon.active_window(), Some(1));
+        assert_eq!(mon.visible_columns(), visible_before + 1, "the band widens to keep it drawn");
+        assert!(laid_out_ids(&mon).contains(&1));
+    }
+
+    #[test]
+    fn promoting_to_the_left_inserts_before_the_active_column() {
+        let mut mon = four_by_three();
+        assert!(mon.focus_window(4));        // column 1
+        mon.move_window_to_new_column(4, true);
+        assert_eq!(mon.locate(4), Some((1, 0)), "inserted at the old index, pushing column 1 right");
+        // (2, 1), not (2, 0): detaching 4 empties row 0 rather than pruning it
+        // (see Monitor::remove_window's TODO), so 5 keeps its row index while the
+        // whole column shifts one to the right. RemoveWindow on that empty row is
+        // what cleans it up.
+        assert_eq!(mon.locate(5), Some((2, 1)), "the column it displaced shifts right");
+        assert_eq!(mon.active_column, 1);
+        assert_eq!(mon.active_window(), Some(4));
+        assert!(laid_out_ids(&mon).contains(&4));
+    }
+
+    #[test]
+    fn promoting_leaves_the_source_group_populated() {
+        // Column 0 holds 1/2/3 in separate rows, so pulling 1 out must not
+        // disturb the other two.
+        let mut mon = four_by_three();
+        mon.move_window_to_new_column(1, false);
+        assert_eq!(mon.locate(2), Some((0, 1)));
+        assert_eq!(mon.locate(3), Some((0, 2)));
+    }
+
+    // ---- remove_active_group ----
+
+    #[test]
+    fn removing_an_empty_group_prunes_the_row() {
+        let mut mon = four_by_three();
+        mon.columns[0].groups.push(Group::empty());
+        mon.columns[0].active_row = 3;
+        assert!(mon.remove_active_group());
+        assert_eq!(mon.columns[0].groups.len(), 3);
+        assert_eq!(mon.columns[0].active_row, 2, "the cursor clamps back into range");
+    }
+
+    #[test]
+    fn removing_the_last_group_prunes_the_column() {
+        let mut mon = monitor_with_visible(&[&[1], &[2], &[3]], 3);
+        mon.columns.insert(1, Column::new(0));
+        mon.columns[1].add_group(Group::empty());
+        mon.active_column = 1;
+        assert!(mon.remove_active_group());
+        assert_eq!(mon.columns.len(), 3);
+        assert_eq!(mon.locate(2), Some((1, 0)), "the columns behind it close up");
+    }
+
+    #[test]
+    fn pruning_a_column_shrinks_the_visible_band() {
+        // visible_columns must never exceed the number of columns, or
+        // compute_layout emits slots that do not exist.
+        let mut mon = monitor_with_visible(&[&[1], &[2]], 2);
+        mon.columns.push(Column::new(0));
+        mon.columns[2].add_group(Group::empty());
+        mon.increment_visible_columns(1);
+        assert_eq!(mon.visible_columns(), 3);
+        mon.active_column = 2;
+        assert!(mon.remove_active_group());
+        assert_eq!(mon.columns.len(), 2);
+        assert_eq!(mon.visible_columns(), 2);
+        assert!(mon.active_column < mon.visible_columns());
+    }
+
+    #[test]
+    fn removing_refuses_a_group_that_holds_windows() {
+        // A keypress must not be able to delete windows out from under the user;
+        // the window path handles those.
+        let mut mon = four_by_three();
+        assert!(!mon.remove_active_group());
+        assert_eq!(mon.locate(1), Some((0, 0)));
+    }
+
+    #[test]
+    fn removing_keeps_the_last_empty_group_of_the_last_column() {
+        // The resting state of an empty monitor. Pruning it would leave the
+        // cursor pointing at nothing and every active_* accessor indexing an
+        // empty Vec.
+        let mut mon = monitor_with_visible(&[&[1]], 1);
+        mon.columns[0].groups.clear();
+        mon.columns[0].add_group(Group::empty());
+        assert!(!mon.remove_active_group());
+        assert_eq!(mon.columns.len(), 1);
+        assert_eq!(mon.columns[0].groups.len(), 1);
+    }
+
+    // ---- multi-monitor ----
+
+    fn two_head_workspace() -> Workspace {
+        let mut ws = Workspace::new();
+        ws.ensure_monitor(0, 1);
+        ws.ensure_monitor(1, 1);
+        ws.set_active_monitor(0);
+        ws.monitors[0].add_window(SplitDirection::Horizontal, 1, 0);
+        ws.monitors[1].add_window(SplitDirection::Horizontal, 2, 0);
+        ws
+    }
+
+    #[test]
+    fn monitor_offset_wraps_in_both_directions() {
+        let ws = two_head_workspace();
+        assert_eq!(ws.monitor_id_by_offset(1), Some(1));
+        assert_eq!(ws.monitor_id_by_offset(-1), Some(1), "two heads: next and previous coincide");
+        assert_eq!(ws.monitor_id_by_offset(2), Some(0), "a full lap comes back home");
+    }
+
+    #[test]
+    fn monitor_offset_is_none_on_a_single_head() {
+        // The chord has to no-op rather than cycling the one monitor onto itself
+        // and firing a pointless refocus + layout pass.
+        let mut ws = Workspace::new();
+        ws.ensure_monitor(0, 1);
+        assert_eq!(ws.monitor_id_by_offset(1), None);
+    }
+
+    #[test]
+    fn moving_a_window_across_heads_detaches_and_reseats_it() {
+        let mut ws = two_head_workspace();
+        assert!(ws.move_window_to_monitor(1, 1, SplitDirection::Horizontal));
+        assert_eq!(ws.get_monitor_id_by_window_id(1), Some(1), "window followed to head 1");
+        assert_eq!(ws.monitors[0].count_windows(), 0, "source head gives it up");
+        assert_eq!(ws.monitors[1].count_windows(), 2);
+        assert_eq!(ws.active_monitor_id(), 1, "the cursor follows the window");
+        assert_eq!(ws.active_monitor().and_then(|m| m.active_window()), Some(1));
+    }
+
+    #[test]
+    fn moving_a_window_to_the_head_it_is_already_on_is_a_noop() {
+        let mut ws = two_head_workspace();
+        assert!(!ws.move_window_to_monitor(1, 0, SplitDirection::Horizontal));
+        assert_eq!(ws.monitors[0].count_windows(), 1);
+        assert_eq!(ws.active_monitor_id(), 0);
+    }
+
+    #[test]
+    fn moving_an_unknown_window_changes_nothing() {
+        let mut ws = two_head_workspace();
+        assert!(!ws.move_window_to_monitor(999, 1, SplitDirection::Horizontal));
+        assert_eq!(ws.active_monitor_id(), 0, "a refused move must not drag the cursor");
+        assert_eq!(ws.monitors[1].count_windows(), 1);
+    }
+
+    #[test]
+    fn moving_into_an_empty_head_seeds_its_group() {
+        // active_window() is None over there, so add_window falls through to
+        // seeding the group rather than splitting a leaf that is not present.
+        let mut ws = Workspace::new();
+        ws.ensure_monitor(0, 1);
+        ws.ensure_monitor(1, 1);
+        ws.set_active_monitor(0);
+        ws.monitors[0].add_window(SplitDirection::Horizontal, 1, 0);
+        assert!(ws.move_window_to_monitor(1, 1, SplitDirection::Horizontal));
+        assert_eq!(ws.monitors[1].active_window(), Some(1));
+        assert_eq!(ws.monitors[0].count_windows(), 0);
     }

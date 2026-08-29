@@ -11,7 +11,7 @@
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.visible_columns, 3);
         assert_eq!(cfg.keybinds.len(), bind_count, "a keybind was dropped during resolution");
-        assert_eq!(bind_count, 27);
+        assert_eq!(bind_count, 29);
     }
 
     // The defaults read off disk as four separate files must resolve to
@@ -248,14 +248,14 @@
 
     #[test]
     fn chord_parses_modifiers_and_keysym() {
-        let kb = parse_chord("Alt+Return", NavAction::MoveToNewColumn).unwrap();
+        let kb = parse_chord("Alt+Return", NavAction::MoveToNewColumnRight).unwrap();
         assert!(kb.alt && !kb.logo && !kb.ctrl && !kb.shift);
         assert_eq!(kb.keysym, keysym_from_name("Return", KEYSYM_NO_FLAGS).raw());
     }
 
     #[test]
     fn unknown_key_drops_the_bind() {
-        assert!(parse_chord("Alt+Nonsense", NavAction::MoveToNewColumn).is_none());
+        assert!(parse_chord("Alt+Nonsense", NavAction::MoveToNewColumnRight).is_none());
     }
 
     // ---- output config ----
