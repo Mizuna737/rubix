@@ -293,6 +293,13 @@ const RULE_SCHEMA: &[(&str, Schema)] = &[
     ("inactive_backdrop_blur", Schema::Leaf),
     ("active_refract", Schema::Leaf),
     ("inactive_refract", Schema::Leaf),
+    ("active_effect", Schema::Leaf),
+    ("inactive_effect", Schema::Leaf),
+    ("effect_speed", Schema::Leaf),
+    ("active_effect_luminance_nits", Schema::Leaf),
+    ("inactive_effect_luminance_nits", Schema::Leaf),
+    ("effect_depth", Schema::Leaf),
+    ("effect_fps", Schema::Leaf),
 ];
 
 const OUTPUT_SCHEMA: &[(&str, Schema)] = &[
@@ -330,6 +337,13 @@ const DECORATION_SCHEMA: &[(&str, Schema)] = &[
     ("refract_strength", Schema::Leaf),
     ("refract_facet_size", Schema::Leaf),
     ("refract_dispersion", Schema::Leaf),
+    ("active_effect", Schema::Leaf),
+    ("inactive_effect", Schema::Leaf),
+    ("effect_speed", Schema::Leaf),
+    ("active_effect_luminance_nits", Schema::Leaf),
+    ("inactive_effect_luminance_nits", Schema::Leaf),
+    ("effect_depth", Schema::Leaf),
+    ("effect_fps", Schema::Leaf),
     ("rule", Schema::ArrayOfTables(RULE_SCHEMA)),
 ];
 

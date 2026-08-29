@@ -913,6 +913,11 @@
             backdrop_tonemap: false,
             backdrop_blur: false,
             refract: false,
+            effect: BorderEffect::None,
+            effect_speed: 1.0,
+            effect_luminance_nits: None,
+            effect_depth: 0.6,
+            effect_fps: 24,
         };
         let before = style.clone();
         let over = StyleOverride { backdrop_blur: Some(true), ..StyleOverride::default() };
@@ -1111,4 +1116,107 @@
         let deco = decoration_from("active_opacity = 0.95\ninactive_opacity = 0.75\n");
         let params = ThemeConfig::default().solve_params(&deco);
         assert_eq!(params.opacity, 0.75);
+    }
+
+    // ---- border effects ----
+
+    #[test]
+    fn effect_fields_parse_at_the_section_level() {
+        let deco = decoration_from(
+            r##"
+            active_effect = "Breathing"
+            inactive_effect = "Pulse"
+            effect_speed = 2.0
+            active_effect_luminance_nits = 700.0
+            effect_depth = 0.3
+            effect_fps = 30
+            "##,
+        );
+        assert_eq!(deco.active.effect, BorderEffect::Breathing);
+        assert_eq!(deco.inactive.effect, BorderEffect::Pulse);
+        assert_eq!(deco.active.effect_speed, 2.0);
+        assert_eq!(deco.inactive.effect_speed, 2.0, "effect_speed is shared across both states");
+        assert_eq!(deco.active.effect_luminance_nits, Some(700.0));
+        assert_eq!(deco.inactive.effect_luminance_nits, None);
+        assert_eq!(deco.active.effect_depth, 0.3);
+        assert_eq!(deco.active.effect_fps, 30);
+    }
+
+    #[test]
+    fn effect_fields_parse_at_the_rule_level_with_pascal_case_variants() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            app_id = "signal"
+            active_effect = "GradientFlow"
+            inactive_effect = "Comet"
+            "##,
+        );
+        let active = deco.style_for(Some("signal"), None, true);
+        let inactive = deco.style_for(Some("signal"), None, false);
+        assert_eq!(active.effect, BorderEffect::GradientFlow);
+        assert_eq!(inactive.effect, BorderEffect::Comet);
+    }
+
+    // A rule's active_effect must override the section default while leaving
+    // every other field -- colour, opacity, glow -- exactly where the section
+    // left it. Mirrors the existing "a rule setting only X" tests above.
+    #[test]
+    fn a_rules_active_effect_overrides_the_section_default_leaving_other_fields_untouched() {
+        let deco = decoration_from(
+            r##"
+            active_color = "#111111"
+            active_opacity = 0.8
+            active_effect = "Pulse"
+            [[rule]]
+            app_id = "signal"
+            active_effect = "Comet"
+            "##,
+        );
+        let style = deco.style_for(Some("signal"), None, true);
+        assert_eq!(style.effect, BorderEffect::Comet);
+        assert_eq!(style.color, parse_color("#111111").unwrap());
+        assert_eq!(style.opacity, 0.8);
+    }
+
+    #[test]
+    fn any_effect_is_false_when_nothing_names_an_effect() {
+        let deco = decoration_from("active_color = \"#111111\"\n");
+        assert!(!deco.any_effect);
+    }
+
+    #[test]
+    fn any_effect_is_true_when_only_a_rule_names_one() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            app_id = "signal"
+            active_effect = "Pulse"
+            "##,
+        );
+        assert!(deco.any_effect);
+    }
+
+    #[test]
+    fn any_effect_is_true_when_the_section_default_names_one() {
+        let deco = decoration_from("active_effect = \"Breathing\"\n");
+        assert!(deco.any_effect);
+    }
+
+    #[test]
+    fn effect_speed_clamps_a_zero_up_to_the_floor() {
+        let deco = decoration_from("effect_speed = 0.0\n");
+        assert_eq!(deco.active.effect_speed, 0.01);
+    }
+
+    #[test]
+    fn effect_fps_clamps_a_zero_up_to_one() {
+        let deco = decoration_from("effect_fps = 0\n");
+        assert_eq!(deco.active.effect_fps, 1);
+    }
+
+    #[test]
+    fn effect_depth_clamps_above_one_down_to_one() {
+        let deco = decoration_from("effect_depth = 2.0\n");
+        assert_eq!(deco.active.effect_depth, 1.0);
     }

@@ -1273,6 +1273,11 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, cr
     };
 
     let animating = data.step_animations();
+    // Read alongside `step_animations`, before the surface `guard` is
+    // dropped: `border_tick_interval` takes `&self` on `RubixState`, and
+    // reading it later would fight the same borrow discipline this whole
+    // function already respects for `surface`/`guard`.
+    let border_tick = data.border_tick_interval();
 
     let result = render_surface(surface, &mut renderer, data);
 
@@ -1298,7 +1303,9 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, cr
         }
     };
 
-    let reschedule = reschedule || (animating && !matches!(&result, Ok(true)));
+    let reschedule = reschedule
+        || (animating && !matches!(&result, Ok(true)))
+        || (border_tick.is_some() && !matches!(&result, Ok(true)));
 
     let frame_duration = surface.frame_duration;
     // Send frame callbacks so clients keep producing content.
@@ -1324,7 +1331,15 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, cr
     drop(guard);
 
     if reschedule {
-        schedule_render(udev, node, crtc, frame_duration);
+        // A window tween wants the next vblank; a border effect wants only its
+        // own tick. When both are live the tween's rate wins, since it is
+        // always the faster of the two.
+        let delay = if animating {
+            frame_duration
+        } else {
+            border_tick.unwrap_or(frame_duration)
+        };
+        schedule_render(udev, node, crtc, delay);
     }
 }
 

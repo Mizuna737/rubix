@@ -257,3 +257,62 @@ inactive_color = "#45475a"
 # inactive_backdrop_tonemap = true
 # active_backdrop_blur = true
 # inactive_backdrop_blur = true
+
+# Animated border effects. Per-rule, layered over the ring exactly like colour
+# and opacity above: a broad rule can turn an effect on, a narrower one can
+# turn it back off or swap it for another.
+#
+# active_effect / inactive_effect:
+#   "None"          plain static ring (default)
+#   "Pulse"         sinusoidal swell, the whole ring in phase
+#   "Breathing"     like Pulse but weighted to dwell at the low end, so it
+#                   reads as breathing rather than blinking
+#   "GradientFlow"  a travelling wave running around the ring's perimeter
+#   "Comet"         a bright head chasing a decaying tail around the perimeter
+# active_effect = "None"
+# inactive_effect = "None"
+
+# Cycles per second. Shared across both states, per rule. Range [0.01, 20.0].
+# effect_speed = 1.0
+
+# How far the effect dips the ring's alpha at its trough, 0.0-1.0. Shared
+# across both states, per rule. `0.0` modulates nothing but colour, which is
+# only visible at all when paired with an *_effect_luminance_nits below --
+# without it a depth of 0 is a no-op effect.
+# effect_depth = 0.6
+
+# Ticks per second the effect is sampled at. Shared across both states, per
+# rule. This is what keeps an animated border cheap: the ring's inputs
+# quantise to this rate, so a 24 fps effect rebuilds (and damages) 24 times a
+# second on a 165 Hz panel instead of 165 -- turning it up trades damage cost
+# for smoothness. Range [1, 240].
+# effect_fps = 24
+
+# active_effect_luminance_nits / inactive_effect_luminance_nits: the HDR
+# payoff, and the reason this feature exists at all. Pairing an effect
+# luminance with effect_depth = 0.0 gives a PURE luminance animation at
+# constant hue and alpha -- the border swings between two absolute
+# brightnesses (its normal colour and this nit value) with nothing else
+# moving. That is something an SDR compositor physically cannot do: SDR has no
+# "brighter than white" to swing into, only "more or less opaque/saturated".
+# Ignored entirely on non-HDR outputs, where effect_depth is the only thing
+# that moves.
+# active_effect_luminance_nits = 700.0
+# inactive_effect_luminance_nits = 0
+
+# Known limitation: GradientFlow and Comet sweep a POLAR angle around the
+# window's centre, not true arc length along the rounded-rectangle perimeter.
+# On a wide window this means the wave/comet visibly moves faster along the
+# short (top/bottom) edges than the long (left/right) ones. Correct
+# arc-length parameterisation needs the perimeter integral and is deferred to
+# a later phase.
+#
+# A breathing focus ring at a fixed 700 nits, motionless in hue -- exactly the
+# thing SDR chrome cannot express:
+#
+# [[decoration.rule]]
+# app_id = "signal"
+# active_effect = "Breathing"
+# active_effect_luminance_nits = 700.0
+# effect_speed = 0.5
+# effect_depth = 0.0

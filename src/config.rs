@@ -199,6 +199,28 @@ pub enum BarPosition {
     Bottom,
 }
 
+/// Which animation, if any, modulates a border ring.
+///
+/// `None` is not merely the default -- it is a distinct code path. A ring
+/// whose effect is `None` produces a `RingInputs` with no time component, so
+/// it compares equal frame to frame, reuses its cached element, and generates
+/// no damage. Everything below is opt-in and costs nothing until it is asked
+/// for.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BorderEffect {
+    #[default]
+    None,
+    /// Sinusoidal swell, the whole ring in phase.
+    Pulse,
+    /// Like `Pulse` but weighted to dwell at the low end, so it reads as
+    /// breathing rather than blinking.
+    Breathing,
+    /// A travelling wave running around the ring's perimeter.
+    GradientFlow,
+    /// A bright head chasing a decaying tail around the perimeter.
+    Comet,
+}
+
 /// Resolved `[bar]`. See `config/default/bar.toml` for the on-disk defaults.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BarConfig {
@@ -949,6 +971,23 @@ pub struct WindowStyle {
     /// of showing the wallpaper flat. `false` (the default) preserves existing
     /// behaviour.
     pub refract: bool,
+    /// Which animation, if any, modulates the border ring. `None` (the
+    /// default) is the plain static ring -- see `BorderEffect::None`.
+    pub effect: BorderEffect,
+    /// Cycles per second. Clamped to [0.01, 20.0] at resolve time.
+    pub effect_speed: f32,
+    /// The luminance the effect peaks at on an HDR output, in nits. `None`
+    /// leaves the ring's colour alone and the effect modulates alpha only.
+    pub effect_luminance_nits: Option<f32>,
+    /// How far the effect dips the ring's alpha at its trough, 0.0-1.0.
+    /// `0.0` modulates nothing but colour -- which, paired with
+    /// `effect_luminance_nits`, is a pure luminance animation an SDR
+    /// compositor cannot express.
+    pub effect_depth: f32,
+    /// Ticks per second the effect is sampled at. The ring's inputs quantise
+    /// to this, so a 24 fps effect rebuilds (and damages) 24 times a second
+    /// on a 165 Hz panel instead of 165. Clamped to [1, 240].
+    pub effect_fps: u32,
 }
 
 impl Default for DecorationConfig {
@@ -1005,6 +1044,12 @@ pub struct DecorationConfig {
     /// Per-channel dispersion spread, `0.0`-`1.0`, before the seam
     /// amplification the shader applies. Clamped to `[0.0, 1.0]`.
     pub refract_dispersion: f32,
+    /// Whether ANY style or rule names an effect other than `None`.
+    ///
+    /// The per-frame "is anything animating" check consults this first, so a
+    /// config that never asked for an effect pays a single bool test rather
+    /// than a walk over every window resolving styles.
+    pub any_effect: bool,
 }
 
 /// A conditional override. Both matchers are case-insensitive substring tests,
@@ -1038,6 +1083,14 @@ pub struct StyleOverride {
     pub backdrop_tonemap: Option<bool>,
     pub backdrop_blur: Option<bool>,
     pub refract: Option<bool>,
+    pub effect: Option<BorderEffect>,
+    pub effect_speed: Option<f32>,
+    /// Doubly optional for the same reason `luminance_nits` already is --
+    /// outer = "did the rule mention it", inner = "did it ask for no
+    /// opinion".
+    pub effect_luminance_nits: Option<Option<f32>>,
+    pub effect_depth: Option<f32>,
+    pub effect_fps: Option<u32>,
 }
 
 impl StyleOverride {
@@ -1065,6 +1118,21 @@ impl StyleOverride {
         }
         if let Some(refract) = self.refract {
             style.refract = refract;
+        }
+        if let Some(effect) = self.effect {
+            style.effect = effect;
+        }
+        if let Some(speed) = self.effect_speed {
+            style.effect_speed = speed;
+        }
+        if let Some(nits) = self.effect_luminance_nits {
+            style.effect_luminance_nits = nits;
+        }
+        if let Some(depth) = self.effect_depth {
+            style.effect_depth = depth;
+        }
+        if let Some(fps) = self.effect_fps {
+            style.effect_fps = fps;
         }
     }
 }
@@ -1155,6 +1223,21 @@ struct RawDecoration {
     refract_facet_size: f32,
     #[serde(default = "default_refract_dispersion")]
     refract_dispersion: f32,
+    #[serde(default)]
+    active_effect: BorderEffect,
+    #[serde(default)]
+    inactive_effect: BorderEffect,
+    // Shared across both states, same convention `glow_falloff` follows.
+    #[serde(default = "default_effect_speed")]
+    effect_speed: f32,
+    #[serde(default)]
+    active_effect_luminance_nits: Option<f32>,
+    #[serde(default)]
+    inactive_effect_luminance_nits: Option<f32>,
+    #[serde(default = "default_effect_depth")]
+    effect_depth: f32,
+    #[serde(default = "default_effect_fps")]
+    effect_fps: u32,
     // Singular to match the `[[decoration.rule]]` array-of-tables header
     // exactly, same convention as `[[output]]`.
     #[serde(default)]
@@ -1188,6 +1271,13 @@ impl Default for RawDecoration {
             refract_strength: default_refract_strength(),
             refract_facet_size: default_refract_facet_size(),
             refract_dispersion: default_refract_dispersion(),
+            active_effect: BorderEffect::default(),
+            inactive_effect: BorderEffect::default(),
+            effect_speed: default_effect_speed(),
+            active_effect_luminance_nits: None,
+            inactive_effect_luminance_nits: None,
+            effect_depth: default_effect_depth(),
+            effect_fps: default_effect_fps(),
             rule: Vec::new(),
         }
     }
@@ -1229,6 +1319,20 @@ struct RawBorderRule {
     active_refract: Option<bool>,
     #[serde(default)]
     inactive_refract: Option<bool>,
+    #[serde(default)]
+    active_effect: Option<BorderEffect>,
+    #[serde(default)]
+    inactive_effect: Option<BorderEffect>,
+    #[serde(default)]
+    effect_speed: Option<f32>,
+    #[serde(default)]
+    active_effect_luminance_nits: Option<f32>,
+    #[serde(default)]
+    inactive_effect_luminance_nits: Option<f32>,
+    #[serde(default)]
+    effect_depth: Option<f32>,
+    #[serde(default)]
+    effect_fps: Option<u32>,
 }
 
 fn default_border_width() -> u32 {
@@ -1286,6 +1390,18 @@ fn default_refract_dispersion() -> f32 {
 /// few pixels behind a maximized neighbour still fades.
 fn default_obscured_threshold() -> f32 {
     0.9
+}
+
+fn default_effect_speed() -> f32 {
+    1.0
+}
+
+fn default_effect_depth() -> f32 {
+    0.6
+}
+
+fn default_effect_fps() -> u32 {
+    24
 }
 
 fn default_active_color() -> String {
@@ -1354,6 +1470,18 @@ fn resolve_opacity(value: f32) -> f32 {
     if value.is_nan() { 1.0 } else { value.clamp(0.0, 1.0) }
 }
 
+fn resolve_effect_speed(v: f32) -> f32 {
+    v.clamp(0.01, 20.0)
+}
+
+fn resolve_effect_depth(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
+}
+
+fn resolve_effect_fps(v: u32) -> u32 {
+    v.clamp(1, 240)
+}
+
 fn resolve_color(text: &str, fallback: Color32F) -> Color32F {
     match parse_color(text) {
         Some(color) => color,
@@ -1385,6 +1513,13 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
                     backdrop_tonemap: r.active_backdrop_tonemap,
                     backdrop_blur: r.active_backdrop_blur,
                     refract: r.active_refract,
+                    effect: r.active_effect,
+                    effect_speed: r.effect_speed.map(resolve_effect_speed),
+                    effect_luminance_nits: r
+                        .active_effect_luminance_nits
+                        .map(|n| resolve_luminance(Some(n))),
+                    effect_depth: r.effect_depth.map(resolve_effect_depth),
+                    effect_fps: r.effect_fps.map(resolve_effect_fps),
                 },
                 inactive: StyleOverride {
                     color: color(r.inactive_color, inactive_fallback),
@@ -1395,12 +1530,26 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
                     backdrop_tonemap: r.inactive_backdrop_tonemap,
                     backdrop_blur: r.inactive_backdrop_blur,
                     refract: r.inactive_refract,
+                    effect: r.inactive_effect,
+                    effect_speed: r.effect_speed.map(resolve_effect_speed),
+                    effect_luminance_nits: r
+                        .inactive_effect_luminance_nits
+                        .map(|n| resolve_luminance(Some(n))),
+                    effect_depth: r.effect_depth.map(resolve_effect_depth),
+                    effect_fps: r.effect_fps.map(resolve_effect_fps),
                 },
                 app_id: r.app_id,
                 title: r.title,
             }
         })
-        .collect();
+        .collect::<Vec<BorderRule>>();
+
+    let any_effect = raw.active_effect != BorderEffect::None
+        || raw.inactive_effect != BorderEffect::None
+        || rules.iter().any(|r| {
+            r.active.effect.is_some_and(|e| e != BorderEffect::None)
+                || r.inactive.effect.is_some_and(|e| e != BorderEffect::None)
+        });
 
     DecorationConfig {
         border_width: raw.border_width,
@@ -1414,6 +1563,11 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
             backdrop_tonemap: raw.active_backdrop_tonemap,
             backdrop_blur: raw.active_backdrop_blur,
             refract: raw.active_refract,
+            effect: raw.active_effect,
+            effect_speed: resolve_effect_speed(raw.effect_speed),
+            effect_luminance_nits: resolve_luminance(raw.active_effect_luminance_nits),
+            effect_depth: resolve_effect_depth(raw.effect_depth),
+            effect_fps: resolve_effect_fps(raw.effect_fps),
         },
         inactive: WindowStyle {
             color: resolve_color(&raw.inactive_color, inactive_fallback),
@@ -1424,6 +1578,11 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
             backdrop_tonemap: raw.inactive_backdrop_tonemap,
             backdrop_blur: raw.inactive_backdrop_blur,
             refract: raw.inactive_refract,
+            effect: raw.inactive_effect,
+            effect_speed: resolve_effect_speed(raw.effect_speed),
+            effect_luminance_nits: resolve_luminance(raw.inactive_effect_luminance_nits),
+            effect_depth: resolve_effect_depth(raw.effect_depth),
+            effect_fps: resolve_effect_fps(raw.effect_fps),
         },
         rules,
         obscured_opacity: resolve_opacity(raw.obscured_opacity),
@@ -1438,6 +1597,7 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
         refract_strength: raw.refract_strength.clamp(0.0, 200.0),
         refract_facet_size: raw.refract_facet_size.clamp(4.0, 2000.0),
         refract_dispersion: raw.refract_dispersion.clamp(0.0, 1.0),
+        any_effect,
     }
 }
 

@@ -1673,6 +1673,43 @@ impl RubixState {
         }
     }
 
+    /// How long until the next border-effect tick, or `None` if no visible
+    /// window has a live effect.
+    ///
+    /// Separate from `step_animations`'s window tweens because the two run at
+    /// different rates: a tween wants every vblank, an effect wants its own
+    /// `effect_fps`. Driving effects off the vblank would wake the compositor
+    /// 165 times a second to produce 24 distinct frames.
+    ///
+    /// Returns the SHORTEST interval across live effects -- with mixed rates
+    /// the fastest one sets the cadence and the slower ones quantise
+    /// themselves out via `RingInputs`.
+    pub(crate) fn border_tick_interval(&self) -> Option<std::time::Duration> {
+        if !self.config.decoration.any_effect {
+            return None;
+        }
+        let mut fastest: Option<u32> = None;
+        for id in self.windows.keys() {
+            if self.fullscreen_windows.contains(id) {
+                continue;
+            }
+            // `covered = 0.0` rather than the real per-output occlusion
+            // fraction: that map is built per-output in the render path, and
+            // computing it here would duplicate that work just to decide
+            // whether to schedule a wakeup at all. The consequence is that a
+            // fully-obscured animated window still schedules ticks even
+            // though `style_for_window` will refuse to animate it once
+            // `covered` is known at draw time -- a cheap wakeup with no
+            // resulting damage, not a correctness problem.
+            let style = crate::decoration::style_for_window(self, *id, 0.0);
+            if style.effect == crate::config::BorderEffect::None {
+                continue;
+            }
+            fastest = Some(fastest.map_or(style.effect_fps, |f| f.max(style.effect_fps)));
+        }
+        fastest.map(|fps| std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64))
+    }
+
     /// Advance every active tween one frame. Returns true while any tween is live.
     /// Touches nothing when `self.animations` is empty (otherwise the udev backend
     /// never idles).
