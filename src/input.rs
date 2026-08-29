@@ -6,7 +6,10 @@ use smithay::{
     desktop::WindowSurface,
     input::{
         keyboard::{
-            keysyms::{KEY_XF86Switch_VT_1, KEY_XF86Switch_VT_12},
+            keysyms::{
+                KEY_Hyper_R, KEY_ISO_Level3_Shift, KEY_ISO_Level5_Shift, KEY_Shift_L,
+                KEY_XF86Switch_VT_1, KEY_XF86Switch_VT_12,
+            },
             xkb::{self, Keysym},
             FilterResult, ModifiersState,
         },
@@ -59,6 +62,7 @@ pub enum NavAction {
     FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
     RemoveWindow,      // close (politely) then unconditionally detach the focused window
     ToggleFocusFollowsMouse, // flip hover-to-focus live; config re-seeds it on save
+    ToggleMouseFollowsFocus, // flip warp-on-focus live; config re-seeds it on save
     IncreaseSdrWhite,
     DecreaseSdrWhite,
     ToggleHdr,
@@ -88,6 +92,23 @@ enum KeyAction {
 /// the resolved (modified) symbol -- e.g. Shift+1 comes out `Super+Control+
 /// Shift+exclam`, not `Super+Control+Shift+1`, because `handle.modified_sym`
 /// already applied Shift before this runs.
+/// True for the keysyms that are themselves modifiers.
+///
+/// keyd sends a Tartarus chord as three separate presses -- Super down, Control
+/// down, then the key -- and the first two arrive with the modifier state
+/// already set. They pass the echo gate in `process_input_event` and would be
+/// reported as `Super+Super_L` and `Super+Control+Control_L`. A modifier press
+/// is not a chord: it can match no bind, so echoing it makes a listen-mode UI
+/// announce two misses before every real chord.
+fn is_modifier_keysym(sym: u32) -> bool {
+    // Shift_L (0xffe1) through Hyper_R (0xffee) is one contiguous block
+    // covering shift/control/caps/meta/alt/super/hyper. The ISO level shifts
+    // sit outside it.
+    (KEY_Shift_L..=KEY_Hyper_R).contains(&sym)
+        || sym == KEY_ISO_Level3_Shift
+        || sym == KEY_ISO_Level5_Shift
+}
+
 fn format_chord(mods: &ModifiersState, keysym: Keysym) -> String {
     let mut chord = String::new();
     if mods.logo {
@@ -189,7 +210,10 @@ impl RubixState {
                         // `key_state == Pressed` check below the filter), and the
                         // string is only built once the gate passes, so ordinary typing
                         // never allocates here.
-                        if key_state == KeyState::Pressed && (mods.logo || mods.ctrl || mods.alt) {
+                        if key_state == KeyState::Pressed
+                            && (mods.logo || mods.ctrl || mods.alt)
+                            && !is_modifier_keysym(sym)
+                        {
                             let chord = format_chord(mods, handle.modified_sym());
                             state.pending_chords.push((chord, matched_kb.map(|kb| kb.action.clone())));
                         }
@@ -475,6 +499,15 @@ impl RubixState {
     /// confirms the chord reached us (and never reached the client). Steps 2-3
     /// promote the model to a Monitor and wire scroll/rotate/move here.
     pub(crate) fn dispatch_nav(&mut self, action: NavAction) {
+        // Captured before dispatch so the tail can tell whether this action
+        // actually moved focus -- a Spawn or an SDR-white nudge must not warp
+        // the pointer just because dispatch_nav ran.
+        let focus_before = self.focused_window_id();
+        // Focus identity alone is not enough: a move action carries the focused
+        // window to a new slot without ever changing which window is focused, so
+        // the pointer has to follow the geometry too.
+        let origin_before = focus_before.and_then(|id| self.settled_window_location(id));
+
         // Motion actions reposition the active column/group, so keyboard focus
         // should follow to whatever now sits in the active slot. Spawn (its focus
         // is a separate on-map concern) and the MoveToNewColumn stub do not.
@@ -510,6 +543,7 @@ impl RubixState {
                 | NavAction::DecreaseSdrWhite
                 | NavAction::ToggleHdr
                 | NavAction::ToggleFocusFollowsMouse
+                | NavAction::ToggleMouseFollowsFocus
                 | NavAction::Quit
         );
         if !keeps_maximize {
@@ -539,6 +573,12 @@ impl RubixState {
                 // Takes effect on the next pointer motion rather than adopting
                 // whatever happens to sit under a stationary cursor -- turning it
                 // on should not itself move focus.
+            }
+            NavAction::ToggleMouseFollowsFocus => {
+                self.mouse_follows_focus = !self.mouse_follows_focus;
+                tracing::info!("mouse follows focus: {}", self.mouse_follows_focus);
+                // Takes effect on the next focus change rather than warping
+                // immediately -- turning it on should not itself move the pointer.
             }
             NavAction::MoveToNewColumn => { self.move_focused_window_to_new_column() },
             NavAction::MoveActiveColumnLeft => {
@@ -624,6 +664,12 @@ impl RubixState {
         self.apply_layout();
         if refocus {
             self.focus_active_window();
+        }
+        let focus_after = self.focused_window_id();
+        let moved = focus_after != focus_before
+            || focus_after.and_then(|id| self.settled_window_location(id)) != origin_before;
+        if moved {
+            self.warp_pointer_to_focused_window();
         }
         self.ipc_dirty = true;
     }

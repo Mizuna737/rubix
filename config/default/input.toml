@@ -16,6 +16,18 @@
 # such as the bar or rofi, which are not windows and must keep their keyboard.
 focus_follows_mouse = false
 
+# The counterpart to focus_follows_mouse: a keyboard or IPC focus change warps
+# the pointer to the centre of the newly focused window's visible area,
+# instead of leaving it wherever it was. Live/hot-reloadable, and flippable at
+# runtime with the ToggleMouseFollowsFocus keybind -- same seed/live split as
+# above. Hovering a window (focus-follows-mouse) never triggers this.
+#
+# Inert while a pointer grab is in progress, and while any tracked window holds
+# an active pointer lock or confinement -- a game must never be teleported out
+# from under itself. Also does nothing if the newly focused window has no
+# visible area on any output (e.g. rotated off-screen under the cube).
+mouse_follows_focus = false
+
 # Keybinds map a chord to a NavAction variant. The value is the *exact* Rust
 # variant name -- serde deserializes it straight into the enum, so there is no
 # translation table in code. Chord syntax: modifier tokens (Super/Alt/Ctrl/Shift,

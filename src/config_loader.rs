@@ -345,7 +345,8 @@ const IDLE_SCHEMA: &[(&str, Schema)] = &[("enabled", Schema::Leaf), ("screen_off
 const LAYOUT_SCHEMA: &[(&str, Schema)] =
     &[("visible_columns", Schema::Leaf), ("outer_gap", Schema::Leaf), ("inner_gap", Schema::Leaf)];
 const ANIMATION_SCHEMA: &[(&str, Schema)] = &[("duration_ms", Schema::Leaf)];
-const INPUT_SCHEMA: &[(&str, Schema)] = &[("focus_follows_mouse", Schema::Leaf)];
+const INPUT_SCHEMA: &[(&str, Schema)] =
+    &[("focus_follows_mouse", Schema::Leaf), ("mouse_follows_focus", Schema::Leaf)];
 const DIAGNOSTICS_SCHEMA: &[(&str, Schema)] = &[("config_errors", Schema::Leaf)];
 const THEME_SCHEMA: &[(&str, Schema)] = &[
     ("enable", Schema::Leaf),

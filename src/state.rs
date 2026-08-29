@@ -378,6 +378,11 @@ pub struct RubixState {
     // and re-seeded by `reload_config`, but flippable on its own via the
     // ToggleFocusFollowsMouse keybind -- same seed/live split as sdr_white_nits.
     pub(crate) focus_follows_mouse: bool,
+    // Live mouse-follows-focus flag. Seeded from `config.mouse_follows_focus`
+    // and re-seeded by `reload_config`, but flippable on its own via the
+    // ToggleMouseFollowsFocus keybind -- same seed/live split as
+    // focus_follows_mouse.
+    pub(crate) mouse_follows_focus: bool,
 
     // wlr-screencopy captures awaiting the next presented frame. Pushed by the
     // frame `copy` handler (screencopy.rs), drained by each backend's render
@@ -566,6 +571,7 @@ impl RubixState {
 
         let sdr_white_nits = config.sdr_white_nits.clamp(80.0, 300.0);
         let focus_follows_mouse = config.focus_follows_mouse;
+        let mouse_follows_focus = config.mouse_follows_focus;
 
         let mut state = Self {
             start_time,
@@ -635,6 +641,7 @@ impl RubixState {
             dnd_icon: None,
             cursor_position_hint: None,
             focus_follows_mouse,
+            mouse_follows_focus,
             pending_screencopy: Vec::new(),
 
             hdr_outputs: HashSet::new(),
@@ -1360,12 +1367,14 @@ impl RubixState {
         // Covers colors, rules and per-rule luminance in one go.
         self.config.decoration = new.decoration;
         self.config.focus_follows_mouse = new.focus_follows_mouse;
+        self.config.mouse_follows_focus = new.mouse_follows_focus;
         // Swapped before the report below, so an edit that changes the sink is
         // itself announced through the sink it just asked for.
         self.config.diagnostics = new.diagnostics;
         // Re-seeded like sdr_white_nits: a config edit wins over a runtime
         // toggle, so saving the file is always the way back to a known state.
         self.focus_follows_mouse = self.config.focus_follows_mouse;
+        self.mouse_follows_focus = self.config.mouse_follows_focus;
         // Live like the rest: a changed `screen_off_seconds` (or `enabled`)
         // re-arms the idle timer immediately, computed against the same
         // `last_activity` -- so shortening the timeout below the current idle
@@ -1898,6 +1907,81 @@ impl RubixState {
         self.ipc_dirty = true;
     }
 
+    /// Move the pointer to the centre of the focused window, if
+    /// mouse-follows-focus is on and nothing vetoes it.
+    ///
+    /// Called only from the keyboard/IPC focus-change sites, never from
+    /// `focus_follows_pointer` itself -- warping in response to a hover would
+    /// re-centre the cursor under itself every time it moved, which is not a
+    /// feedback loop so much as a cursor that cannot leave the window it is on.
+    /// Where a window will come to rest, which is not where the Space says it is.
+    ///
+    /// `apply_layout` only *plans* a tween; it does not run it. Asked right
+    /// after a nav action, `space.element_location` therefore reports where the
+    /// window *was* -- or, for a scaling tween, nothing at all, since
+    /// `step_animations` unmaps the element from the Space for the duration of
+    /// the flight. The tween's destination is the only settled answer.
+    pub(crate) fn settled_window_location(&self, id: u32) -> Option<Point<i32, Logical>> {
+        self.animations
+            .get(&id)
+            .map(|tween| Point::<i32, Logical>::from((tween.to.x, tween.to.y)))
+            .or_else(|| {
+                let window = self.windows.get(&id)?;
+                self.space.element_location(window)
+            })
+    }
+
+    pub(crate) fn warp_pointer_to_focused_window(&mut self) {
+        if !self.mouse_follows_focus {
+            return;
+        }
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        // A grab owns the pointer for the length of a drag or popup; warping
+        // mid-grab pulls the grab out from under itself. Same reasoning as the
+        // guard in `focus_follows_pointer`.
+        if pointer.is_grabbed() {
+            return;
+        }
+        let Some(id) = self.focused_window_id() else { return };
+        let Some(window) = self.windows.get(&id) else { return };
+        // A game holding a pointer lock or confinement must never be
+        // teleported out from under itself.
+        if let Some(surface) = window.wl_surface() {
+            let locked = with_pointer_constraint(&surface, &pointer, |constraint| {
+                constraint.is_some_and(|c| c.is_active())
+            });
+            if locked {
+                return;
+            }
+        }
+
+        let Some(loc) = self.settled_window_location(id) else { return };
+        let size = window.geometry().size;
+        let window_rect = Rectangle::new(loc, size);
+
+        let outputs: Vec<Rectangle<i32, Logical>> =
+            self.space.outputs().filter_map(|o| self.space.output_geometry(o)).collect();
+
+        let Some(raw_target) = mouse_follows_focus_target(window_rect, &outputs, self.pointer_location) else {
+            return;
+        };
+        let target = self.clamp_to_outputs(raw_target);
+
+        self.pointer_location = target;
+        let under = self.surface_under(target);
+        let time = smithay::utils::Clock::<smithay::utils::Monotonic>::new().now().as_millis();
+        pointer.motion(
+            self,
+            under,
+            &smithay::input::pointer::MotionEvent {
+                location: target,
+                serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
     /// The window under a point, as a Rubix id. Resolved through the Space so
     /// subsurfaces and popups map to their owning toplevel.
     pub(crate) fn window_id_at(&self, pos: Point<f64, Logical>) -> Option<u32> {
@@ -2356,6 +2440,40 @@ impl RubixState {
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod tests;
+
+/// Where the pointer should land for a window occupying `window_rect`, given
+/// the output layout and where the pointer is now. `None` means "do not warp".
+///
+/// A free function over plain rectangles, deliberately: it is the only part of
+/// mouse-follows-focus with interesting logic, and it must be testable without
+/// constructing a compositor.
+fn mouse_follows_focus_target(
+    window_rect: Rectangle<i32, Logical>,
+    outputs: &[Rectangle<i32, Logical>],
+    pointer: Point<f64, Logical>,
+) -> Option<Point<f64, Logical>> {
+    // Already inside: warping here would yank a cursor that was already in the
+    // right place, on every rotate that happens to leave it there.
+    if window_rect.to_f64().contains(pointer) {
+        return None;
+    }
+    // Under the cube a focused window can be rotated entirely off-screen
+    // (see grid_tests.rs::focus_window_alone_can_park_the_cursor_off_screen);
+    // warping to a point on no output is nonsense, so pick the visible portion
+    // -- the intersection with the largest area -- and skip entirely if there
+    // is none.
+    let visible = outputs
+        .iter()
+        .filter_map(|output| window_rect.intersection(*output))
+        .max_by_key(|rect| rect.size.w as i64 * rect.size.h as i64)?;
+    if visible.size.w <= 0 || visible.size.h <= 0 {
+        return None;
+    }
+    Some(Point::from((
+        visible.loc.x as f64 + visible.size.w as f64 / 2.0,
+        visible.loc.y as f64 + visible.size.h as f64 / 2.0,
+    )))
+}
 
 #[derive(Default)]
 pub struct ClientState {

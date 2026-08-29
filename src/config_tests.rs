@@ -192,6 +192,37 @@
         assert!(cfg.focus_follows_mouse);
     }
 
+    #[test]
+    fn config_omitting_input_section_defaults_mouse_follows_focus_off() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [input] still parses");
+        let cfg = Config::resolve(raw);
+        assert!(!cfg.mouse_follows_focus, "warp-on-focus is opt-in");
+    }
+
+    #[test]
+    fn input_section_enables_mouse_follows_focus() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [input]
+            mouse_follows_focus = true
+
+            [keybinds]
+            "Alt+h" = "RotateColumnsLeft"
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config with [input] parses");
+        let cfg = Config::resolve(raw);
+        assert!(cfg.mouse_follows_focus);
+    }
+
     // ---- animation duration ----
 
     #[test]

@@ -157,6 +157,10 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ToplevelHandleData> for RubixState {
             //   slot when the column itself is past visible_columns.
             zwlr_foreign_toplevel_handle_v1::Request::Activate { .. } => {
                 state.focus_by_id(id);
+                // This is rofi's window switcher, and it is the one route that
+                // routinely lands focus on another monitor -- the case
+                // mouse-follows-focus exists for.
+                state.warp_pointer_to_focused_window();
                 state.ipc_dirty = true;
             }
             zwlr_foreign_toplevel_handle_v1::Request::Close => {

@@ -165,6 +165,14 @@ pub struct Config {
     /// this field only seeds/reseeds it).
     pub focus_follows_mouse: bool,
 
+    /// A keyboard/IPC-initiated focus change warps the pointer to the centre
+    /// of the newly focused window. Live/hot-reloadable, and also flippable at
+    /// runtime via the ToggleMouseFollowsFocus keybind (see
+    /// RubixState::mouse_follows_focus, the live value the input path reads --
+    /// this field only seeds/reseeds it). The counterpart to
+    /// focus_follows_mouse, not a replacement for it.
+    pub mouse_follows_focus: bool,
+
     /// Border appearance. Live/hot-reloadable like the rest of the config;
     /// the render path reads it fresh every frame.
     pub decoration: DecorationConfig,
@@ -573,6 +581,10 @@ struct RawInput {
     // focus-follows-mouse changes what every keystroke does, so it is opt-in.
     #[serde(default)]
     focus_follows_mouse: bool,
+    // Off by default: the same opt-in reasoning as focus_follows_mouse, applied
+    // to the reverse direction.
+    #[serde(default)]
+    mouse_follows_focus: bool,
 }
 
 // Optional section: a config omitting `[idle]` parses fine, taking the
@@ -738,6 +750,7 @@ impl Config {
             },
             sdr_white_nits,
             focus_follows_mouse: raw.input.focus_follows_mouse,
+            mouse_follows_focus: raw.input.mouse_follows_focus,
             decoration: resolve_decoration(raw.decoration, sdr_white_nits),
             idle: IdleConfig {
                 enabled: raw.idle.enabled,

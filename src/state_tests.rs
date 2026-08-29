@@ -774,3 +774,65 @@ fn any_and_all_diverge_on_a_partially_off_multi_monitor_setup() {
     assert!(any_off(&mixed), "wake-on-input should still have something to wake");
     assert!(!all_off(&mixed), "idle timer should still be counting down");
 }
+
+// ---- mouse_follows_focus_target (pure geometry, no compositor) ----
+
+use crate::state::mouse_follows_focus_target;
+use smithay::utils::{Logical, Point, Rectangle};
+
+fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new((x, y).into(), (w, h).into())
+}
+
+#[test]
+fn mouse_follows_focus_target_is_none_when_pointer_already_inside_window() {
+    let window = rect(0, 0, 200, 200);
+    let outputs = [rect(0, 0, 1920, 1080)];
+    let pointer = Point::<f64, Logical>::from((50.0, 50.0));
+    assert_eq!(mouse_follows_focus_target(window, &outputs, pointer), None);
+}
+
+#[test]
+fn mouse_follows_focus_target_is_none_when_window_is_off_every_output() {
+    // Mirrors grid_tests.rs::focus_window_alone_can_park_the_cursor_off_screen --
+    // the model tolerates a focused window with no on-screen geometry at all.
+    let window = rect(5000, 5000, 200, 200);
+    let outputs = [rect(0, 0, 1920, 1080)];
+    let pointer = Point::<f64, Logical>::from((10.0, 10.0));
+    assert_eq!(mouse_follows_focus_target(window, &outputs, pointer), None);
+}
+
+#[test]
+fn mouse_follows_focus_target_picks_the_larger_straddled_intersection() {
+    // Window spans two outputs; most of it sits on the second (wider overlap),
+    // so the target must be the centre of that larger slice, not the first
+    // output encountered or the window's own centre.
+    let window = rect(1800, 0, 400, 200); // 1800..2200
+    let left_output = rect(0, 0, 1920, 1080); // overlap: 1800..1920 (120 wide)
+    let right_output = rect(1920, 0, 1920, 1080); // overlap: 1920..2200 (280 wide)
+    let outputs = [left_output, right_output];
+    let pointer = Point::<f64, Logical>::from((10.0, 10.0));
+    let target = mouse_follows_focus_target(window, &outputs, pointer).expect("straddling window is visible");
+    // Larger intersection is on the right output: x in [1920, 2200], y in [0, 200].
+    assert_eq!(target, Point::from((2060.0, 100.0)));
+}
+
+#[test]
+fn mouse_follows_focus_target_uses_the_visible_part_when_partly_off_the_right_edge() {
+    let window = rect(1800, 0, 400, 200); // 1800..2200, only one output
+    let outputs = [rect(0, 0, 1920, 1080)];
+    let pointer = Point::<f64, Logical>::from((10.0, 10.0));
+    let target = mouse_follows_focus_target(window, &outputs, pointer).expect("partially visible window is visible");
+    // Visible slice is x in [1800, 1920], y in [0, 200] -- centre of that, not
+    // the centre of the full (partly off-screen) window rect.
+    assert_eq!(target, Point::from((1860.0, 100.0)));
+}
+
+#[test]
+fn mouse_follows_focus_target_is_the_true_centre_when_fully_visible_on_one_output() {
+    let window = rect(100, 100, 200, 200);
+    let outputs = [rect(0, 0, 1920, 1080)];
+    let pointer = Point::<f64, Logical>::from((10.0, 10.0));
+    let target = mouse_follows_focus_target(window, &outputs, pointer).expect("fully visible window is visible");
+    assert_eq!(target, Point::from((200.0, 200.0)));
+}
