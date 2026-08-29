@@ -234,7 +234,14 @@ fn log_file_path() -> Option<std::path::PathBuf> {
 /// off an unreachable console, so the file is the only way to see what
 /// happened; this makes a log exist without the user having to redirect.
 fn open_log_file() -> Option<std::fs::File> {
-    std::fs::File::create(log_file_path()?).ok()
+    let path = log_file_path()?;
+    // Keep one generation. A session that dies badly (freeze, hard reset)
+    // leaves its evidence in this file, and truncating on the next start is
+    // exactly when that evidence matters most.
+    if path.exists() {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    std::fs::File::create(path).ok()
 }
 
 // `rubix screen ...` -- a tight `hyprctl`/`niri msg`-style client for

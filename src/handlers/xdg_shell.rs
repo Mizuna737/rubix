@@ -329,12 +329,49 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
             }
             PopupKind::InputMethod(ref _input_method) => {}
         }
+        // DEBUG popup-placement trace: where this popup will actually be drawn.
+        if let Ok(root) = find_popup_root_surface(&popup) {
+            let window = space
+                .elements()
+                .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root));
+            let loc = window.and_then(|w| space.element_location(w));
+            let geo = window.map(|w| w.geometry());
+            for (p, offset) in PopupManager::popups_for_surface(&root) {
+                if p.wl_surface() == surface {
+                    tracing::info!(
+                        "POPUPTRACE commit: root_window_loc={:?} root_geo={:?} popup_offset={:?} popup_geo={:?} draw_at={:?}",
+                        loc,
+                        geo,
+                        offset,
+                        p.geometry(),
+                        loc.map(|l| l + offset - p.geometry().loc),
+                    );
+                }
+            }
+        }
     }
 }
 
 impl RubixState {
     fn unconstrain_popup(&self, popup: &PopupSurface) {
+        // DEBUG popup-placement trace: what the client actually asked for.
+        let req = popup.with_pending_state(|state| {
+            (
+                state.positioner.anchor_rect,
+                state.positioner.anchor_edges,
+                state.positioner.gravity,
+                state.positioner.constraint_adjustment,
+                state.positioner.offset,
+                state.positioner.rect_size,
+                state.positioner.reactive,
+            )
+        });
+        tracing::info!(
+            "POPUPTRACE request: anchor_rect={:?} anchor_edges={:?} gravity={:?} adjustment={:?} offset={:?} size={:?} reactive={}",
+            req.0, req.1, req.2, req.3, req.4, req.5, req.6,
+        );
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+            tracing::info!("POPUPTRACE bail: no root surface");
             return;
         };
         let Some(window) = self
@@ -342,6 +379,11 @@ impl RubixState {
             .elements()
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
         else {
+            tracing::info!(
+                "POPUPTRACE bail: root toplevel not mapped in space ({} elements, {} tracked windows)",
+                self.space.elements().count(),
+                self.windows.len(),
+            );
             return;
         };
 
@@ -349,22 +391,51 @@ impl RubixState {
         // sits on (multi-monitor), falling back to the first known output --
         // gracefully, no unwrap -- if for some reason the parent's location
         // can't be resolved (e.g. no outputs at all).
-        let Some(window_geo) = self.space.element_geometry(window) else { return; };
+        let Some(window_geo) = self.space.element_geometry(window) else {
+            tracing::info!("POPUPTRACE bail: no element geometry");
+            return;
+        };
         let output = self
             .output_at(window_geo.loc.to_f64())
             .or_else(|| self.space.outputs().next().cloned());
-        let Some(output) = output else { return; };
-        let Some(output_geo) = self.space.output_geometry(&output) else { return; };
+        let Some(output) = output else {
+            tracing::info!("POPUPTRACE bail: no output");
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            tracing::info!("POPUPTRACE bail: no output geometry");
+            return;
+        };
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
         let mut target = output_geo;
-        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        // Resolved BEFORE `with_pending_state`: that call holds the popup
+        // surface's own state mutex for the length of its closure, and
+        // `get_popup_toplevel_coords` re-enters `with_states` on that same
+        // surface (via `get_parent_surface`). The mutex is not reentrant, so
+        // calling it from inside the closure deadlocks the whole compositor
+        // the instant any client opens a menu.
+        let toplevel_coords = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        target.loc -= toplevel_coords;
         target.loc -= window_geo.loc;
 
-        popup.with_pending_state(|state| {
+        // DEBUG popup-placement trace
+        let (anchor_rect, positioner_geo, geometry) = popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
+            (state.positioner.anchor_rect, state.positioner.get_geometry(), state.geometry)
         });
+        tracing::info!(
+            "POPUPTRACE unconstrain: window_geo={:?} output={:?} output_geo={:?} toplevel_coords={:?} target={:?} anchor_rect={:?} positioner_geo={:?} -> geometry={:?}",
+            window_geo,
+            output.name(),
+            output_geo,
+            toplevel_coords,
+            target,
+            anchor_rect,
+            positioner_geo,
+            geometry,
+        );
     }
     pub(crate) fn focused_window_id(& self) -> Option<u32> {
         let keyboard = self.seat.get_keyboard().unwrap();

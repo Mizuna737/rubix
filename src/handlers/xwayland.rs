@@ -163,6 +163,12 @@ impl XwmHandler for RubixState {
         // into `self.windows` (so it renders + is destroyable) but do NOT add
         // to any monitor in `self.workspace`.
         let loc = window.geometry().loc;
+        // DEBUG popup-placement trace
+        tracing::info!(
+            "POPUPTRACE x11 OR mapped: class={:?} geometry={:?}",
+            window.class(),
+            window.geometry(),
+        );
         let id = self.next_window_id();
         let win = Window::new_x11_window(window);
         self.windows.insert(id, win.clone());
@@ -349,6 +355,13 @@ impl XwmHandler for RubixState {
             .iter()
             .find(|(_, win)| win.wl_surface().as_deref() == window.wl_surface().as_ref())
             .map(|(id, _)| *id);
+        // DEBUG popup-placement trace
+        tracing::info!(
+            "POPUPTRACE x11 OR configure_notify: class={:?} geometry={:?} tracked_id={:?}",
+            window.class(),
+            geometry,
+            id,
+        );
         if let Some(win) = id.and_then(|id| self.windows.get(&id).cloned()) {
             self.space.map_element(win, geometry.loc, false);
         }
