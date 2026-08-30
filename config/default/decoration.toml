@@ -101,10 +101,18 @@ border_width = 2
 active_color = "#89b4fa"
 inactive_color = "#45475a"
 
-# How brightly the focused window's border glows on an HDR monitor.
+# How brightly the focused window's border glows on an HDR monitor, in cd/m^2.
 # Turn it UP for a more eye-catching focus ring, DOWN for a subtler one.
 # Set above sdr_white_nits to get a focus indicator that SDR chrome
 # physically cannot express. Omit or set 0 for no opinion.
+#
+# The number is the luminance the border actually emits, and it means the same
+# thing for every colour: 600 is 600 cd/m^2 on a saturated magenta exactly as
+# it is on white. The colour's hue and saturation are held and only its level
+# moves. Very saturated colours have less room than white does -- pure blue
+# runs out around 800 -- and a request past that renders as bright as that
+# colour can get rather than shifting hue.
+#
 # Ignored on non-HDR monitors, in screenshots, and in screencasts.
 # Details: docs/brightness-tuning.md
 # Commented out so this file matches the built-in defaults exactly: a config
@@ -292,20 +300,18 @@ inactive_color = "#45475a"
 # payoff, and the reason this feature exists at all. Pairing an effect
 # luminance with effect_depth = 0.0 gives a PURE luminance animation at
 # constant hue and alpha -- the border swings between two absolute
-# brightnesses (its normal colour and this nit value) with nothing else
-# moving. That is something an SDR compositor physically cannot do: SDR has no
+# brightnesses (its normal colour and this nit value, both meaning the
+# luminance they say) with nothing else moving. That is something an SDR compositor physically cannot do: SDR has no
 # "brighter than white" to swing into, only "more or less opaque/saturated".
 # Ignored entirely on non-HDR outputs, where effect_depth is the only thing
 # that moves.
 # active_effect_luminance_nits = 700.0
 # inactive_effect_luminance_nits = 0
 
-# Known limitation: GradientFlow and Comet sweep a POLAR angle around the
-# window's centre, not true arc length along the rounded-rectangle perimeter.
-# On a wide window this means the wave/comet visibly moves faster along the
-# short (top/bottom) edges than the long (left/right) ones. Correct
-# arc-length parameterisation needs the perimeter integral and is deferred to
-# a later phase.
+# GradientFlow and Comet travel by arc length along the rounded-rectangle
+# perimeter, so they move at one speed the whole way round regardless of the
+# window's aspect ratio, and their wavefronts stay square-on to the edge they
+# are crossing rather than slanting across it.
 #
 # A breathing focus ring at a fixed 700 nits, motionless in hue -- exactly the
 # thing SDR chrome cannot express:

@@ -142,19 +142,62 @@ float dither(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
 }
 
+// Normalised position around the ring, 0.0 to 1.0, measured as arc length
+// along the rounded rectangle rather than as a polar angle.
+//
+// A polar angle is constant along a ray from the centre, so its iso-lines meet
+// a long edge obliquely: a travelling effect reads as a slanted streak that
+// ignores the edge it is crossing, and it sweeps the short edges faster than
+// the long ones. Arc length's iso-lines are the rounded rectangle's own
+// normals, so a wavefront meets every edge square-on and travels at one speed
+// the whole way round.
+//
+// Fold to the first quadrant, measure along that quadrant's boundary, unfold.
+// `inner` is the box the corner arcs are centred on and `d` the offset from
+// its corner, which is the same decomposition `roundRectSdf` uses.
+float perimeterCoord(vec2 centred, vec2 winHalf, float r) {
+    vec2 inner = winHalf - vec2(r);
+    vec2 d = abs(centred) - inner;
+
+    // One straight run along each axis plus one corner arc. Floored off zero
+    // because a window can be degenerate before it is first configured, and
+    // the division below is the only place that would show it.
+    float quarter = max(inner.x + inner.y + r * (TAU * 0.25), 1.0 / 65536.0);
+
+    float u;
+    if (d.x > 0.0 && d.y > 0.0) {
+        // Corner arc. atan(0, 0) is undefined per the GLSL ES 100 spec; both
+        // components are strictly positive inside this branch, so the case
+        // never arises.
+        u = inner.y + r * atan(d.y, d.x);
+    } else if (d.x > d.y) {
+        // Off the vertical edge, or inside and nearer to it. `d.y <= 0` here,
+        // so the height is already within the straight run.
+        u = abs(centred.y);
+    } else {
+        // Off the horizontal edge, measured backwards from the corner.
+        u = inner.y + r * (TAU * 0.25) + (inner.x - abs(centred.x));
+    }
+
+    // `u` runs from the +x axis crossing towards the +y one, so the quadrants
+    // that traverse it backwards subtract rather than add.
+    float t;
+    if (centred.y >= 0.0) {
+        t = (centred.x >= 0.0) ? u : 2.0 * quarter - u;
+    } else {
+        t = (centred.x >= 0.0) ? 4.0 * quarter - u : 2.0 * quarter + u;
+    }
+    return t / (4.0 * quarter);
+}
+
 // The effect's instantaneous amount, 0.0 to 1.0. Zero for `None`, which makes
 // the mix below collapse to the ring's own colour at full alpha -- the static
 // ring is bit-identical to what it was before effects existed.
 //
 // `centred` is in element-centred pixels, the same space the SDF works in, so
-// the perimeter effects can read an angle off it without extra plumbing.
-//
-// The angle is a POLAR angle, not arc length along the rounded rectangle. On a
-// wide window the travelling effects therefore sweep the short edges faster
-// than the long ones. That is visible if you look for it and is the known
-// limitation of this version; true arc-length parameterisation needs the
-// perimeter integral and is deliberately deferred.
-float effectAmount(vec2 centred) {
+// the travelling effects can share the ring's own geometry rather than
+// re-deriving it.
+float effectAmount(vec2 centred, vec2 winHalf, float r) {
     if (rubix_effect < 0.5) {
         return 0.0;
     }
@@ -170,20 +213,16 @@ float effectAmount(vec2 centred) {
         float s = 0.5 + 0.5 * sin(phase);
         return s * s;
     }
-    // atan(0, 0) is undefined per the GLSL ES 100 spec. That can only happen
-    // exactly at the element centre, which is deep inside the window and
-    // masked to a = 0 by ringCoverage, so whatever an individual driver
-    // returns there never reaches the screen.
-    float ang = atan(centred.y, centred.x) / TAU + 0.5;
+    float p = perimeterCoord(centred, winHalf, r);
     if (rubix_effect < 3.5) {
         // GradientFlow: two wavelengths around the ring, drifting.
-        return 0.5 + 0.5 * sin((ang * 2.0 - rubix_time) * TAU);
+        return 0.5 + 0.5 * sin((p * 2.0 - rubix_time) * TAU);
     }
     // Comet: fract() gives a sawtooth around the perimeter; raising it to a
     // high power crushes all but the leading edge, leaving a bright head and a
     // fading tail. pow() rather than exp() so the tail reaches exactly zero at
     // the wrap point instead of leaving a seam.
-    float f = fract(ang - rubix_time);
+    float f = fract(p - rubix_time);
     return pow(f, 8.0);
 }
 
@@ -225,7 +264,7 @@ void main() {
     float lit = smoothstep(0.0, 1.0 / 255.0, a);
     a = clamp(a + dither(v_coords * size) * (1.0 / 512.0) * lit, 0.0, 1.0);
 
-    float m = effectAmount(centred);
+    float m = effectAmount(centred, winHalf, r);
 
     // Colour travels from the ring's own colour to its effect peak. On an SDR
     // output, or with no `effect_luminance_nits`, the two endpoints are the
@@ -384,15 +423,23 @@ where
 /// The colour to hand the ring shader, already in the destination's space.
 ///
 /// On an HDR output this is linear BT.2020 scaled to absolute nits, so a rule
-/// asking for 350 nits gets exactly 350 nits. Everywhere else it is the
-/// configured sRGB colour, untouched -- `luminance_nits` is not consulted at
-/// all, so a machine with no HDR display behaves as though none of this exists.
+/// asking for 350 nits gets exactly 350 nits -- the number is the border's own
+/// emitted luminance, not a white reference the colour then lands some
+/// fraction below. Everywhere else it is the configured sRGB colour, untouched
+/// -- `luminance_nits` is not consulted at all, so a machine with no HDR
+/// display behaves as though none of this exists.
+///
+/// With no `luminance_nits` set there is no requested level, so the colour
+/// falls back to being white-referred against the session's SDR white and
+/// renders at the brightness any other piece of SDR chrome would.
 pub(crate) fn resolved_color(style: &WindowStyle, hdr: bool, sdr_white_nits: f32) -> Color32F {
     if !hdr {
         return style.color;
     }
-    let nits = style.luminance_nits.unwrap_or(sdr_white_nits);
-    crate::hdr_shaders::srgb_to_bt2020_abs10k(style.color, nits)
+    match style.luminance_nits {
+        Some(nits) => crate::hdr_shaders::srgb_at_luminance(style.color, nits),
+        None => crate::hdr_shaders::srgb_to_bt2020_abs10k(style.color, sdr_white_nits),
+    }
 }
 
 /// Numeric code for the shader's `rubix_effect < N.5` band chain.
@@ -456,6 +503,14 @@ pub(crate) fn occlusion_map(state: &RubixState, output: &Output) -> HashMap<u32,
         let Some(location) = state.space.element_location(window) else { continue };
         let rect = Rectangle::new(location, window.geometry().size);
         if !region.overlaps(rect) {
+            continue;
+        }
+        // Menus and tooltips take no part in this, in either direction. They
+        // are never faded themselves (they carry no decoration at all), and
+        // they must not fade what they cover: a dropdown is transient chrome,
+        // and treating it as an occluder makes the window underneath dim and
+        // undim every time the user opens a menu.
+        if crate::state::is_override_redirect(window) {
             continue;
         }
         if let Some(id) = state
@@ -596,11 +651,12 @@ where
     // The effect's peak colour. On an HDR output with an effect luminance set
     // this is the SAME sRGB colour resolved at a different absolute
     // luminance, so the animation is a pure brightness swing at constant hue
-    // -- a 200-to-800-nit swell that keeps its saturation. Everywhere else it
-    // is the base colour and the mix in the shader does nothing.
+    // -- a 200-to-800-nit swell that keeps its saturation, and both ends mean
+    // the nits they say regardless of how saturated the colour is. Everywhere
+    // else it is the base colour and the mix in the shader does nothing.
     let effect_color = match (hdr, style.effect_luminance_nits) {
         (true, Some(nits)) if style.effect != BorderEffect::None => {
-            crate::hdr_shaders::srgb_to_bt2020_abs10k(style.color, nits)
+            crate::hdr_shaders::srgb_at_luminance(style.color, nits)
         }
         _ => color,
     };
@@ -960,11 +1016,39 @@ mod tests {
         );
     }
 
+    // No `luminance_nits` means no requested level, so the colour is
+    // white-referred against SDR white like any other piece of SDR chrome.
     #[test]
     fn hdr_colour_without_a_luminance_sits_at_sdr_white() {
         let implicit = resolved_color(&style(None), true, 200.0);
+        let expected =
+            crate::hdr_shaders::srgb_to_bt2020_abs10k(style(None).color, 200.0);
+        assert!((implicit.r() - expected.r()).abs() < 1e-6);
+        assert!((implicit.g() - expected.g()).abs() < 1e-6);
+        assert!((implicit.b() - expected.b()).abs() < 1e-6);
+    }
+
+    // ...and setting the number to that same value is NOT the same thing, for
+    // anything but white. `Some(200)` asks for 200 nits on screen; the
+    // white-referred fallback puts this blue at roughly a third of that. This
+    // is the distinction the config key exists to make, so it gets a test of
+    // its own rather than riding on the one above.
+    #[test]
+    fn an_explicit_luminance_means_emitted_nits_not_a_white_reference() {
+        let implicit = resolved_color(&style(None), true, 200.0);
         let explicit = resolved_color(&style(Some(200.0)), true, 200.0);
-        assert!((implicit.r() - explicit.r()).abs() < 1e-6);
+        assert!(
+            explicit.r() > implicit.r() * 2.0,
+            "explicit {} should sit well above white-referred {}",
+            explicit.r(),
+            implicit.r()
+        );
+        let luma = crate::hdr_shaders::bt2020_luminance([
+            explicit.r(),
+            explicit.g(),
+            explicit.b(),
+        ]) * 10000.0;
+        assert!((luma - 200.0).abs() < 0.5, "emitted {luma} nits, asked for 200");
     }
 
     #[test]

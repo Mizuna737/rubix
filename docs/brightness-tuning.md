@@ -57,6 +57,14 @@ black reads as "washed out" far more readily than a dimmed highlight does.
 `sdr_white_nits` at 203, a 350-nit focus ring is a focus indication that SDR
 chrome physically cannot express.
 
+The number is the luminance the border **emits**, not a white reference the
+colour then lands some fraction below, so it means the same thing for every
+hue: 350 is 350 cd/m^2 on a saturated magenta exactly as it is on white. Only
+the level moves; hue and saturation are held. Saturated colours have less
+headroom than white — sRGB blue tops out near 800 cd/m^2 — and a request past
+a colour's ceiling renders as bright as that colour gets rather than shifting
+hue on the way there.
+
 This is also what makes the glow work. In SDR a glow has to brighten toward
 white to be visible at all, which washes out its hue and competes with window
 content — which is why glows tend to look gaudy. With luminance above SDR white

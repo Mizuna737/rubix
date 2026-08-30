@@ -291,9 +291,10 @@ pub fn compile_hdr_shaders(renderer: &mut GlesRenderer) -> Result<HdrShaders, Gl
     Ok(HdrShaders { decode_sdr, encode })
 }
 
-/// CPU-side sRGB EOTF + BT.709->BT.2020 + nits scaling, factored out of
-/// [`sdr_solid_transform`] so it's independently unit-testable.
-pub(crate) fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Color32F {
+/// CPU-side sRGB EOTF + BT.709->BT.2020, with no luminance scaling applied.
+/// 1.0 in means 1.0 out, so the result is relative to whatever white the
+/// caller goes on to reference it against.
+pub(crate) fn srgb_to_linear_bt2020(color: Color32F) -> [f32; 3] {
     fn to_linear(c: f32) -> f32 {
         if c <= 0.04045 {
             c / 12.92
@@ -313,7 +314,71 @@ pub(crate) fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Col
     for row in 0..3 {
         lin2020[row] = M[0][row] * lin709[0] + M[1][row] * lin709[1] + M[2][row] * lin709[2];
     }
+    lin2020
+}
+
+/// BT.2020 relative luminance of a linear BT.2020 triple -- the Y row of the
+/// BT.2020 RGB-to-XYZ matrix, as given in ITU-R BT.2020-2 Table 3.
+pub(crate) fn bt2020_luminance(lin2020: [f32; 3]) -> f32 {
+    0.2627 * lin2020[0] + 0.6780 * lin2020[1] + 0.0593 * lin2020[2]
+}
+
+/// CPU-side sRGB EOTF + BT.709->BT.2020 + nits scaling, factored out of
+/// [`sdr_solid_transform`] so it's independently unit-testable.
+///
+/// The nits value is **white-referred**: it says what SDR white would emit,
+/// and every other colour lands proportionally below it. That is the right
+/// meaning for content -- an SDR surface's white is what the number is
+/// describing. For chrome the compositor draws itself, where the number is
+/// meant to describe the colour actually on screen, use
+/// [`srgb_at_luminance`].
+pub(crate) fn srgb_to_bt2020_abs10k(color: Color32F, sdr_white_nits: f32) -> Color32F {
+    let lin2020 = srgb_to_linear_bt2020(color);
     let scale = sdr_white_nits / 10000.0;
+    Color32F::new(
+        lin2020[0] * scale,
+        lin2020[1] * scale,
+        lin2020[2] * scale,
+        color.a(),
+    )
+}
+
+/// The same conversion, but scaled so the result *emits* `nits`, whatever the
+/// colour.
+///
+/// [`srgb_to_bt2020_abs10k`] is white-referred, which makes the number mean
+/// something different for every hue: `#ffb4fa` at 1000 emits about 608 cd/m^2
+/// because that colour only carries 61% of white's luminance. That is correct
+/// for content and wrong for a config key, where "600 nits" should mean 600
+/// nits on a magenta border exactly as it does on a white one. Here the
+/// requested luminance is divided back out by the colour's own relative
+/// luminance, so the hue and saturation are preserved and only the level moves.
+///
+/// Two edges the caller does not have to think about:
+///
+/// * A colour with no luminance to scale (black, or alpha-only) has no
+///   brightness to ask for. It stays where it is rather than dividing by zero.
+/// * Saturated colours run out of container long before white does. sRGB blue
+///   carries 7.2% of white's luminance, so it tops out around 800 cd/m^2:
+///   past that its blue channel would have to exceed the 10000 the PQ curve
+///   can encode at all. The scale is capped so the brightest channel lands
+///   exactly at the top of the container, which yields the brightest in-gamut
+///   version of the requested colour instead of a hue shift from per-channel
+///   clipping. The panel's own peak is lower again and its tone-mapping
+///   handles the rest.
+pub(crate) fn srgb_at_luminance(color: Color32F, nits: f32) -> Color32F {
+    let lin2020 = srgb_to_linear_bt2020(color);
+    let luma = bt2020_luminance(lin2020);
+    // Below this there is no meaningful colour to scale up, and the division
+    // stops being numerically sensible well before it reaches zero.
+    if luma <= 1e-6 {
+        return Color32F::new(lin2020[0], lin2020[1], lin2020[2], color.a());
+    }
+    let mut scale = (nits / 10000.0) / luma;
+    let peak = lin2020[0].max(lin2020[1]).max(lin2020[2]);
+    if peak * scale > 1.0 {
+        scale = 1.0 / peak;
+    }
     Color32F::new(
         lin2020[0] * scale,
         lin2020[1] * scale,
@@ -796,6 +861,95 @@ mod tests {
         assert!(out.r().abs() < EPSILON);
         assert!(out.g().abs() < EPSILON);
         assert!(out.b().abs() < EPSILON);
+    }
+
+    fn emitted_nits(c: Color32F) -> f32 {
+        bt2020_luminance([c.r(), c.g(), c.b()]) * 10000.0
+    }
+
+    // The whole point of the function: the number is the luminance, not a
+    // white reference. White is the one colour where both readings agree, so
+    // it cannot show the difference on its own -- the saturated cases are the
+    // test.
+    #[test]
+    fn requested_luminance_is_what_is_emitted() {
+        for color in [
+            Color32F::new(1.0, 1.0, 1.0, 1.0),
+            // #ffb4fa, the magenta that exposed this: only ~61% of white's
+            // luminance, so white-referred scaling lands well under target.
+            Color32F::new(1.0, 0.706, 0.980, 1.0),
+            Color32F::new(0.2, 0.9, 0.4, 1.0),
+        ] {
+            for nits in [100.0, 350.0, 600.0] {
+                let out = srgb_at_luminance(color, nits);
+                assert!(
+                    (emitted_nits(out) - nits).abs() < 0.5,
+                    "{color:?} at {nits} emitted {}",
+                    emitted_nits(out)
+                );
+            }
+        }
+    }
+
+    // The old behaviour, kept honest: white-referred scaling undershoots on
+    // anything that is not white, which is exactly why the config key could
+    // not be trusted to mean nits.
+    #[test]
+    fn white_referred_scaling_undershoots_saturated_colors() {
+        let magenta = Color32F::new(1.0, 0.706, 0.980, 1.0);
+        let referred = emitted_nits(srgb_to_bt2020_abs10k(magenta, 1000.0));
+        assert!(
+            (500.0..700.0).contains(&referred),
+            "expected a large shortfall, got {referred}"
+        );
+        assert!((emitted_nits(srgb_at_luminance(magenta, 1000.0)) - 1000.0).abs() < 0.5);
+    }
+
+    // Hue is preserved: only the level moves. Ratios between channels are what
+    // carry chromaticity, so they must survive the rescale untouched.
+    #[test]
+    fn luminance_scaling_preserves_chromaticity() {
+        let color = Color32F::new(1.0, 0.706, 0.980, 1.0);
+        let a = srgb_at_luminance(color, 200.0);
+        let b = srgb_at_luminance(color, 700.0);
+        assert!((a.r() / a.g() - b.r() / b.g()).abs() < 1e-4);
+        assert!((a.b() / a.g() - b.b() / b.g()).abs() < 1e-4);
+    }
+
+    // sRGB blue carries 7.2% of white's luminance and so tops out near 800
+    // nits. Above that, cap rather than overflow the container -- and stay
+    // capped however far past it the request goes.
+    #[test]
+    fn unreachable_luminance_clamps_to_the_container() {
+        let blue = Color32F::new(0.0, 0.0, 1.0, 1.0);
+        assert!(
+            (emitted_nits(srgb_at_luminance(blue, 700.0)) - 700.0).abs() < 0.5,
+            "700 is still inside blue's headroom"
+        );
+        for nits in [2000.0, 10000.0] {
+            let out = srgb_at_luminance(blue, nits);
+            let peak = out.r().max(out.g()).max(out.b());
+            assert!((peak - 1.0).abs() < 1e-4, "at {nits}: peak was {peak}");
+            assert!(emitted_nits(out) < nits);
+        }
+    }
+
+    // No luminance to scale means no division to do.
+    #[test]
+    fn black_has_no_luminance_to_request() {
+        let out = srgb_at_luminance(Color32F::new(0.0, 0.0, 0.0, 1.0), 600.0);
+        for c in [out.r(), out.g(), out.b()] {
+            assert!(c.is_finite() && c.abs() < EPSILON, "got {c}");
+        }
+    }
+
+    // Alpha is a coverage term, not a colour channel, and the rescale must not
+    // touch it -- a translucent glow that silently went opaque would be a
+    // very confusing bug to chase.
+    #[test]
+    fn alpha_survives_the_rescale() {
+        let out = srgb_at_luminance(Color32F::new(1.0, 0.706, 0.980, 0.35), 600.0);
+        assert!((out.a() - 0.35).abs() < EPSILON);
     }
 }
 
