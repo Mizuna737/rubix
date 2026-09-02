@@ -169,6 +169,27 @@ pub(crate) fn init_xwayland(loop_handle: &LoopHandle<'static, RubixState>, displ
                     // spawn time (see NavAction::Spawn in input.rs).
                     data.xdisplay = Some(display_number);
                     tracing::info!("XWayland ready on :{display_number}");
+
+                    // Push the live display number into the systemd --user
+                    // manager on EVERY Ready, respawns included. The startup
+                    // command's `import-environment` only ever runs once, so a
+                    // respawn onto a new display number (Xwayland is spawned
+                    // with -terminate, so this is routine) left every session
+                    // unit pointing at a dead server: teams-for-notif restarted
+                    // 1320 times overnight against a stale DISPLAY=:0. A
+                    // subprocess, not set_var -- Ready fires mid-event-loop
+                    // with other threads alive, where a global set_var is UB.
+                    let display = format!("DISPLAY=:{display_number}");
+                    std::process::Command::new("systemctl")
+                        .args(["--user", "set-environment", &display])
+                        .spawn()
+                        .ok();
+                    // Same value for D-Bus-activated services (portals, and
+                    // anything else launched by activation rather than by unit).
+                    std::process::Command::new("dbus-update-activation-environment")
+                        .args(["--systemd", &display])
+                        .spawn()
+                        .ok();
                     // A clean Ready means the new server is up and stable enough
                     // to have started the WM -- forgive whatever rapid-exit count
                     // a prior crash burst left behind, so it doesn't count against
