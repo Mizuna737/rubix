@@ -1072,10 +1072,16 @@ where
         let Some(location) = state.space.element_location(window) else { continue };
         let geometry = window.geometry();
         let render_location: Point<i32, Logical> = location - geometry.loc - region.loc;
+        // An override-redirect X11 surface (a menu, tooltip, combobox) resolves
+        // to no id on purpose: `id` is what gates the border ring, the glow,
+        // the backdrop and the active/inactive opacity, and none of those
+        // belong on client chrome. A menu drawn at `inactive.opacity` because
+        // it is not the focused window is the visible form of that mistake.
         let id = state
             .windows
             .iter()
-            .find_map(|(id, w)| (w == window).then_some(*id));
+            .find_map(|(id, w)| (w == window).then_some(*id))
+            .filter(|_| !crate::state::is_unmanaged(window));
         let fullscreen = id.is_some_and(|id| state.fullscreen_windows.contains(&id));
 
         // Region-local logical rect of the window's content, which is what the

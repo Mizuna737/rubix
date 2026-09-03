@@ -510,7 +510,7 @@ pub(crate) fn occlusion_map(state: &RubixState, output: &Output) -> HashMap<u32,
         // they must not fade what they cover: a dropdown is transient chrome,
         // and treating it as an occluder makes the window underneath dim and
         // undim every time the user opens a menu.
-        if crate::state::is_override_redirect(window) {
+        if crate::state::is_unmanaged(window) {
             continue;
         }
         if let Some(id) = state

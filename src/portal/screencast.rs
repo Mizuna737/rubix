@@ -98,18 +98,16 @@ fn build_source_list(state: &RubixState) -> Vec<SourceInfo> {
     let mut sources = Vec::new();
 
     for (&id, window) in &state.windows {
-        let label = window
-            .toplevel()
-            .and_then(|toplevel| {
-                smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
-                    states
-                        .data_map
-                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-                        .map(|d| d.lock().unwrap())
-                        .and_then(|attrs| attrs.app_id.clone().or_else(|| attrs.title.clone()))
-                })
-            })
-            .unwrap_or_else(|| format!("window-{id}"));
+        // A menu or tooltip is not something anyone means to share, and it is
+        // gone again before the picker could be clicked.
+        if crate::state::is_unmanaged(window) {
+            continue;
+        }
+        // `window_identity` resolves both surface kinds -- an X11 window has
+        // no `toplevel()`, so reading xdg attributes alone labelled every
+        // Steam or game window `window-9` in the share picker.
+        let (app_id, title) = state.window_identity(id);
+        let label = title.or(app_id).unwrap_or_else(|| format!("window-{id}"));
         sources.push(SourceInfo { id, kind: SourceKind::Window, label });
     }
 

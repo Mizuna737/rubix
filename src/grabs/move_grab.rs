@@ -30,8 +30,15 @@ impl PointerGrab<RubixState> for MoveSurfaceGrab {
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
+        // `relocate_element`, not `map_element`: this runs on every pointer
+        // motion for the length of the drag, and `map_element` both re-inserts
+        // the element at the top of the stack and -- with `activate: true` --
+        // clears the activated state of every other window each time, which on
+        // an X11 window is a `_NET_WM_STATE_FOCUSED` property write per motion
+        // event. Moving a window is not a focus change; whatever raised and
+        // focused it when the grab started still holds.
         data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+            .relocate_element(&self.window, new_location.to_i32_round());
     }
 
     fn relative_motion(

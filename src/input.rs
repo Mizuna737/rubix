@@ -453,6 +453,13 @@ impl RubixState {
                         // e.g. a mako notification or the bar -- must NOT steal
                         // focus from the active window, so it's excluded here.
                         self.space.elements().for_each(|window| {
+                            // A menu lives in `space` too, but it is not a
+                            // focusable entity -- writing `_NET_WM_STATE_FOCUSED`
+                            // to one is what dismisses it, so it never reaches
+                            // `set_activated`.
+                            if crate::state::is_unmanaged(window) {
+                                return;
+                            }
                             window.set_activated(false);
                             let Some(toplevel) = window.toplevel() else { return; };
                             toplevel.send_pending_configure();
@@ -804,6 +811,9 @@ impl RubixState {
             self.space.raise_element(&window, true);
         }
         self.space.elements().for_each(|w| {
+            if crate::state::is_unmanaged(w) {
+                return;
+            }
             w.set_activated(w == &window);
             let Some(toplevel) = w.toplevel() else { return; };
             toplevel.send_pending_configure();
@@ -868,6 +878,9 @@ impl RubixState {
                 let serial = SERIAL_COUNTER.next_serial();
                 let keyboard = self.seat.get_keyboard().expect("keyboard added to seat at startup");
                 self.space.elements().for_each(|w| {
+                    if crate::state::is_unmanaged(w) {
+                        return;
+                    }
                     w.set_activated(false);
                     let Some(toplevel) = w.toplevel() else { return; };
                     toplevel.send_pending_configure();

@@ -56,9 +56,10 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
     // `target.as_ref()` below compares `Option<&WlSurface> == Option<&WlSurface>`,
     // so a `None` target would match the first tracked window that also has no
     // surface -- an arbitrary victim, since `self.windows` is a HashMap and its
-    // iteration order isn't stable. Smithay detaches the wl_surface right after
-    // `unmapped_window` returns, so this is defensive rather than a live path
-    // today, but the failure mode it prevents is evicting an unrelated window.
+    // iteration order isn't stable. This is the common path for repeat removals
+    // of a window that is already gone: `unmapped_window` fires twice per
+    // window and `destroyed_window` follows, so the second and third calls
+    // find the wl_surface already detached.
     if target.is_none() {
         return;
     }
@@ -69,10 +70,21 @@ fn remove_x11_window(state: &mut RubixState, window: &X11Surface) {
         .map(|(id, _)| *id);
 
     if let Some(id) = id {
+        // Was this a menu rather than a window? Decided BEFORE the removal,
+        // while the entry still exists.
+        let unmanaged = state.windows.get(&id).is_some_and(crate::state::is_unmanaged);
         // No-op if this id was never added to the tiling model (OR windows) --
         // `remove_window_by_id` is id-based throughout.
         state.remove_window_by_id(id);
-        state.apply_layout();
+        // A menu closing changes nothing about the grid, and `apply_layout` is
+        // not free of side effects: it re-maps every tiled window, which used to
+        // hoist them all to the top of the stack. Menu-bar navigation destroys
+        // the old menu as it opens the next one, so that pass ran *between* the
+        // new menu's map and its first frame and buried it behind the window it
+        // belongs to -- the "blinks and disappears" report.
+        if !unmanaged {
+            state.apply_layout();
+        }
         state.ipc_dirty = true;
         // Mirrors the `new X11 toplevel` log at `map_window_request` below --
         // this is the other half of that accounting, and previously logged
@@ -100,6 +112,31 @@ impl XwmHandler for RubixState {
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_mapped(true);
+
+        // A managed window that declares itself a menu is still a menu. Steam's
+        // menu-bar dropdowns arrive here rather than at
+        // `mapped_override_redirect_window`, and handing one a tile and the
+        // keyboard makes Steam dismiss it instantly. Same treatment as an
+        // override-redirect surface: it renders, it is destroyable, and the
+        // model never hears about it.
+        if crate::state::is_unmanaged_x11(&window) {
+            let rect = window.last_configure();
+            // The client owns this geometry; echo it back so the frame lands
+            // where it asked rather than wherever it was created.
+            let _ = window.configure(Some(rect));
+            let id = self.next_window_id();
+            let win = Window::new_x11_window(window);
+            self.windows.insert(id, win.clone());
+            self.space.map_element(win, rect.loc, false);
+            self.ipc_dirty = true;
+            tracing::info!(
+                "new unmanaged X11 window {id} at {:?} ({} tracked)",
+                rect,
+                self.windows.len(),
+            );
+            return;
+        }
+
         // Read before the surface is moved into `Window::new_x11_window` below:
         // EWMH clients that want to start fullscreen set `_NET_WM_STATE` before
         // `XMapWindow`, and the pinned smithay fork already folds that into
@@ -162,18 +199,29 @@ impl XwmHandler for RubixState {
         // OR windows own their own geometry -- no tiling, no configure. Insert
         // into `self.windows` (so it renders + is destroyable) but do NOT add
         // to any monitor in `self.workspace`.
-        let loc = window.geometry().loc;
-        // DEBUG popup-placement trace
-        tracing::info!(
-            "POPUPTRACE x11 OR mapped: class={:?} geometry={:?}",
-            window.class(),
-            window.geometry(),
-        );
+        // `X11Surface::geometry()` is `bbox() - frame_extents()`, and `bbox()`
+        // is built with `Rectangle::from_size` -- its location is ALWAYS (0, 0),
+        // whatever the client asked for. Reading placement from it mapped every
+        // menu, tooltip and combobox at the top-left corner of the global space
+        // (Steam's dropdowns blinking in the upper-left). `last_configure()` is
+        // the rect the X server actually reported for this window, position
+        // included, and smithay keeps it current for override-redirect windows
+        // from ConfigureNotify -- including the one that lands *before* the map,
+        // which `configure_notify` below cannot use because the window is not
+        // tracked yet.
+        let loc = window.last_configure().loc;
         let id = self.next_window_id();
         let win = Window::new_x11_window(window);
         self.windows.insert(id, win.clone());
-        // activate=true so it stacks above the tiled windows.
-        self.space.map_element(win, (loc.x, loc.y), true);
+        // activate=FALSE. Stacking does not depend on it -- `map_element`
+        // appends, and the topmost element is the last one inserted -- but
+        // `Space::insert_elem` reads `activate` as "this is now the active
+        // window", so a `true` here clears the activated state of every other
+        // element, the parent toplevel included. On an X11 window that is an
+        // immediate `_NET_WM_STATE_FOCUSED` property write, so opening a menu
+        // told Steam it had just been deactivated and Steam dismissed the menu
+        // it was in the middle of opening.
+        self.space.map_element(win, (loc.x, loc.y), false);
         self.ipc_dirty = true;
     }
 
@@ -250,8 +298,8 @@ impl XwmHandler for RubixState {
         h: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        if window.is_override_redirect() {
-            // OR windows own their geometry -- honor the request, filling any
+        if crate::state::is_unmanaged_x11(&window) {
+            // Menus own their geometry -- honor the request, filling any
             // missing fields from the current geometry.
             let current = window.geometry();
             let rect = Rectangle::<i32, Logical>::new(
@@ -269,12 +317,7 @@ impl XwmHandler for RubixState {
         // Tiled: deny the client geometry, tiling owns it. Reply with our
         // current tile rect if we have one yet, else echo the request so the
         // handshake completes. Fullscreen windows get the full output bounds.
-        let target = window.wl_surface();
-        let id = self
-            .windows
-            .iter()
-            .find(|(_, win)| win.wl_surface().as_deref() == target.as_ref())
-            .map(|(id, _)| *id);
+        let id = self.window_id_for_x11(&window);
 
         let rect = if let Some(id) = id {
             if self.fullscreen_windows.contains(&id) {
@@ -345,23 +388,12 @@ impl XwmHandler for RubixState {
         geometry: Rectangle<i32, Logical>,
         _above: Option<u32>,
     ) {
-        // Only matters for OR windows -- tiled windows are geometry we drove,
-        // so this is a no-op for them.
-        if !window.is_override_redirect() {
+        // Only matters for unmanaged windows -- tiled geometry is what we
+        // drove ourselves, so this is a no-op for those.
+        if !crate::state::is_unmanaged_x11(&window) {
             return;
         }
-        let id = self
-            .windows
-            .iter()
-            .find(|(_, win)| win.wl_surface().as_deref() == window.wl_surface().as_ref())
-            .map(|(id, _)| *id);
-        // DEBUG popup-placement trace
-        tracing::info!(
-            "POPUPTRACE x11 OR configure_notify: class={:?} geometry={:?} tracked_id={:?}",
-            window.class(),
-            geometry,
-            id,
-        );
+        let id = self.window_id_for_x11(&window);
         if let Some(win) = id.and_then(|id| self.windows.get(&id).cloned()) {
             self.space.map_element(win, geometry.loc, false);
         }
@@ -420,9 +452,10 @@ impl XwmHandler for RubixState {
     /// monitor, and arms the matching transition before handing over the
     /// keyboard.
     ///
-    /// Honoured unconditionally, matching the Wayland path. Neither seam gates
-    /// on focus-stealing heuristics today; if one ever grows them, both should,
-    /// or the two protocols disagree about what a window is allowed to do.
+    /// Honoured unconditionally except for one refusal, matching the Wayland
+    /// path otherwise. Neither seam gates on focus-stealing heuristics today;
+    /// if one ever grows them, both should, or the two protocols disagree about
+    /// what a window is allowed to do.
     ///
     /// `timestamp` and `currently_active_window` are unused: Rubix has no
     /// focus-stealing-prevention window to compare the timestamp against, and
@@ -435,6 +468,18 @@ impl XwmHandler for RubixState {
         _timestamp: u32,
         _currently_active_window: Option<X11Surface>,
     ) {
+        // An override-redirect window is the X11 spelling of an xdg popup --
+        // a menu, not a toplevel -- and is never a focus target. Steam sends
+        // `_NET_ACTIVE_WINDOW` for its own menu bar dropdowns; honouring that
+        // used to call `focus_by_id` on the menu, which deactivated the Steam
+        // toplevel that owns it. On an X11 surface `set_activated(false)` is
+        // an immediate `_NET_WM_STATE_FOCUSED` property write, so Steam saw
+        // its main window lose focus and dismissed the menu a frame after
+        // opening it. `window_id_at` already refuses ids for unmanaged
+        // windows; this closes the back door around that rule.
+        if crate::state::is_unmanaged_x11(&window) {
+            return;
+        }
         if let Some(id) = self.window_id_for_x11(&window) {
             self.focus_by_id(id);
             self.ipc_dirty = true;
@@ -449,10 +494,15 @@ impl RubixState {
     /// keyed by the compositor's own u32, so each entry point has to cross that
     /// boundary before it can do anything.
     fn window_id_for_x11(&self, window: &X11Surface) -> Option<u32> {
-        let target = window.wl_surface();
+        // An X11 window has no `wl_surface` until XWayland associates one, which
+        // lands in its own ClientMessage some time after the window exists. Match
+        // on `None` and `None == None` makes the FIRST unassociated window in the
+        // map answer for any other one -- a configure or a move landing on a
+        // window that merely happened to be waiting for its surface too.
+        let target = window.wl_surface()?;
         self.windows
             .iter()
-            .find(|(_, w)| w.wl_surface().as_deref() == target.as_ref())
+            .find(|(_, w)| w.wl_surface().as_deref() == Some(&target))
             .map(|(id, _)| *id)
     }
 }

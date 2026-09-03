@@ -265,7 +265,16 @@ pub fn refresh(state: &mut RubixState) {
         false
     });
 
-    for id in state.windows.keys().copied().collect::<Vec<_>>() {
+    // Menus, tooltips and drag icons are not toplevels. Announcing one gives
+    // every taskbar and pager a window that appears and closes again as fast
+    // as the user can open a dropdown.
+    let ids: Vec<u32> = state
+        .windows
+        .iter()
+        .filter(|(_, window)| !crate::state::is_unmanaged(window))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
         let (app_id, title) = state.window_identity(id);
         let states = states_for(state, id, focused);
         let outputs: Vec<Output> = state

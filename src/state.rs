@@ -42,7 +42,7 @@ use smithay::{
         viewporter::ViewporterState,
         xwayland_shell::XWaylandShellState,
     },
-    xwayland::X11Wm,
+    xwayland::{xwm::WmWindowType, X11Surface, X11Wm},
 };
 
 use crate::{
@@ -1693,6 +1693,11 @@ impl RubixState {
             if self.fullscreen_windows.contains(id) {
                 continue;
             }
+            // Menus and tooltips carry no border, so nothing about them can
+            // want an animation tick.
+            if self.windows.get(id).is_some_and(is_unmanaged) {
+                continue;
+            }
             // `covered = 0.0` rather than the real per-output occlusion
             // fraction: that map is built per-output in the render path, and
             // computing it here would duplicate that work just to decide
@@ -2021,8 +2026,20 @@ impl RubixState {
 
     /// The window under a point, as a Rubix id. Resolved through the Space so
     /// subsurfaces and popups map to their owning toplevel.
+    ///
+    /// Override-redirect X11 windows -- menus, tooltips, comboboxes -- answer
+    /// `None`. This is a *focus* question, and an OR window is not a focusable
+    /// entity: it is the X11 equivalent of an xdg popup, which reaches this
+    /// function folded into its parent rather than as an id of its own. Taking
+    /// focus for one is self-defeating, since the toplevel that owns the menu
+    /// then reads as unfocused and dismisses it -- Steam's dropdowns vanishing
+    /// the moment they were clicked. Pointer events are unaffected: they follow
+    /// `surface_under`, which still resolves the OR surface directly.
     pub(crate) fn window_id_at(&self, pos: Point<f64, Logical>) -> Option<u32> {
         let (window, _) = self.space.element_under(pos)?;
+        if is_unmanaged(window) {
+            return None;
+        }
         self.windows
             .iter()
             .find(|(_, candidate)| *candidate == window)
@@ -2133,7 +2150,7 @@ impl RubixState {
                 // "always hidden" and try to iconify a menu or tooltip. They
                 // also have no frame to unmap -- `set_mapped` rejects them
                 // outright.
-                if x11.is_override_redirect() {
+                if is_unmanaged_x11(x11) {
                     continue;
                 }
                 let hidden = !visible.contains(id);
@@ -2353,7 +2370,19 @@ impl RubixState {
                         }
                     }
 
-                    self.space.map_element(window, (rect.x as i32, rect.y as i32), false);
+                    // `relocate_element` for a window already in the Space:
+                    // `map_element` removes and re-appends it, which silently
+                    // makes every layout pass a full re-stack in `targets`
+                    // order. Menus and tooltips live in the same Space and are
+                    // deliberately not in `targets`, so a re-stack buries them
+                    // behind the window they belong to. Geometry updates have
+                    // no business reordering anything; the explicit
+                    // `raise_element` calls below still own stacking.
+                    if self.space.element_location(&window).is_some() {
+                        self.space.relocate_element(&window, (rect.x as i32, rect.y as i32));
+                    } else {
+                        self.space.map_element(window, (rect.x as i32, rect.y as i32), false);
+                    }
                 }
             }
             Some(transition) => {
@@ -2568,6 +2597,47 @@ fn idle_timer_delay(
 ///
 /// `None` when the group has no tiles in `targets`, which is exactly the case
 /// where it is scrolled off screen and must not be blown up.
+/// True for an X11 surface that is chrome rather than a window: a menu,
+/// tooltip, combobox, drag icon or notification.
+///
+/// Two things put a surface in this class, and a compositor has to honour
+/// both. Override-redirect is the explicit one -- the client has told the
+/// window manager to keep its hands off. `_NET_WM_WINDOW_TYPE` is the one
+/// that is easy to miss: a client may map an ordinary *managed* window and
+/// declare it a menu by type alone, which is exactly what Steam's menu-bar
+/// dropdowns (Steam, View, Friends, Games, Help) do. Judging by
+/// override-redirect alone, those reached the normal toplevel path, took a
+/// tile and took focus, and Steam dismissed them on the spot.
+///
+/// These are tracked in `RubixState::windows` so they render and can be swept
+/// on destroy, but they are not windows in any sense the rest of the
+/// compositor means. They are the X11 spelling of an xdg popup -- which is
+/// never a `Window` at all, only part of the parent's surface tree -- so
+/// anywhere that reasons about "the windows the user has", they have to be
+/// filtered back out: tiling, focus, decoration, occlusion, iconification,
+/// taskbar protocols, screencast sources.
+pub(crate) fn is_unmanaged_x11(x11: &X11Surface) -> bool {
+    x11.is_override_redirect()
+        || matches!(
+            x11.window_type(),
+            Some(
+                WmWindowType::DropdownMenu
+                    | WmWindowType::PopupMenu
+                    | WmWindowType::Menu
+                    | WmWindowType::Tooltip
+                    | WmWindowType::Combo
+                    | WmWindowType::Dnd
+                    | WmWindowType::Notification
+            )
+        )
+}
+
+/// [`is_unmanaged_x11`] for a mapped `Window`. Always false for a Wayland
+/// toplevel: an xdg popup never becomes a `Window` in the first place.
+pub(crate) fn is_unmanaged(window: &Window) -> bool {
+    window.x11_surface().is_some_and(is_unmanaged_x11)
+}
+
 pub(crate) fn group_bounds(targets: &[(u32, Rect)], ids: &[u32]) -> Option<Rect> {
     targets
         .iter()
