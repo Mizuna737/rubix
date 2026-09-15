@@ -286,6 +286,13 @@ pub struct RubixState {
     // Windows currently in fullscreen state (bypass normal tiling).
     pub(crate) fullscreen_windows: HashSet<u32>,
 
+    // Windows with an effects lock: forced to full opacity with no backdrop
+    // blur/refraction regardless of decoration rules, and matchable by border
+    // rules for a distinct locked-state border. Per window, not per client --
+    // toggled by NavAction::ToggleEffectsLock, cleared on destroy, never
+    // persisted (this set starts empty every run).
+    pub(crate) effects_locked_windows: HashSet<u32>,
+
     // X11 windows last reported to their client as iconified. Only what the
     // client was told -- `sync_x11_iconic` diffs against it so an unchanged
     // layout pass sends no property writes.
@@ -628,6 +635,7 @@ impl RubixState {
             active_ghosts: Vec::new(),
             active_scales: Vec::new(),
             fullscreen_windows: HashSet::new(),
+            effects_locked_windows: HashSet::new(),
             iconified: HashSet::new(),
             pending_x11_focus: None,
             maximized: MaximizeState::None,
@@ -1878,6 +1886,26 @@ impl RubixState {
         self.ipc_dirty = true;
     }
 
+    /// Flip the effects lock on one window: forces full opacity with no
+    /// backdrop blur/refraction (see `DecorationConfig::style_for`) and makes
+    /// it matchable by border rules for a distinct border, until toggled off
+    /// again or the window is destroyed (see `remove_window_by_id`).
+    ///
+    /// Purely a decoration change -- no geometry moves, so `apply_layout`
+    /// would be a no-op here. `nudge_render` is the actual redraw trigger: it
+    /// schedules an immediate render pass, which re-resolves every window's
+    /// style (picking up the new lock state) and, because the border ring
+    /// cache compares resolved style inputs frame to frame (see
+    /// `decoration::RING_CACHE`), rebuilds and damages the ring the moment
+    /// something about it actually changed.
+    pub(crate) fn toggle_window_effects_lock(&mut self, id: u32) {
+        if !self.effects_locked_windows.remove(&id) {
+            self.effects_locked_windows.insert(id);
+        }
+        self.ipc_dirty = true;
+        self.nudge_render();
+    }
+
     /// Step the focused window through the maximize cycle.
     ///
     /// Forward is `Group` -> `Monitor` -> `None`; reverse walks the same ring
@@ -2264,6 +2292,7 @@ impl RubixState {
             self.space.unmap_elem(&win);
         }
         self.fullscreen_windows.remove(&id);
+        self.effects_locked_windows.remove(&id);
         self.iconified.remove(&id);
     }
 

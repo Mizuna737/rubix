@@ -278,6 +278,7 @@ enum Schema {
 const RULE_SCHEMA: &[(&str, Schema)] = &[
     ("app_id", Schema::Leaf),
     ("title", Schema::Leaf),
+    ("effects_locked", Schema::Leaf),
     ("active_color", Schema::Leaf),
     ("inactive_color", Schema::Leaf),
     ("active_luminance_nits", Schema::Leaf),

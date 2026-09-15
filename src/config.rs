@@ -1109,12 +1109,17 @@ pub struct DecorationConfig {
     pub any_effect: bool,
 }
 
-/// A conditional override. Both matchers are case-insensitive substring tests,
-/// and a rule with neither matcher set matches every window (useful as a
-/// catch-all placed last). When both are set, both must match.
+/// A conditional override. `app_id`/`title` are case-insensitive substring
+/// tests; `effects_locked`, when set, requires the window's effects-lock state
+/// (see `RubixState::effects_locked_windows`) to equal it exactly. All set
+/// matchers must match (AND), and a rule with none of them set matches every
+/// window (useful as a catch-all placed last).
 pub struct BorderRule {
     pub app_id: Option<String>,
     pub title: Option<String>,
+    /// `Some(true)` matches only locked windows, `Some(false)` only unlocked
+    /// ones, `None` is not a constraint.
+    pub effects_locked: Option<bool>,
     pub active: StyleOverride,
     pub inactive: StyleOverride,
 }
@@ -1214,8 +1219,9 @@ fn matches_app_id_and_title(
 }
 
 impl BorderRule {
-    fn matches(&self, app_id: Option<&str>, title: Option<&str>) -> bool {
+    fn matches(&self, app_id: Option<&str>, title: Option<&str>, effects_locked: bool) -> bool {
         matches_app_id_and_title(&self.app_id, &self.title, app_id, title)
+            && self.effects_locked.is_none_or(|locked| locked == effects_locked)
     }
 }
 
@@ -1320,13 +1326,54 @@ impl DecorationConfig {
     /// exception work the obvious way -- dim every window, then a later rule
     /// pins one class back to fully opaque without having to restate its
     /// colours.
-    pub fn style_for(&self, app_id: Option<&str>, title: Option<&str>, focused: bool) -> WindowStyle {
+    ///
+    /// `effects_locked` both scopes which rules can match (see
+    /// `BorderRule::matches`) and, applied after every rule, overrides
+    /// whatever they set: a locked window always ends at `opacity = 1.0`,
+    /// `backdrop_blur = false`, `refract = false`, regardless of what a
+    /// matching rule (including a lock-scoped one) asked for. A locked rule
+    /// can still set colour/glow/effect fields freely -- only those three
+    /// fields are pinned.
+    pub fn style_for(
+        &self,
+        app_id: Option<&str>,
+        title: Option<&str>,
+        focused: bool,
+        effects_locked: bool,
+    ) -> WindowStyle {
+        self.style_for_themed(app_id, title, focused, effects_locked, None)
+    }
+
+    /// `style_for` with the wallpaper-derived border colour, when enabled,
+    /// standing in for the section's configured colour.
+    ///
+    /// The theme replaces the baseline rather than the result, so a rule that
+    /// names a colour still wins over the wallpaper -- that is how a lock-scoped
+    /// rule marks a locked window. Windows no colour rule matches follow the
+    /// wallpaper as before. Only the RGB is taken from the theme; the section's
+    /// alpha stands.
+    pub fn style_for_themed(
+        &self,
+        app_id: Option<&str>,
+        title: Option<&str>,
+        focused: bool,
+        effects_locked: bool,
+        theme_color: Option<Color32F>,
+    ) -> WindowStyle {
         let mut style = if focused { self.active.clone() } else { self.inactive.clone() };
+        if let Some(themed) = theme_color {
+            style.color = Color32F::new(themed.r(), themed.g(), themed.b(), style.color.a());
+        }
         for rule in &self.rules {
-            if rule.matches(app_id, title) {
+            if rule.matches(app_id, title, effects_locked) {
                 let over = if focused { &rule.active } else { &rule.inactive };
                 over.apply(&mut style);
             }
+        }
+        if effects_locked {
+            style.opacity = 1.0;
+            style.backdrop_blur = false;
+            style.refract = false;
         }
         style
     }
@@ -1451,6 +1498,8 @@ struct RawBorderRule {
     app_id: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    effects_locked: Option<bool>,
     #[serde(default)]
     active_color: Option<String>,
     #[serde(default)]
@@ -1702,6 +1751,7 @@ fn resolve_decoration(raw: RawDecoration, sdr_white_nits: f32) -> DecorationConf
                 },
                 app_id: r.app_id,
                 title: r.title,
+                effects_locked: r.effects_locked,
             }
         })
         .collect::<Vec<BorderRule>>();

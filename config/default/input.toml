@@ -89,6 +89,10 @@ mouse_follows_focus = false
 "Alt+Shift+T" = "ToggleHdr"
 # Flip focus-follows-mouse live, for A/B without editing the config (see [input]).
 "Alt+Shift+F" = "ToggleFocusFollowsMouse"
+# Lock the focused window solid: fully opaque, no blur or refraction, whatever
+# the decoration rules say. Press again to release; closing the window clears
+# it. Border rules can match `effects_locked = true` to mark locked windows.
+"Alt+Shift+E" = "ToggleEffectsLock"
 # Exit the compositor. On the TTY backend this is the only in-session quit (winit
 # also closes on the host window's close button). Ctrl+Alt+Fn switches VTs.
 # Uppercase Q: with Shift held, xkb resolves the key to its shifted symbol, so the

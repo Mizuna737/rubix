@@ -11,7 +11,7 @@
         let cfg = Config::resolve(raw);
         assert_eq!(cfg.visible_columns, 3);
         assert_eq!(cfg.keybinds.len(), bind_count, "a keybind was dropped during resolution");
-        assert_eq!(bind_count, 29);
+        assert_eq!(bind_count, 30);
     }
 
     // The defaults read off disk as four separate files must resolve to
@@ -641,7 +641,7 @@
             app_id = "signal"
             active_color = "#333333"
         "##);
-        let style = deco.style_for(Some("firefox"), None, true);
+        let style = deco.style_for(Some("firefox"), None, true, false);
         assert_eq!(style.color, parse_color("#111111").unwrap());
     }
 
@@ -652,7 +652,7 @@
             app_id = "signal"
             active_color = "#333333"
         "##);
-        let style = deco.style_for(Some("org.SIGNAL.Desktop"), None, true);
+        let style = deco.style_for(Some("org.SIGNAL.Desktop"), None, true, false);
         assert_eq!(style.color, parse_color("#333333").unwrap());
     }
 
@@ -664,7 +664,7 @@
             app_id = "signal"
             active_color = "#333333"
         "##);
-        let inactive = deco.style_for(Some("signal"), None, false);
+        let inactive = deco.style_for(Some("signal"), None, false, false);
         assert_eq!(
             inactive.color,
             parse_color("#222222").unwrap(),
@@ -685,7 +685,7 @@
             active_color = "#444444"
         "##);
         assert_eq!(
-            deco.style_for(Some("signal"), None, true).color,
+            deco.style_for(Some("signal"), None, true, false).color,
             parse_color("#444444").unwrap()
         );
     }
@@ -700,7 +700,7 @@
             app_id = "signal"
             active_opacity = 1.0
         "##);
-        let style = deco.style_for(Some("signal"), None, true);
+        let style = deco.style_for(Some("signal"), None, true, false);
         assert_eq!(style.opacity, 1.0, "the narrow rule pins opacity back");
         assert_eq!(
             style.color,
@@ -719,11 +719,11 @@
             active_color = "#333333"
         "##);
         assert_eq!(
-            deco.style_for(Some("firefox"), Some("YouTube - Home"), true).color,
+            deco.style_for(Some("firefox"), Some("YouTube - Home"), true, false).color,
             parse_color("#333333").unwrap()
         );
         assert_eq!(
-            deco.style_for(Some("firefox"), Some("Hacker News"), true).color,
+            deco.style_for(Some("firefox"), Some("Hacker News"), true, false).color,
             parse_color("#111111").unwrap(),
             "title must also match"
         );
@@ -737,7 +737,7 @@
             active_color = "#333333"
         "##);
         assert_eq!(
-            deco.style_for(None, None, true).color,
+            deco.style_for(None, None, true, false).color,
             parse_color("#333333").unwrap()
         );
     }
@@ -751,7 +751,7 @@
             active_color = "#333333"
         "##);
         assert_eq!(
-            deco.style_for(None, None, true).color,
+            deco.style_for(None, None, true, false).color,
             parse_color("#111111").unwrap()
         );
     }
@@ -764,7 +764,7 @@
             active_color = "#333333"
             active_luminance_nits = 600.0
         "##);
-        assert_eq!(deco.style_for(Some("signal"), None, true).luminance_nits, Some(600.0));
+        assert_eq!(deco.style_for(Some("signal"), None, true, false).luminance_nits, Some(600.0));
     }
 
     // ---- opacity ----
@@ -792,8 +792,8 @@
     #[test]
     fn focused_and_unfocused_opacity_are_independent() {
         let deco = decoration_from("active_opacity = 1.0\ninactive_opacity = 0.85");
-        assert_eq!(deco.style_for(None, None, true).opacity, 1.0);
-        assert_eq!(deco.style_for(None, None, false).opacity, 0.85);
+        assert_eq!(deco.style_for(None, None, true, false).opacity, 1.0);
+        assert_eq!(deco.style_for(None, None, false, false).opacity, 0.85);
     }
 
     #[test]
@@ -805,8 +805,8 @@
             active_color = "#89b4fa"
             active_opacity = 0.9
         "##);
-        assert_eq!(deco.style_for(Some("Alacritty"), None, true).opacity, 0.9);
-        assert_eq!(deco.style_for(Some("firefox"), None, true).opacity, 1.0);
+        assert_eq!(deco.style_for(Some("Alacritty"), None, true, false).opacity, 0.9);
+        assert_eq!(deco.style_for(Some("firefox"), None, true, false).opacity, 1.0);
     }
 
     // Each field of a rule stands on its own: a rule may set opacity without
@@ -821,7 +821,7 @@
             app_id = "alacritty"
             active_opacity = 0.5
         "##);
-        let style = deco.style_for(Some("alacritty"), None, true);
+        let style = deco.style_for(Some("alacritty"), None, true, false);
         assert_eq!(style.opacity, 0.5);
         assert_eq!(
             style.color,
@@ -842,11 +842,11 @@
             inactive_opacity = 1.0
         "##);
         assert_eq!(
-            deco.style_for(Some("firefox"), Some("YouTube - Home"), false).opacity,
+            deco.style_for(Some("firefox"), Some("YouTube - Home"), false, false).opacity,
             1.0
         );
         assert_eq!(
-            deco.style_for(Some("firefox"), Some("Hacker News"), false).opacity,
+            deco.style_for(Some("firefox"), Some("Hacker News"), false, false).opacity,
             0.85
         );
     }
@@ -859,7 +859,7 @@
             app_id = "alacritty"
             active_color = "#89b4fa"
         "##);
-        assert_eq!(deco.style_for(Some("alacritty"), None, true).opacity, 0.8);
+        assert_eq!(deco.style_for(Some("alacritty"), None, true, false).opacity, 0.8);
     }
 
     // ---- backdrop (frosted glass) ----
@@ -899,7 +899,7 @@
             "##,
         );
         assert_eq!(deco.backdrop_blur_radius, 64, "radius stays a single global value");
-        assert!(deco.style_for(Some("obsidian"), None, true).backdrop_blur);
+        assert!(deco.style_for(Some("obsidian"), None, true, false).backdrop_blur);
     }
 
     #[test]
@@ -911,7 +911,7 @@
             active_backdrop_tonemap = true
             "##,
         );
-        let style = deco.style_for(Some("obsidian"), None, true);
+        let style = deco.style_for(Some("obsidian"), None, true, false);
         assert!(style.backdrop_tonemap);
         assert!(!style.backdrop_blur, "blur was never asked for by this rule");
     }
@@ -929,7 +929,7 @@
             active_backdrop_blur = true
             "##,
         );
-        let style = deco.style_for(Some("obsidian"), None, true);
+        let style = deco.style_for(Some("obsidian"), None, true, false);
         assert!(style.backdrop_blur);
         assert!(!style.backdrop_tonemap);
         assert_eq!(style.color, parse_color("#111111").unwrap());
@@ -948,7 +948,109 @@
             active_backdrop_tonemap = false
             "##,
         );
-        assert!(!deco.style_for(None, Some("glass pane"), true).backdrop_tonemap);
+        assert!(!deco.style_for(None, Some("glass pane"), true, false).backdrop_tonemap);
+    }
+
+    // ---- effects lock ----
+
+    #[test]
+    fn effects_lock_forces_opacity_blur_and_refract_off_over_a_matching_rule() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            app_id = "obsidian"
+            active_backdrop_blur = true
+            active_refract = true
+            active_opacity = 0.8
+            "##,
+        );
+        let locked = deco.style_for(Some("obsidian"), None, true, true);
+        assert_eq!(locked.opacity, 1.0);
+        assert!(!locked.backdrop_blur);
+        assert!(!locked.refract);
+
+        // Same window unlocked keeps the rule's values.
+        let unlocked = deco.style_for(Some("obsidian"), None, true, false);
+        assert_eq!(unlocked.opacity, 0.8);
+        assert!(unlocked.backdrop_blur);
+        assert!(unlocked.refract);
+    }
+
+    #[test]
+    fn effects_locked_rule_with_no_matcher_sets_border_colour_only_on_locked_windows() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            effects_locked = true
+            active_color = "#ff0000"
+            "##,
+        );
+        assert_eq!(
+            deco.style_for(Some("anything"), None, true, true).color,
+            parse_color("#ff0000").unwrap()
+        );
+        assert_ne!(
+            deco.style_for(Some("anything"), None, true, false).color,
+            parse_color("#ff0000").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_locked_rule_setting_opacity_still_resolves_to_fully_opaque() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            effects_locked = true
+            active_opacity = 0.5
+            "##,
+        );
+        assert_eq!(deco.style_for(Some("anything"), None, true, true).opacity, 1.0);
+    }
+
+    #[test]
+    fn effects_locked_rule_combines_with_app_id_as_and_not_or() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            app_id = "obsidian"
+            effects_locked = true
+            active_color = "#ff0000"
+            "##,
+        );
+        // Right app, not locked: no match.
+        assert_ne!(
+            deco.style_for(Some("obsidian"), None, true, false).color,
+            parse_color("#ff0000").unwrap()
+        );
+        // Locked, wrong app: no match.
+        assert_ne!(
+            deco.style_for(Some("firefox"), None, true, true).color,
+            parse_color("#ff0000").unwrap()
+        );
+        // Both: matches.
+        assert_eq!(
+            deco.style_for(Some("obsidian"), None, true, true).color,
+            parse_color("#ff0000").unwrap()
+        );
+    }
+
+    #[test]
+    fn effects_locked_false_rule_applies_only_to_unlocked_windows() {
+        let deco = decoration_from(
+            r##"
+            [[rule]]
+            effects_locked = false
+            active_color = "#00ff00"
+            "##,
+        );
+        assert_eq!(
+            deco.style_for(Some("anything"), None, true, false).color,
+            parse_color("#00ff00").unwrap()
+        );
+        assert_ne!(
+            deco.style_for(Some("anything"), None, true, true).color,
+            parse_color("#00ff00").unwrap()
+        );
     }
 
     #[test]
@@ -1201,8 +1303,8 @@
             inactive_effect = "Comet"
             "##,
         );
-        let active = deco.style_for(Some("signal"), None, true);
-        let inactive = deco.style_for(Some("signal"), None, false);
+        let active = deco.style_for(Some("signal"), None, true, false);
+        let inactive = deco.style_for(Some("signal"), None, false, false);
         assert_eq!(active.effect, BorderEffect::GradientFlow);
         assert_eq!(inactive.effect, BorderEffect::Comet);
     }
@@ -1222,7 +1324,7 @@
             active_effect = "Comet"
             "##,
         );
-        let style = deco.style_for(Some("signal"), None, true);
+        let style = deco.style_for(Some("signal"), None, true, false);
         assert_eq!(style.effect, BorderEffect::Comet);
         assert_eq!(style.color, parse_color("#111111").unwrap());
         assert_eq!(style.opacity, 0.8);
@@ -1417,4 +1519,25 @@
         );
         assert_eq!(rules[0].column, Some(2));
         assert_eq!(rules[0].row, Some(4));
+    }
+
+    // Regression: the wallpaper theme used to repaint every border after the
+    // rules ran, so a lock-scoped rule's colour never reached the screen.
+    #[test]
+    fn rule_colour_wins_over_theme_colour() {
+        let mut deco = DecorationConfig::default();
+        let red = Color32F::new(1.0, 0.0, 0.0, 1.0);
+        let themed = Color32F::new(0.1, 0.2, 0.9, 1.0);
+        deco.rules.push(BorderRule {
+            app_id: None,
+            title: None,
+            effects_locked: Some(true),
+            active: StyleOverride { color: Some(red), ..Default::default() },
+            inactive: StyleOverride { color: Some(red), ..Default::default() },
+        });
+        assert_eq!(deco.style_for_themed(None, None, true, true, Some(themed)).color, red);
+        assert_eq!(deco.style_for_themed(None, None, false, true, Some(themed)).color, red);
+        let unlocked = deco.style_for_themed(None, None, true, false, Some(themed)).color;
+        assert_eq!((unlocked.r(), unlocked.g(), unlocked.b()), (themed.r(), themed.g(), themed.b()));
+        assert_eq!(unlocked.a(), deco.active.color.a());
     }

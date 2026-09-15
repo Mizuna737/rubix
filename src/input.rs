@@ -89,6 +89,12 @@ pub enum NavAction {
     IncreaseSdrWhite,
     DecreaseSdrWhite,
     ToggleHdr,
+    // Lock the focused window's effects: forces full opacity with no backdrop
+    // blur/refraction regardless of decoration rules, and lets border rules
+    // match on the lock for a distinct border. Per window, toggled again to
+    // release; not persisted across a restart. See
+    // `RubixState::toggle_window_effects_lock`.
+    ToggleEffectsLock,
 }
 
 /// Per-press adjustment for the IncreaseSdrWhite/DecreaseSdrWhite chords, in
@@ -584,6 +590,7 @@ impl RubixState {
                 | NavAction::ToggleHdr
                 | NavAction::ToggleFocusFollowsMouse
                 | NavAction::ToggleMouseFollowsFocus
+                | NavAction::ToggleEffectsLock
                 | NavAction::Quit
         );
         if !keeps_maximize {
@@ -727,6 +734,11 @@ impl RubixState {
                 // toggle_hdr does its own render scheduling; don't also fall
                 // through to apply_layout for geometry it doesn't need.
                 self.toggle_hdr();
+            },
+            NavAction::ToggleEffectsLock => {
+                if let Some(id) = self.focused_window_id() {
+                    self.toggle_window_effects_lock(id);
+                }
             },
         }
         self.apply_layout();
