@@ -272,6 +272,27 @@ impl Monitor {
         true
     }
 
+    /// Place `window_id` into an explicit `(col, row)` slot, growing that
+    /// column's row list as needed. The counterpart to [`add_window`](Self::add_window)'s
+    /// "split the focused window" placement, used by window-placement rules
+    /// that name an exact slot instead (see `Config::window_placement_for`).
+    ///
+    /// `col` must already exist -- this does not grow the column band itself
+    /// (`grow_columns` does that, and shifts indices, which would defeat a
+    /// rule naming a specific column). Returns `false` without touching
+    /// anything if it doesn't, so the caller can fall back to default
+    /// placement rather than panicking on a stale or out-of-range rule.
+    pub fn add_window_at_slot(&mut self, col: usize, row: usize, window_id: u32) -> bool {
+        let Some(column) = self.columns.get_mut(col) else { return false };
+        while column.groups.len() <= row {
+            column.groups.push(Group::empty());
+        }
+        column.groups[row] = Group::new(TilingNode::new(window_id), window_id);
+        column.active_row = row;
+        self.active_column = col;
+        true
+    }
+
     pub fn focus_window(&mut self, window_id: u32) -> bool {
         let Some((col,row)) = self.locate(window_id) else { return false };
         self.active_column = col;
@@ -705,6 +726,18 @@ impl Workspace {
 
     pub fn set_active_monitor(&mut self, id: u32) {
         self.active_monitor = id;
+    }
+
+    /// Monitor by id -- for placement rules that target a specific output
+    /// rather than whichever one is active (see `Config::window_placement_for`
+    /// and its call site in `handlers/compositor.rs`).
+    pub fn monitor(&self, id: u32) -> Option<&Monitor> {
+        self.monitors.iter().find(|m| m.id == id)
+    }
+
+    /// Monitor by id, mutable. Counterpart to [`monitor`](Self::monitor).
+    pub fn monitor_mut(&mut self, id: u32) -> Option<&mut Monitor> {
+        self.monitors.iter_mut().find(|m| m.id == id)
     }
     pub fn ensure_monitor(&mut self, id: u32, visible_columns: usize) -> &Monitor {
         if let Some(idx) = self.monitors.iter().position(|m| m.id == id) {

@@ -85,13 +85,62 @@ impl CompositorHandler for RubixState {
                     // live outside the grid -- adding it here would hand it a
                     // tile slot it must not have.
                     if !self.fullscreen_windows.contains(&id) {
-                        let focused_id = self.focused_window_id();
-                        let direction = focused_id
-                            .and_then(|fid| self.window_rect(fid))
-                            .map(Rect::longer_axis)
-                            .unwrap_or(SplitDirection::Horizontal);
-                        if let Some(monitor) = self.workspace.active_monitor_mut() {
-                            monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                        // Window placement rules (`[[rule]]`, see
+                        // `Config::window_placement_for`) can pin a matching
+                        // window to another output and/or an exact grid slot --
+                        // the Rubix equivalent of `awful.rules` moving a client
+                        // to another screen and tag. No match resolves to an
+                        // all-`None` placement, which falls straight through to
+                        // the pre-existing behaviour below.
+                        let (app_id, title) = self.window_identity(id);
+                        let placement = self.config.window_placement_for(app_id.as_deref(), title.as_deref());
+                        let ruled_monitor_id = placement
+                            .output
+                            .as_deref()
+                            .and_then(|name| self.config.outputs.iter().position(|o| o.name == name))
+                            .map(|i| i as u32)
+                            .filter(|mid| self.workspace.monitor(*mid).is_some());
+
+                        if let Some(monitor_id) = ruled_monitor_id {
+                            // Split the DESTINATION monitor's own focused window
+                            // (not necessarily the one holding keyboard focus),
+                            // computed the same way `move_focused_window_to_monitor`
+                            // does for a non-active monitor -- `window_rect` is no
+                            // help here, it's scoped to the active monitor only.
+                            let direction = self
+                                .workspace
+                                .monitor(monitor_id)
+                                .and_then(|monitor| {
+                                    let bounds = self.output_bounds_for(monitor.id)?;
+                                    let active = monitor.active_window()?;
+                                    monitor
+                                        .compute_layout(bounds, self.config.outer_gap, self.config.inner_gap)
+                                        .into_iter()
+                                        .find(|(wid, _)| *wid == active)
+                                        .map(|(_, rect)| rect)
+                                })
+                                .map(Rect::longer_axis)
+                                .unwrap_or(SplitDirection::Horizontal);
+                            let dest_focused = self.workspace.monitor(monitor_id).and_then(|m| m.active_window());
+
+                            if let Some(monitor) = self.workspace.monitor_mut(monitor_id) {
+                                let placed_at_slot = match (placement.column, placement.row) {
+                                    (Some(col), Some(row)) => monitor.add_window_at_slot(col, row, id),
+                                    _ => false,
+                                };
+                                if !placed_at_slot {
+                                    monitor.add_window(direction, id, dest_focused.unwrap_or(0));
+                                }
+                            }
+                        } else {
+                            let focused_id = self.focused_window_id();
+                            let direction = focused_id
+                                .and_then(|fid| self.window_rect(fid))
+                                .map(Rect::longer_axis)
+                                .unwrap_or(SplitDirection::Horizontal);
+                            if let Some(monitor) = self.workspace.active_monitor_mut() {
+                                monitor.add_window(direction, id, focused_id.unwrap_or(0));
+                            }
                         }
                     }
                     self.apply_layout();
