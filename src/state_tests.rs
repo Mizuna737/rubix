@@ -667,7 +667,7 @@ use crate::state::idle_timer_delay;
 use std::time::Duration;
 
 fn idle_cfg(enabled: bool, screen_off_seconds: u64) -> IdleConfig {
-    IdleConfig { enabled, screen_off_seconds }
+    IdleConfig { enabled, screen_off_seconds, inhibit_when_fullscreen: true }
 }
 
 #[test]

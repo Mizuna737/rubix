@@ -1,0 +1,33 @@
+# Window placement rules.
+#
+# Every *.toml under this directory is loaded and merged, so the split
+# across files is organisational only -- move things wherever suits you.
+#
+# The Rubix equivalent of AwesomeWM's `awful.rules`: a matching window is
+# pinned to a particular output and/or grid slot as soon as it maps, instead
+# of following the default "split the focused window" placement. Matching is
+# a case-insensitive substring test on `app_id`/`title`, same as
+# `[[decoration.rule]]` -- when both are given, both must match. Rules
+# accumulate in file order: a later matching rule overrides only the fields
+# it names, so a broad rule plus a narrow correction works the obvious way.
+#
+# `column`/`row` are 0-based grid indices on the matched output (see
+# `model::grid`), the closest thing Rubix has to AwesomeWM's tags -- there is
+# no separate workspace/tag concept inside an output. `column` is validated
+# against `[layout] visible_columns` at load time; an out-of-range value is
+# reported (desktop notification or IPC, per `[diagnostics]`) and that rule's
+# placement is dropped rather than clamped silently or panicking at spawn
+# time. Leaving `column`/`row` unset falls through to default placement,
+# scoped to `output` when that is set.
+#
+# This is deliberately no more than a placement mechanism -- it does not
+# touch border/decoration (that's `decoration.toml`'s job) and does not
+# invent any new grid concept beyond `(column, row)`.
+#
+# Example, commented out: pin a window to a specific output's top-left slot.
+#
+# [[rule]]
+# app_id = "dashboard"
+# output = "HDMI-A-1"
+# column = 0
+# row = 0

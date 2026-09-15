@@ -302,6 +302,14 @@ const RULE_SCHEMA: &[(&str, Schema)] = &[
     ("effect_fps", Schema::Leaf),
 ];
 
+const WINDOW_RULE_SCHEMA: &[(&str, Schema)] = &[
+    ("app_id", Schema::Leaf),
+    ("title", Schema::Leaf),
+    ("output", Schema::Leaf),
+    ("column", Schema::Leaf),
+    ("row", Schema::Leaf),
+];
+
 const OUTPUT_SCHEMA: &[(&str, Schema)] = &[
     ("name", Schema::Leaf),
     ("position", Schema::Leaf),
@@ -355,7 +363,11 @@ const WALLPAPER_SCHEMA: &[(&str, Schema)] = &[
     ("sdr_reference_nits", Schema::Leaf),
 ];
 
-const IDLE_SCHEMA: &[(&str, Schema)] = &[("enabled", Schema::Leaf), ("screen_off_seconds", Schema::Leaf)];
+const IDLE_SCHEMA: &[(&str, Schema)] = &[
+    ("enabled", Schema::Leaf),
+    ("screen_off_seconds", Schema::Leaf),
+    ("inhibit_when_fullscreen", Schema::Leaf),
+];
 const LAYOUT_SCHEMA: &[(&str, Schema)] =
     &[("visible_columns", Schema::Leaf), ("outer_gap", Schema::Leaf), ("inner_gap", Schema::Leaf)];
 const ANIMATION_SCHEMA: &[(&str, Schema)] = &[("duration_ms", Schema::Leaf)];
@@ -391,6 +403,7 @@ const ROOT_SCHEMA: &[(&str, Schema)] = &[
     ("keybinds", Schema::FreeForm),
     ("startup", Schema::Leaf),
     ("output", Schema::ArrayOfTables(OUTPUT_SCHEMA)),
+    ("rule", Schema::ArrayOfTables(WINDOW_RULE_SCHEMA)),
     ("wallpaper", Schema::Table(WALLPAPER_SCHEMA)),
     ("idle", Schema::Table(IDLE_SCHEMA)),
     ("theme", Schema::Table(THEME_SCHEMA)),

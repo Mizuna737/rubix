@@ -52,3 +52,10 @@ enabled = true
 # Seconds of no activity before the screen powers off. 0 disables the timer
 # regardless of `enabled`.
 screen_off_seconds = 600
+# While true (the default), a fullscreen window holds the screen on even
+# without an idle-inhibit lock -- X11 clients (games, XWayland) have no way
+# to take one at all, so without this they could still get blanked mid-play.
+# Set false to fall back to plain idle-inhibit-protocol behaviour; on OLED
+# hardware, weigh that against a fullscreen window pinning the panel on
+# indefinitely.
+inhibit_when_fullscreen = true

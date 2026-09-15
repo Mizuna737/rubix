@@ -69,6 +69,55 @@
 
     // A config predating [wallpaper] must keep working, drawing nothing rather
     // than failing to parse.
+    // `inhibit_when_fullscreen` round-trips and defaults to `true` when
+    // `[idle]` (or just the key) is omitted -- a fresh install must keep a
+    // fullscreen game from being blanked mid-session with no config edits.
+    #[test]
+    fn idle_inhibit_when_fullscreen_defaults_true_when_idle_section_omitted() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config without [idle] still parses");
+        let cfg = Config::resolve(raw);
+        assert!(cfg.idle.inhibit_when_fullscreen);
+    }
+
+    #[test]
+    fn idle_inhibit_when_fullscreen_defaults_true_when_key_omitted() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+
+            [idle]
+            enabled = true
+            screen_off_seconds = 300
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("[idle] without the key still parses");
+        let cfg = Config::resolve(raw);
+        assert!(cfg.idle.inhibit_when_fullscreen);
+    }
+
+    #[test]
+    fn idle_inhibit_when_fullscreen_round_trips_false() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+
+            [idle]
+            inhibit_when_fullscreen = false
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config parses");
+        let cfg = Config::resolve(raw);
+        assert!(!cfg.idle.inhibit_when_fullscreen);
+    }
+
     #[test]
     fn config_omitting_wallpaper_section_draws_none() {
         let text = r#"
@@ -1219,4 +1268,153 @@
     fn effect_depth_clamps_above_one_down_to_one() {
         let deco = decoration_from("effect_depth = 2.0\n");
         assert_eq!(deco.active.effect_depth, 1.0);
+    }
+
+    // ---- window placement rules ----
+
+    /// Parses a `[[rule]]`-only TOML fragment (no `[layout]`/`[keybinds]`
+    /// noise) straight into resolved `WindowRule`s, the same
+    /// `RawWindowRule -> WindowRule` path `Config::resolve` takes, at a given
+    /// `visible_columns` (for the column-bounds check).
+    fn window_rules_from(toml_body: &str, visible_columns: usize) -> Vec<WindowRule> {
+        #[derive(Deserialize)]
+        struct RuleFile {
+            #[serde(default)]
+            rule: Vec<RawWindowRule>,
+        }
+        let file: RuleFile = toml::from_str(toml_body).expect("rule fragment parses");
+        resolve_window_rules(file.rule, visible_columns)
+    }
+
+    #[test]
+    fn a_window_rule_matches_app_id_by_case_insensitive_substring() {
+        let rules = window_rules_from(
+            r##"
+            [[rule]]
+            app_id = "dashboard"
+            output = "HDMI-A-1"
+            "##,
+            3,
+        );
+        assert!(rules[0].matches(Some("Dashboard"), None));
+        assert!(!rules[0].matches(Some("firefox"), None));
+    }
+
+    #[test]
+    fn a_window_rule_with_both_matchers_requires_both_to_match() {
+        let rules = window_rules_from(
+            r##"
+            [[rule]]
+            app_id = "firefox"
+            title = "youtube"
+            output = "DP-3"
+            "##,
+            3,
+        );
+        assert!(rules[0].matches(Some("firefox"), Some("YouTube - Home")));
+        assert!(!rules[0].matches(Some("firefox"), Some("Hacker News")), "title must also match");
+    }
+
+    #[test]
+    fn a_window_rule_matcher_does_not_match_a_window_with_no_app_id() {
+        let rules = window_rules_from(
+            r##"
+            [[rule]]
+            app_id = "dashboard"
+            output = "HDMI-A-1"
+            "##,
+            3,
+        );
+        assert!(!rules[0].matches(None, None));
+    }
+
+    #[test]
+    fn a_later_window_rule_overrides_only_the_fields_it_names() {
+        // Mirrors `DecorationConfig::style_for`'s accumulation: a narrow rule
+        // pins one field back without having to restate the others.
+        let raw: Vec<RawWindowRule> = {
+            #[derive(Deserialize)]
+            struct RuleFile {
+                rule: Vec<RawWindowRule>,
+            }
+            let file: RuleFile = toml::from_str(
+                r##"
+                [[rule]]
+                app_id = "dashboard"
+                output = "HDMI-A-1"
+                column = 0
+                row = 0
+
+                [[rule]]
+                app_id = "dashboard"
+                row = 1
+                "##,
+            )
+            .expect("rule fragment parses");
+            file.rule
+        };
+        let rules = resolve_window_rules(raw, 3);
+
+        let mut placement = WindowPlacement::default();
+        for rule in &rules {
+            if rule.matches(Some("dashboard"), None) {
+                if rule.output.is_some() {
+                    placement.output = rule.output.clone();
+                }
+                if rule.column.is_some() {
+                    placement.column = rule.column;
+                }
+                if rule.row.is_some() {
+                    placement.row = rule.row;
+                }
+            }
+        }
+        assert_eq!(placement.output, Some("HDMI-A-1".to_string()), "unnamed field keeps the earlier rule's value");
+        assert_eq!(placement.column, Some(0), "unnamed field keeps the earlier rule's value");
+        assert_eq!(placement.row, Some(1), "the later rule's named field wins");
+    }
+
+    #[test]
+    fn an_out_of_range_column_is_reported_and_dropped_rather_than_clamped() {
+        let rules = window_rules_from(
+            r##"
+            [[rule]]
+            app_id = "dashboard"
+            column = 5
+            row = 0
+            "##,
+            3,
+        );
+        assert_eq!(rules[0].column, None, "an out-of-range column must not silently clamp");
+        assert_eq!(rules[0].row, Some(0), "row is unaffected by the column check");
+    }
+
+    #[test]
+    fn a_row_past_the_sanity_cap_is_reported_and_dropped() {
+        let rules = window_rules_from(
+            r##"
+            [[rule]]
+            app_id = "dashboard"
+            column = 0
+            row = 999
+            "##,
+            3,
+        );
+        assert_eq!(rules[0].column, Some(0), "column is unaffected by the row check");
+        assert_eq!(rules[0].row, None, "a row far past any reasonable grid must not silently clamp");
+    }
+
+    #[test]
+    fn an_in_range_column_and_row_both_survive_validation() {
+        let rules = window_rules_from(
+            r##"
+            [[rule]]
+            app_id = "dashboard"
+            column = 2
+            row = 4
+            "##,
+            3,
+        );
+        assert_eq!(rules[0].column, Some(2));
+        assert_eq!(rules[0].row, Some(4));
     }

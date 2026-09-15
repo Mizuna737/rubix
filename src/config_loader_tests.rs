@@ -227,6 +227,7 @@ fn the_schema_matches_the_raw_structs() {
         ("RawBorderRule", RULE_SCHEMA),
         ("RawWallpaper", WALLPAPER_SCHEMA),
         ("RawOutput", OUTPUT_SCHEMA),
+        ("RawWindowRule", WINDOW_RULE_SCHEMA),
         ("RawLayout", LAYOUT_SCHEMA),
         ("RawAnimation", ANIMATION_SCHEMA),
         ("RawInput", INPUT_SCHEMA),

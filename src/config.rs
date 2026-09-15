@@ -148,6 +148,10 @@ pub struct Config {
     /// Empty when the user config omits the section (or has no entries) --
     /// the udev backend falls back to auto left-to-right layout in that case.
     pub outputs: Vec<OutputConfig>,
+    /// Window placement rules, resolved from `[[rule]]` entries -- pins a
+    /// matching window to an output and/or grid slot at spawn time. See
+    /// `WindowRule` and `Config::window_placement_for`.
+    pub window_rules: Vec<WindowRule>,
     /// Desktop wallpaper. Live/hot-reloadable, and also settable at runtime
     /// over IPC (`set_wallpaper`); see src/wallpaper.rs.
     pub wallpaper: WallpaperConfig,
@@ -249,6 +253,15 @@ pub struct IdleConfig {
     /// as "no timeout" rather than "blank instantly", matching how `0` reads
     /// as "off" for `border_width`/`corner_radius` above.
     pub screen_off_seconds: u64,
+    /// While `true` (the default) and any window is fullscreen, the screen
+    /// does not blank on the idle timer -- a client that never took an
+    /// idle-inhibit lock (X11 clients cannot; XWayland implements no
+    /// idle-inhibit protocol at all) would otherwise have its panel blanked
+    /// mid-session. This pins the panel on indefinitely for as long as a
+    /// window stays fullscreen, which is an OLED burn-in consideration on
+    /// some hardware -- that trade is why it's a config key, not hardcoded.
+    /// Set `false` to fall back to plain idle-inhibit-protocol behaviour.
+    pub inhibit_when_fullscreen: bool,
 }
 
 /// Resolved wallpaper settings. An absent `path` means no wallpaper: outputs
@@ -507,6 +520,14 @@ struct RawConfig {
     // manually in resolve(), not deserialized directly.
     #[serde(default)]
     output: Vec<RawOutput>,
+    // Optional: a config omitting `[[rule]]` entirely parses fine (empty list =
+    // every window uses default placement). Field name is singular to match
+    // the `[[rule]]` TOML array-of-tables header exactly, same convention as
+    // `output` above. Distinct from `decoration.rule` (`RawBorderRule`),
+    // which lives nested under `[decoration]` and controls appearance, not
+    // placement.
+    #[serde(default)]
+    rule: Vec<RawWindowRule>,
     // Optional section: a config omitting [wallpaper] draws no wallpaper at all
     // (the desktop clears to black), which is what every pre-wallpaper config
     // already did.
@@ -617,11 +638,17 @@ struct RawIdle {
     enabled: bool,
     #[serde(default = "default_screen_off_seconds")]
     screen_off_seconds: u64,
+    #[serde(default = "default_inhibit_when_fullscreen")]
+    inhibit_when_fullscreen: bool,
 }
 
 impl Default for RawIdle {
     fn default() -> Self {
-        RawIdle { enabled: default_idle_enabled(), screen_off_seconds: default_screen_off_seconds() }
+        RawIdle {
+            enabled: default_idle_enabled(),
+            screen_off_seconds: default_screen_off_seconds(),
+            inhibit_when_fullscreen: default_inhibit_when_fullscreen(),
+        }
     }
 }
 
@@ -631,6 +658,10 @@ fn default_idle_enabled() -> bool {
 
 fn default_screen_off_seconds() -> u64 {
     600
+}
+
+fn default_inhibit_when_fullscreen() -> bool {
+    true
 }
 
 // Optional section: a config omitting `[bar]` parses fine, taking the
@@ -759,6 +790,7 @@ impl Config {
             animation_duration: Duration::from_millis(raw.animation.duration_ms),
             startup: raw.startup,
             outputs,
+            window_rules: resolve_window_rules(raw.rule, raw.layout.visible_columns),
             wallpaper: WallpaperConfig {
                 path: raw.wallpaper.path.map(expand_tilde),
                 mode: raw.wallpaper.mode,
@@ -777,6 +809,7 @@ impl Config {
             idle: IdleConfig {
                 enabled: raw.idle.enabled,
                 screen_off_seconds: raw.idle.screen_off_seconds,
+                inhibit_when_fullscreen: raw.idle.inhibit_when_fullscreen,
             },
             theme: resolve_theme(raw.theme, sdr_white_nits),
             bar: BarConfig {
@@ -812,6 +845,30 @@ impl Config {
             .map_err(|e| note_config_problem(format!("config reload failed ({e}); keeping current config")))
             .ok()?;
         Some(Config::resolve(raw))
+    }
+
+    /// Resolve which output/column/row a new window should land in, per
+    /// matching `[[rule]]` entries. Rules accumulate in file order like
+    /// `DecorationConfig::style_for` -- a later matching rule overrides only
+    /// the fields it names, so a broad rule plus a narrow correction works
+    /// the obvious way. Returns all-`None` when nothing matches, which the
+    /// caller (see `handlers/compositor.rs`) takes as "use default placement".
+    pub fn window_placement_for(&self, app_id: Option<&str>, title: Option<&str>) -> WindowPlacement {
+        let mut placement = WindowPlacement::default();
+        for rule in &self.window_rules {
+            if rule.matches(app_id, title) {
+                if rule.output.is_some() {
+                    placement.output = rule.output.clone();
+                }
+                if rule.column.is_some() {
+                    placement.column = rule.column;
+                }
+                if rule.row.is_some() {
+                    placement.row = rule.row;
+                }
+            }
+        }
+        placement
     }
 }
 
@@ -1137,16 +1194,121 @@ impl StyleOverride {
     }
 }
 
+fn contains_ignore_case(haystack: Option<&str>, needle: &str) -> bool {
+    haystack.is_some_and(|h| h.to_lowercase().contains(&needle.to_lowercase()))
+}
+
+/// Shared substring-matcher semantics for every rule kind that matches on
+/// `app_id`/`title` (`BorderRule`, `WindowRule`): both are case-insensitive
+/// substring tests, a matcher that is set but does not match rejects the rule,
+/// an unset matcher is simply not a constraint, and a rule with neither set
+/// matches every window.
+fn matches_app_id_and_title(
+    rule_app_id: &Option<String>,
+    rule_title: &Option<String>,
+    app_id: Option<&str>,
+    title: Option<&str>,
+) -> bool {
+    rule_app_id.as_ref().is_none_or(|n| contains_ignore_case(app_id, n))
+        && rule_title.as_ref().is_none_or(|n| contains_ignore_case(title, n))
+}
+
 impl BorderRule {
     fn matches(&self, app_id: Option<&str>, title: Option<&str>) -> bool {
-        fn contains_ignore_case(haystack: Option<&str>, needle: &str) -> bool {
-            haystack.is_some_and(|h| h.to_lowercase().contains(&needle.to_lowercase()))
-        }
-        // A matcher that is set but does not match rejects the rule; a matcher
-        // that is unset is simply not a constraint.
-        self.app_id.as_ref().is_none_or(|n| contains_ignore_case(app_id, n))
-            && self.title.as_ref().is_none_or(|n| contains_ignore_case(title, n))
+        matches_app_id_and_title(&self.app_id, &self.title, app_id, title)
     }
+}
+
+// ---- window placement rules ----
+
+/// A rule that pins a matching window to a particular output and/or grid slot
+/// at spawn time -- the Rubix equivalent of `awful.rules` moving a client to
+/// another screen and tag. Matching is the same case-insensitive substring
+/// test `BorderRule` uses (see `matches_app_id_and_title`); this struct is
+/// deliberately kept free of any border/decoration field -- that's
+/// `decoration.toml`'s job.
+///
+/// `column`/`row` name a slot in the *matched output's* grid (see
+/// `model::grid`); leaving either unset falls through to the default
+/// placement (split the destination's focused window), scoped to `output`
+/// when that is set.
+pub struct WindowRule {
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+    pub output: Option<String>,
+    pub column: Option<usize>,
+    pub row: Option<usize>,
+}
+
+impl WindowRule {
+    fn matches(&self, app_id: Option<&str>, title: Option<&str>) -> bool {
+        matches_app_id_and_title(&self.app_id, &self.title, app_id, title)
+    }
+}
+
+/// The placement `Config::window_placement_for` resolves for one new window --
+/// every matching rule's named fields layered over the last, in file order,
+/// same accumulation rule `DecorationConfig::style_for` uses.
+#[derive(Default)]
+pub struct WindowPlacement {
+    pub output: Option<String>,
+    pub column: Option<usize>,
+    pub row: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RawWindowRule {
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    column: Option<usize>,
+    #[serde(default)]
+    row: Option<usize>,
+}
+
+/// Rows are created dynamically as windows spawn, so there is no monitor-side
+/// bound to validate `row` against the way `column` has `visible_columns`.
+/// This is a sanity ceiling only -- a rule naming a row past it is almost
+/// certainly a typo, not an intentionally deep grid.
+const MAX_REASONABLE_WINDOW_RULE_ROW: usize = 64;
+
+/// Resolve `[[rule]]` entries, validating `column`/`row` against what's
+/// actually known at config-load time. Out-of-range values are reported (see
+/// `note_config_problem`) and dropped from the rule -- which falls that rule
+/// through to default placement -- rather than clamped silently or left to
+/// panic deep in the grid at spawn time.
+fn resolve_window_rules(raw: Vec<RawWindowRule>, visible_columns: usize) -> Vec<WindowRule> {
+    raw.into_iter()
+        .map(|r| {
+            let column = r.column.and_then(|c| {
+                if c >= visible_columns.max(1) {
+                    note_config_problem(format!(
+                        "window rule column {c} is out of range (only {visible_columns} \
+                         column(s) configured); ignoring this rule's placement"
+                    ));
+                    None
+                } else {
+                    Some(c)
+                }
+            });
+            let row = r.row.and_then(|row| {
+                if row > MAX_REASONABLE_WINDOW_RULE_ROW {
+                    note_config_problem(format!(
+                        "window rule row {row} exceeds the sanity cap of \
+                         {MAX_REASONABLE_WINDOW_RULE_ROW}; ignoring this rule's placement"
+                    ));
+                    None
+                } else {
+                    Some(row)
+                }
+            });
+            WindowRule { app_id: r.app_id, title: r.title, output: r.output, column, row }
+        })
+        .collect()
 }
 
 impl DecorationConfig {
