@@ -82,6 +82,7 @@ pub enum NavAction {
     ToggleMaximize,        // cycle the focused window group -> monitor -> none; releases on focus change
     ToggleMaximizeReverse, // the same cycle walked backwards: straight to monitor, then group, then none
     FocusFullscreen,   // return to a fullscreen window (they sit outside the grid)
+    ToggleFullscreen,  // put the focused window into fullscreen, or take it out; works whether or not the client asked
     RemoveWindow,      // close (politely) then unconditionally detach the focused window
     ToggleFocusFollowsMouse, // flip hover-to-focus live; config re-seeds it on save
     ToggleMouseFollowsFocus, // flip warp-on-focus live; config re-seeds it on save
@@ -665,6 +666,11 @@ impl RubixState {
             NavAction::ToggleMaximize => self.cycle_maximize(true),
             NavAction::ToggleMaximizeReverse => self.cycle_maximize(false),
             NavAction::FocusFullscreen => self.focus_next_fullscreen(),
+            NavAction::ToggleFullscreen => {
+                if let Some(id) = self.focused_window_id() {
+                    self.toggle_window_fullscreen(id);
+                }
+            },
             NavAction::FlipSplitDirection => self.flip_focused_parent_split_direction(),
             NavAction::MoveFocusedWindowUp => self.move_focused_window_by_direction(Direction::Up),
             NavAction::MoveFocusedWindowDown => self.move_focused_window_by_direction(Direction::Down),

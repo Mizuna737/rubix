@@ -673,38 +673,38 @@ fn idle_cfg(enabled: bool, screen_off_seconds: u64) -> IdleConfig {
 #[test]
 fn idle_timer_disarms_while_screen_already_off() {
     let cfg = idle_cfg(true, 600);
-    assert_eq!(idle_timer_delay(true, false, &cfg, Duration::ZERO), None);
+    assert_eq!(idle_timer_delay(true, false, false, &cfg, Duration::ZERO), None);
 }
 
 #[test]
 fn idle_timer_disarms_while_inhibited() {
     let cfg = idle_cfg(true, 600);
-    assert_eq!(idle_timer_delay(false, true, &cfg, Duration::ZERO), None);
+    assert_eq!(idle_timer_delay(false, true, false, &cfg, Duration::ZERO), None);
 }
 
 #[test]
 fn idle_timer_disarms_when_disabled() {
     let cfg = idle_cfg(false, 600);
-    assert_eq!(idle_timer_delay(false, false, &cfg, Duration::ZERO), None);
+    assert_eq!(idle_timer_delay(false, false, false, &cfg, Duration::ZERO), None);
 }
 
 #[test]
 fn idle_timer_disarms_at_zero_seconds_even_when_enabled() {
     let cfg = idle_cfg(true, 0);
-    assert_eq!(idle_timer_delay(false, false, &cfg, Duration::ZERO), None);
+    assert_eq!(idle_timer_delay(false, false, false, &cfg, Duration::ZERO), None);
 }
 
 #[test]
 fn idle_timer_arms_full_timeout_with_no_elapsed_time() {
     let cfg = idle_cfg(true, 600);
-    assert_eq!(idle_timer_delay(false, false, &cfg, Duration::ZERO), Some(Duration::from_secs(600)));
+    assert_eq!(idle_timer_delay(false, false, false, &cfg, Duration::ZERO), Some(Duration::from_secs(600)));
 }
 
 #[test]
 fn idle_timer_arms_remaining_time_after_partial_elapse() {
     let cfg = idle_cfg(true, 600);
     let elapsed = Duration::from_secs(400);
-    assert_eq!(idle_timer_delay(false, false, &cfg, elapsed), Some(Duration::from_secs(200)));
+    assert_eq!(idle_timer_delay(false, false, false, &cfg, elapsed), Some(Duration::from_secs(200)));
 }
 
 // Config hot-reload shortening the timeout below the already-elapsed idle
@@ -714,7 +714,7 @@ fn idle_timer_arms_remaining_time_after_partial_elapse() {
 fn idle_timer_clamps_to_zero_when_already_past_the_new_shorter_timeout() {
     let cfg = idle_cfg(true, 60);
     let elapsed = Duration::from_secs(600);
-    assert_eq!(idle_timer_delay(false, false, &cfg, elapsed), Some(Duration::ZERO));
+    assert_eq!(idle_timer_delay(false, false, false, &cfg, elapsed), Some(Duration::ZERO));
 }
 
 // screen_off and idle_inhibited are independent guards -- both set still
@@ -722,7 +722,32 @@ fn idle_timer_clamps_to_zero_when_already_past_the_new_shorter_timeout() {
 #[test]
 fn idle_timer_disarms_when_both_screen_off_and_inhibited() {
     let cfg = idle_cfg(true, 600);
-    assert_eq!(idle_timer_delay(true, true, &cfg, Duration::ZERO), None);
+    assert_eq!(idle_timer_delay(true, true, false, &cfg, Duration::ZERO), None);
+}
+
+// A fullscreen window disarms the idle timer exactly like a real
+// idle-inhibit lock, when `inhibit_when_fullscreen` is on (the default) --
+// this is what keeps an X11 game (no idle-inhibit protocol available to it
+// at all) from being blanked mid-session.
+#[test]
+fn idle_timer_disarms_when_fullscreen_and_inhibit_when_fullscreen_is_on() {
+    let cfg = idle_cfg(true, 600);
+    assert_eq!(idle_timer_delay(false, false, true, &cfg, Duration::ZERO), None);
+}
+
+// With the config knob off, a fullscreen window is back to ordinary
+// idle-inhibit-protocol behaviour -- no special-casing, normal delay.
+#[test]
+fn idle_timer_ignores_fullscreen_when_inhibit_when_fullscreen_is_off() {
+    let cfg = IdleConfig { enabled: true, screen_off_seconds: 600, inhibit_when_fullscreen: false };
+    assert_eq!(idle_timer_delay(false, false, true, &cfg, Duration::ZERO), Some(Duration::from_secs(600)));
+}
+
+// No fullscreen window: unchanged behaviour regardless of the knob.
+#[test]
+fn idle_timer_unaffected_by_inhibit_when_fullscreen_when_nothing_is_fullscreen() {
+    let cfg = idle_cfg(true, 600);
+    assert_eq!(idle_timer_delay(false, false, false, &cfg, Duration::ZERO), Some(Duration::from_secs(600)));
 }
 
 // ---- any_off / all_off (Phase 3: per-output power state) ----
@@ -835,4 +860,108 @@ fn mouse_follows_focus_target_is_the_true_centre_when_fully_visible_on_one_outpu
     let pointer = Point::<f64, Logical>::from((10.0, 10.0));
     let target = mouse_follows_focus_target(window, &outputs, pointer).expect("fully visible window is visible");
     assert_eq!(target, Point::from((200.0, 200.0)));
+}
+
+// ---- fullscreen_veto (the focus-follows-mouse gate's predicate) ----
+//
+// `RubixState` cannot be constructed in a unit test -- there is no test-only
+// harness for it anywhere in this file or crate, and every existing test here
+// works either against plain model data or a free function extracted for this
+// exact reason (see `mouse_follows_focus_target` above). `fullscreen_veto`
+// follows the same pattern rather than introducing a new harness.
+
+use crate::state::fullscreen_veto;
+use std::collections::HashSet;
+
+#[test]
+fn fullscreen_veto_suppresses_when_the_focused_window_is_fullscreen() {
+    let mut fullscreen_windows = HashSet::new();
+    fullscreen_windows.insert(7);
+    assert!(fullscreen_veto(&fullscreen_windows, Some(7)));
+}
+
+#[test]
+fn fullscreen_veto_does_not_suppress_when_a_different_window_is_focused() {
+    let mut fullscreen_windows = HashSet::new();
+    fullscreen_windows.insert(7);
+    assert!(!fullscreen_veto(&fullscreen_windows, Some(3)));
+}
+
+#[test]
+fn fullscreen_veto_does_not_suppress_with_no_focused_window() {
+    let mut fullscreen_windows = HashSet::new();
+    fullscreen_windows.insert(7);
+    assert!(!fullscreen_veto(&fullscreen_windows, None));
+}
+
+#[test]
+fn fullscreen_veto_does_not_suppress_when_nothing_is_fullscreen() {
+    let fullscreen_windows = HashSet::new();
+    assert!(!fullscreen_veto(&fullscreen_windows, Some(7)));
+}
+
+// ---- color_state_change_ready (the fullscreen-teardown colour debounce) ----
+//
+// Extracted as a free function for the same reason as `fullscreen_veto`
+// above: `RubixState` cannot be constructed in a unit test.
+
+use crate::state::color_state_change_ready;
+
+#[test]
+fn color_state_change_ready_is_immediate_when_no_recent_teardown() {
+    assert!(color_state_change_ready(None, Duration::from_secs(10)));
+}
+
+#[test]
+fn color_state_change_ready_is_not_ready_before_the_settle_window_elapses() {
+    assert!(!color_state_change_ready(
+        Some(Duration::from_secs(3)),
+        Duration::from_secs(10)
+    ));
+}
+
+#[test]
+fn color_state_change_ready_is_ready_exactly_at_the_settle_window() {
+    assert!(color_state_change_ready(
+        Some(Duration::from_secs(10)),
+        Duration::from_secs(10)
+    ));
+}
+
+#[test]
+fn color_state_change_ready_is_ready_after_the_settle_window() {
+    assert!(color_state_change_ready(
+        Some(Duration::from_secs(15)),
+        Duration::from_secs(10)
+    ));
+}
+
+#[test]
+fn color_state_change_ready_is_not_ready_at_the_2026_09_04_postmortem_gap() {
+    // The observed incident: a manual HDR toggle 8s after a game quit took
+    // the EGL context down. Anything under the 10s settle window must still
+    // be held off.
+    assert!(!color_state_change_ready(
+        Some(Duration::from_secs(8)),
+        Duration::from_secs(10)
+    ));
+}
+
+// ---- gpu_recovery_exhausted (bounding context-loss recovery retries) ----
+
+use crate::state::gpu_recovery_exhausted;
+
+#[test]
+fn gpu_recovery_exhausted_is_false_below_the_limit() {
+    assert!(!gpu_recovery_exhausted(11, 12));
+}
+
+#[test]
+fn gpu_recovery_exhausted_is_true_at_the_limit() {
+    assert!(gpu_recovery_exhausted(12, 12));
+}
+
+#[test]
+fn gpu_recovery_exhausted_is_true_above_the_limit() {
+    assert!(gpu_recovery_exhausted(13, 12));
 }

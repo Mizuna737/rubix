@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use smithay::{
@@ -348,6 +348,28 @@ pub struct RubixState {
     // (which fires on `RubixState`) can reach `GpuManager::single_renderer` to
     // validate an imported dmabuf. None on winit.
     pub(crate) udev_handle: Option<std::rc::Rc<std::cell::RefCell<crate::udev::UdevData>>>,
+    // EGL context loss recovery (see `udev::render`'s `ContextLost` arm and
+    // `udev::recover_from_context_loss`). `render` holds `udev.borrow_mut()`
+    // across its whole body, so it cannot call the device teardown/rebuild
+    // functions itself -- it only records what needs recovering here, and a
+    // calloop timer (armed once the borrow has dropped) does the actual work.
+    /// The device pending a context-loss recovery, if any: its node, the
+    /// devnode path to rebuild it from, and the `BackendData::generation` it
+    /// was recorded against. The path is carried here (not re-read from
+    /// `BackendData`) because a failed recovery attempt already ran
+    /// `device_removed`, which drops the `BackendData` entry -- the next
+    /// retry has nowhere else to find it. The generation is what lets
+    /// `recover_from_context_loss` recognize a hotplug that already tore
+    /// this node down and rebuilt it while recovery was pending, and treat
+    /// that as a no-op instead of tearing the fresh backend down again. Set
+    /// by `render`, cleared once `recover_from_context_loss` either succeeds
+    /// or finds the case above.
+    pub(crate) pending_gpu_recovery: Option<(smithay::backend::drm::DrmNode, std::path::PathBuf, u64)>,
+    /// Consecutive failed recovery attempts for the pending node, driving the
+    /// backoff delay before the next retry. Reset to 0 on the first
+    /// successful frame after a recovery. There is no attempt cap -- see
+    /// `recover_from_context_loss`'s doc comment for why.
+    pub(crate) gpu_recovery_failures: u32,
 
     // Pointer constraints: allows clients to lock or confine the pointer.
     // Used by games for mouselook/aim functionality.
@@ -632,6 +654,8 @@ impl RubixState {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             udev_handle: None,
+            pending_gpu_recovery: None,
+            gpu_recovery_failures: 0,
             pointer_constraints_state,
             relative_pointer_manager_state,
             seat,
@@ -820,6 +844,7 @@ impl RubixState {
         let Some(delay) = idle_timer_delay(
             self.all_outputs_off(),
             self.idle_inhibited,
+            !self.fullscreen_windows.is_empty(),
             &self.config.idle,
             self.last_activity.elapsed(),
         ) else {
@@ -833,9 +858,12 @@ impl RubixState {
         };
         let token = loop_handle.insert_source(timer, move |_, _, data| {
             // Guarded again here (not just at arm time): an inhibitor taken
-            // out, or the screen already turned off some other way, between
-            // arming and firing must not blank it a second time / redundantly.
-            if !data.all_outputs_off() && !data.idle_inhibited {
+            // out, the screen already turned off some other way, or a window
+            // going fullscreen, between arming and firing must not blank it
+            // a second time / redundantly / at all.
+            let fullscreen_suppresses =
+                !data.fullscreen_windows.is_empty() && data.config.idle.inhibit_when_fullscreen;
+            if !data.all_outputs_off() && !data.idle_inhibited && !fullscreen_suppresses {
                 tracing::info!(
                     "idle timeout ({}s) reached; powering every output off",
                     data.config.idle.screen_off_seconds,
@@ -1826,6 +1854,28 @@ impl RubixState {
             }
             self.insert_into_grid(id);
         }
+        // `idle_timer_delay` reads `fullscreen_windows`, so entering
+        // fullscreen must cancel a pending blank immediately (not wait for
+        // the next unrelated input event to re-evaluate it), and leaving
+        // fullscreen must re-arm one on the same terms as any other activity.
+        self.rearm_idle_timer();
+    }
+
+    /// Put the focused window into fullscreen, or take it out, on the
+    /// compositor's own initiative rather than a client's `fullscreen_request`.
+    ///
+    /// This is what recovers a game that `reconcile_focus_state` left fullscreen
+    /// but hidden after focus moved away: the client never has to ask again, the
+    /// compositor just puts it back. A no-op for an `id` the layout no longer
+    /// knows about -- a chord can fire against a stale focused id.
+    pub(crate) fn toggle_window_fullscreen(&mut self, id: u32) {
+        if !self.windows.contains_key(&id) {
+            return;
+        }
+        let was_fullscreen = self.fullscreen_windows.contains(&id);
+        self.set_window_fullscreen(id, !was_fullscreen);
+        self.apply_layout();
+        self.ipc_dirty = true;
     }
 
     /// Step the focused window through the maximize cycle.
@@ -1914,6 +1964,14 @@ impl RubixState {
         self.focus_by_id(next);
     }
 
+    /// Whether the currently keyboard-focused window is fullscreen.
+    ///
+    /// Thin wrapper over `fullscreen_veto` -- see there for why the predicate
+    /// itself is a free function.
+    pub(crate) fn focused_window_is_fullscreen(&self) -> bool {
+        fullscreen_veto(&self.fullscreen_windows, self.focused_window_id())
+    }
+
     /// Give keyboard focus to the window now under the pointer, if
     /// focus-follows-mouse is on and nothing vetoes it.
     ///
@@ -1929,11 +1987,12 @@ impl RubixState {
         if self.seat.get_pointer().is_some_and(|p| p.is_grabbed()) {
             return;
         }
-        // Suspended entirely while anything is fullscreen. `reconcile_focus_state`
-        // drops a non-focused window's fullscreen, so a stray hover would kick a
-        // game out of fullscreen -- and a fullscreen window is outside the grid,
-        // making that hard to undo.
-        if !self.fullscreen_windows.is_empty() {
+        // Suspended only while the *focused* window is fullscreen: a hover must
+        // not pull keyboard focus out of a fullscreen window the user is
+        // actually in (a game with a captured pointer). A backgrounded
+        // fullscreen window no longer needs this protection -- it stays
+        // fullscreen but hidden since focus loss no longer un-fullscreens it.
+        if self.focused_window_is_fullscreen() {
             return;
         }
         // `element_under` only sees space elements, i.e. real toplevels, so
@@ -2076,11 +2135,13 @@ impl RubixState {
     /// Reconcile focus-dependent window state after keyboard focus moves.
     ///
     /// Maximize releases on any focus change, mirroring the `unfocus` handler in
-    /// Max's AwesomeWM config. Fullscreen is split by client type: a Wayland
-    /// toplevel accepts the compositor's word and is genuinely un-fullscreened
-    /// back into the grid, while an X11 client keeps its fullscreen state and is
-    /// merely hidden -- telling one it is windowed just invites it to set
-    /// `_NET_WM_STATE_FULLSCREEN` straight back.
+    /// Max's AwesomeWM config. Fullscreen does not release on focus change, for
+    /// either client type: a window that loses focus while fullscreen stays
+    /// fullscreen and is merely hidden (it gets no rect from `apply_layout`), so
+    /// `FocusFullscreen` and `ToggleFullscreen` can bring it back and direct
+    /// scanout resumes on the next frame. A hidden Wayland toplevel leaves the
+    /// `Space` and so stops receiving frame callbacks on its own, which is why
+    /// no X11-style iconify is needed on that path.
     pub(crate) fn reconcile_focus_state(&mut self) {
         let focused = self.focused_window_id();
         let mut dirty = false;
@@ -2089,31 +2150,6 @@ impl RubixState {
 
         if self.maximized.window().is_some() && self.maximized.window() != focused {
             self.maximized = MaximizeState::None;
-            dirty = true;
-        }
-
-        let unfullscreen: Vec<u32> = self
-            .fullscreen_windows
-            .iter()
-            .copied()
-            .filter(|id| Some(*id) != focused)
-            .filter(|id| {
-                self.windows.get(id).is_some_and(|w| {
-                    matches!(w.underlying_surface(), WindowSurface::Wayland(_))
-                })
-            })
-            .collect();
-
-        for id in unfullscreen {
-            if let Some(WindowSurface::Wayland(toplevel)) =
-                self.windows.get(&id).map(|w| w.underlying_surface())
-            {
-                toplevel.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Fullscreen);
-                });
-            }
-            self.set_window_fullscreen(id, false);
-            tracing::info!("window {id} left fullscreen (lost focus)");
             dirty = true;
         }
 
@@ -2143,6 +2179,7 @@ impl RubixState {
         // `self.iconified` tracks what each client was last told, so a layout
         // pass that changes nothing doesn't spray redundant property writes.
         let mut changed: Vec<(u32, bool)> = Vec::new();
+        let pending_x11_focus = self.pending_x11_focus;
         for (id, window) in &self.windows {
             if let WindowSurface::X11(x11) = window.underlying_surface() {
                 // Override-redirect windows own their own geometry and never
@@ -2151,6 +2188,18 @@ impl RubixState {
                 // also have no frame to unmap -- `set_mapped` rejects them
                 // outright.
                 if is_unmanaged_x11(x11) {
+                    continue;
+                }
+                // A window that maps already fullscreen is focused before its
+                // `wl_surface` is associated (see `pending_x11_focus`'s doc
+                // comment), so the focus does not resolve yet and this pass
+                // would otherwise see it as unfocused and hide it. Iconifying
+                // here unmaps its frame, the client reads that as a withdraw
+                // and unmaps itself, and `surface_associated` never gets the
+                // chance to finish the handover -- the window is gone for
+                // good. Hold the iconify decision until focus has actually
+                // resolved.
+                if pending_x11_focus == Some(*id) {
                     continue;
                 }
                 let hidden = !visible.contains(id);
@@ -2358,6 +2407,13 @@ impl RubixState {
                                 self.last_configured.insert(id, (rect.clone(), is_fullscreen));
                             }
                             WindowSurface::X11(x11) => {
+                                // The compositor can now enter fullscreen on the
+                                // client's behalf (`ToggleFullscreen`), so
+                                // `_NET_WM_STATE_FULLSCREEN` can no longer be
+                                // assumed already correct -- set it before the
+                                // configure so a client reading the property on
+                                // the configure event already sees the new value.
+                                let _ = x11.set_fullscreen(is_fullscreen);
                                 // X11 configure carries position AND size in one rect.
                                 // map_element below still sets the compositor-side
                                 // location; keep both.
@@ -2510,6 +2566,49 @@ mod tests;
 /// Where the pointer should land for a window occupying `window_rect`, given
 /// the output layout and where the pointer is now. `None` means "do not warp".
 ///
+/// Whether `focused` is fullscreen, given the current fullscreen set.
+///
+/// Split out of `focus_follows_pointer`'s veto (via `focused_window_is_fullscreen`)
+/// as a free function over plain data -- same reason as `mouse_follows_focus_target`
+/// below: it is the only part of that veto with a decision in it, and it must
+/// be testable without constructing a compositor.
+fn fullscreen_veto(fullscreen_windows: &HashSet<u32>, focused: Option<u32>) -> bool {
+    focused.is_some_and(|id| fullscreen_windows.contains(&id))
+}
+
+/// Whether a connector colour-state change may be staged now.
+///
+/// `since_fullscreen_gone` is how long ago the last exclusive-fullscreen
+/// window disappeared from this output, or `None` if one is still up or none
+/// has gone recently.
+///
+/// A fullscreen game releases hundreds of megabytes over the seconds after it
+/// exits, and a colour-state change staged into that window forces a swapchain
+/// reallocation that can take the EGL context down -- which is exactly what
+/// happened on 2026-09-04, via a *manual* HDR toggle eight seconds after the
+/// game quit. The gate is therefore on how recently fullscreen went away, not
+/// on which code path is asking: a keybind, a config reload and the automatic
+/// desktop transition are all equally capable of killing the GPU here.
+pub(crate) fn color_state_change_ready(
+    since_fullscreen_gone: Option<Duration>,
+    settle: Duration,
+) -> bool {
+    match since_fullscreen_gone {
+        Some(elapsed) => elapsed >= settle,
+        None => true,
+    }
+}
+
+/// Whether context-loss recovery should keep retrying.
+///
+/// A GPU whose `device_added` keeps returning `EINVAL` is not coming back
+/// without a reboot; retrying every 5s forever just fills the log and keeps
+/// hammering a dead device. Giving up deliberately leaves the session running
+/// -- input and IPC do not depend on DRM -- so the user can still exit cleanly.
+pub(crate) fn gpu_recovery_exhausted(failures: u32, limit: u32) -> bool {
+    failures >= limit
+}
+
 /// A free function over plain rectangles, deliberately: it is the only part of
 /// mouse-follows-focus with interesting logic, and it must be testable without
 /// constructing a compositor.
@@ -2572,13 +2671,24 @@ fn all_off(statuses: &[(String, bool)]) -> bool {
 /// longer (if any) the idle timer should wait before firing. `None` means
 /// stay disarmed. Split out purely so this decision is unit-testable without
 /// a real calloop event loop -- see state_tests.rs.
+///
+/// `fullscreen_active` && `idle.inhibit_when_fullscreen` disarms the same as
+/// a real idle-inhibit lock -- see `IdleConfig::inhibit_when_fullscreen`'s
+/// doc comment for why a fullscreen window needs this even though it may
+/// hold no inhibitor of its own.
 fn idle_timer_delay(
     screen_off: bool,
     idle_inhibited: bool,
+    fullscreen_active: bool,
     idle: &crate::config::IdleConfig,
     elapsed: std::time::Duration,
 ) -> Option<std::time::Duration> {
-    if screen_off || idle_inhibited || !idle.enabled || idle.screen_off_seconds == 0 {
+    if screen_off
+        || idle_inhibited
+        || (fullscreen_active && idle.inhibit_when_fullscreen)
+        || !idle.enabled
+        || idle.screen_off_seconds == 0
+    {
         return None;
     }
     let timeout = std::time::Duration::from_secs(idle.screen_off_seconds);

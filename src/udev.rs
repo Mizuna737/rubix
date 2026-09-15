@@ -35,7 +35,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -150,6 +150,25 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[
 /// `initialize_output`.
 const HDR_OFFSCREEN_FORMATS: &[Fourcc] = &[Fourcc::Abgr16161616f, Fourcc::Argb16161616f];
 
+/// Consecutive failed connector colour-state stage attempts allowed for one
+/// desired value before `render_surface` gives up and stops retrying every
+/// frame (~half a second of frames -- long enough to ride out a transient
+/// allocation failure, short enough not to spam). See
+/// `SurfaceData::color_state_failures`.
+const COLOR_STATE_FAILURE_LIMIT: u32 = 30;
+
+/// How long after an exclusive-fullscreen window disappears a connector
+/// colour-state change must wait before it is staged to DRM. The 2026-09-04
+/// postmortem's observed gap (a manual HDR toggle) was 8s; this window
+/// comfortably exceeds it. See `state::color_state_change_ready`.
+const FULLSCREEN_COLOR_SETTLE: Duration = Duration::from_secs(10);
+
+/// Consecutive `device_added` recovery failures allowed for one lost GPU
+/// before `render`'s context-loss handler stops rescheduling
+/// `schedule_gpu_recovery` and gives up (~50s across `gpu_recovery_backoff`'s
+/// curve). See `state::gpu_recovery_exhausted`.
+const GPU_RECOVERY_ATTEMPT_LIMIT: u32 = 12;
+
 /// Backend-wide state, shared across calloop sources via `Rc<RefCell<_>>`.
 /// `pub(crate)` (and the `gpus`/`primary_gpu` fields below) so `RubixState`'s
 /// `DmabufHandler` impl (handlers/dmabuf.rs) can reach the renderer through
@@ -174,6 +193,13 @@ pub(crate) struct UdevData {
     /// page-flips. `render` bails while inactive and stops rescheduling; the
     /// `ActivateSession` handler re-kicks the render loop on return.
     active: bool,
+    /// Monotonic counter stamped into each `BackendData::generation` at
+    /// `device_added`. Lets `recover_from_context_loss` tell "this node's
+    /// backend is still the one that lost its context" from "a hotplug
+    /// already tore this down and rebuilt it while our recovery timer was
+    /// pending" -- the latter is a fresh, working backend and must not be
+    /// torn down a second time.
+    next_device_generation: u64,
 }
 
 /// Per-DRM-device state: the output manager (owns the DRM device + allocator),
@@ -191,6 +217,14 @@ pub(crate) struct BackendData {
     render_node: DrmNode,
     /// calloop token for this device's DRM VBlank source, removed on unplug.
     registration_token: RegistrationToken,
+    /// The devnode `device_added` was called with. Exists purely so
+    /// `recover_from_context_loss` can replay a full `device_removed` +
+    /// `device_added` without re-deriving where this device came from --
+    /// nothing else reads it.
+    path: PathBuf,
+    /// Stamped from `UdevData::next_device_generation` at `device_added`.
+    /// See that field's doc comment.
+    generation: u64,
 }
 
 /// Per-CRTC (per-monitor) state: the smithay `Output`, its global, and the
@@ -266,6 +300,30 @@ pub(crate) struct SurfaceData {
     /// `set_hdr_output_properties` / `set_sdr_output_properties` directly.
     /// `None` at bringup so the first frame always applies.
     applied_connector_hdr: Option<bool>,
+    /// Whether an exclusive-fullscreen window currently owns this output.
+    /// Used only to detect the moment fullscreen goes away, to arm
+    /// `fullscreen_gone_at` below.
+    applied_connector_fullscreen: bool,
+    /// When the last exclusive-fullscreen window stopped owning this output.
+    /// `None` while one is up, or once the settle window has been consumed.
+    /// Colour-state changes are held off until this is `FULLSCREEN_COLOR_SETTLE`
+    /// old -- see `state::color_state_change_ready`.
+    fullscreen_gone_at: Option<std::time::Instant>,
+    /// Whether the last colour-state deferral has already been logged, so the
+    /// "holding hdr" message fires once per deferral instead of once per
+    /// frame. Cleared whenever a stage is attempted.
+    color_state_deferred: bool,
+    /// Consecutive failed connector colour-state stages for this surface.
+    /// Reset to 0 whenever a stage succeeds or `desired_connector_hdr`
+    /// changes. Exists because a failed stage no longer updates
+    /// `applied_connector_hdr` (so the next frame retries) and an output
+    /// whose driver is refusing allocations would otherwise retry at frame
+    /// rate forever.
+    color_state_failures: u32,
+    /// The `desired_connector_hdr` that `color_state_failures` is counting
+    /// against. When the desired value changes, the failure budget resets --
+    /// a new intent deserves a fresh set of attempts.
+    color_state_failed_for: Option<bool>,
     /// Authoritative per-output screen power state (Phase 3 -- was a single
     /// `RubixState::screen_off` global in Phase 1, moved here so one output
     /// can be off while another stays lit). `true` = CRTC atomically disabled
@@ -446,6 +504,7 @@ pub fn init_udev(
         backends: HashMap::new(),
         loop_handle: event_loop.handle(),
         active: true,
+        next_device_generation: 0,
     }));
 
     // Give `RubixState` a handle back into the renderer, so `DmabufHandler::dmabuf_imported`
@@ -680,6 +739,8 @@ fn device_added(
         })
         .map_err(|e| format!("failed to register DRM VBlank source: {e}"))?;
 
+    let generation = udev_data.next_device_generation;
+    udev_data.next_device_generation += 1;
     udev_data.backends.insert(
         node,
         BackendData {
@@ -688,6 +749,8 @@ fn device_added(
             surfaces: HashMap::new(),
             render_node,
             registration_token,
+            path: path.to_path_buf(),
+            generation,
         },
     );
 
@@ -749,6 +812,139 @@ fn device_removed(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: Drm
         udev_data.gpus.as_mut().remove_node(&backend.render_node);
         udev_data.loop_handle.remove(backend.registration_token);
         tracing::info!("removed DRM device {node}");
+    }
+}
+
+/// Recover from `SwapBuffersError::ContextLost` on `node` (see `render`'s
+/// error arm, which records the request, and the module docs there on why it
+/// cannot run inline). Driven by a calloop timer armed once `render`'s
+/// `udev.borrow_mut()` guard has dropped -- `device_removed`/`device_added`
+/// both borrow it again, so calling them from inside `render` would panic on
+/// a double borrow.
+///
+/// This is a full `device_removed` + `device_added` replay, not a
+/// DRM-surfaces-only rebuild: `device_removed` drops `node` from
+/// `GpuManager` (`gpus.as_mut().remove_node`), which is what forces the next
+/// `single_renderer()`/`renderer()` call on this node to build a fresh EGL
+/// context. Rebuilding just the surfaces would re-attach the same dead
+/// context and recover nothing.
+///
+/// Tears down and rebuilds *every* output on this device, including ones
+/// that were rendering fine -- a lost EGL context is per-device, not
+/// per-CRTC, so there is no finer-grained recovery available.
+///
+/// Retries up to `GPU_RECOVERY_ATTEMPT_LIMIT` times at the `gpu_recovery_backoff`
+/// curve, then gives up and stops rescheduling (see `state::gpu_recovery_exhausted`)
+/// -- a device that never comes back would otherwise retry forever, filling the
+/// log and hammering a dead device while leaving the user with a black screen
+/// and no way out short of the power button. Giving up does not stop the
+/// compositor or touch the session: input and IPC do not depend on DRM, so the
+/// user can still exit cleanly. A later genuine hotplug still goes through
+/// `device_added`/`device_changed` and resets `gpu_recovery_failures`,
+/// re-arming recovery.
+fn recover_from_context_loss(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode) {
+    let Some((_, path, recorded_generation)) = data.pending_gpu_recovery.clone() else {
+        // Already resolved by an earlier call this episode (shouldn't
+        // normally fire twice, but a stray extra timer would land here).
+        return;
+    };
+
+    // A genuine hotplug can race a pending recovery -- the incident this
+    // fixes logged one at the same moment as the context loss. If `node`'s
+    // current `BackendData` carries a *different* generation than the one
+    // this recovery was recorded against, a hotplug already tore this node
+    // down and rebuilt it (via the udev monitor's own `Removed`/`Added`
+    // handling, not this function) while the timer was pending -- that
+    // backend is fresh and working, so treat this as a no-op rather than
+    // tearing it down a second time.
+    let superseded = udev
+        .borrow()
+        .backends
+        .get(&node)
+        .is_some_and(|backend| backend.generation != recorded_generation);
+    if superseded {
+        tracing::info!("context-loss recovery for {node} skipped: already rebuilt by a hotplug");
+        data.pending_gpu_recovery = None;
+        data.gpu_recovery_failures = 0;
+        return;
+    }
+
+    tracing::info!(
+        "recovering {node} from lost EGL context (attempt {})",
+        data.gpu_recovery_failures + 1
+    );
+    device_removed(udev, data, node);
+    match device_added(udev, data, node, &path) {
+        Ok(()) => {
+            tracing::info!("recovered {node} from lost EGL context");
+            data.pending_gpu_recovery = None;
+            data.gpu_recovery_failures = 0;
+        }
+        Err(e) => {
+            data.gpu_recovery_failures = data.gpu_recovery_failures.saturating_add(1);
+            if crate::state::gpu_recovery_exhausted(data.gpu_recovery_failures, GPU_RECOVERY_ATTEMPT_LIMIT) {
+                tracing::error!(
+                    "context-loss recovery for {node} gave up after {} attempts: {e}. \
+                     The GPU is not recoverable without a reboot. The compositor is \
+                     still running and input still works -- press the key bound to \
+                     Quit to exit cleanly to a TTY.",
+                    data.gpu_recovery_failures,
+                );
+                // Deliberately no `schedule_gpu_recovery` here: giving up must not
+                // stop the compositor, VT-switch, or take any action on its own --
+                // it only stops rescheduling. A later real hotplug still goes
+                // through `device_added`/`device_changed` and resets
+                // `gpu_recovery_failures` above, re-arming recovery.
+                data.pending_gpu_recovery = Some((node, path, recorded_generation));
+                return;
+            }
+            let delay = gpu_recovery_backoff(data.gpu_recovery_failures);
+            tracing::error!(
+                "context-loss recovery for {node} failed: {e} -- retrying in {delay:?} \
+                 (attempt {} of {GPU_RECOVERY_ATTEMPT_LIMIT})",
+                data.gpu_recovery_failures,
+            );
+            // Keep the pending record (with its path) alive for the retry --
+            // `device_removed` above already dropped `node`'s `BackendData`,
+            // so this is the only place left that remembers where to rebuild
+            // it from. The generation carried forward is stale (the entry is
+            // gone), but harmless: the next call's `superseded` check only
+            // matters when a backend for `node` actually exists.
+            data.pending_gpu_recovery = Some((node, path, recorded_generation));
+            schedule_gpu_recovery(udev, node, delay);
+        }
+    }
+}
+
+/// Backoff delay for the Nth (1-indexed) consecutive context-loss recovery
+/// failure on a device: 250ms, 500ms, 1s, 2s, 4s, then held at a 5s ceiling.
+/// The ceiling is what stops an unrecoverable device from spinning a tight
+/// teardown/rebuild loop; `GPU_RECOVERY_ATTEMPT_LIMIT` is what stops it
+/// spinning at all; see `recover_from_context_loss`.
+fn gpu_recovery_backoff(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::from_millis(250),
+        1 => Duration::from_millis(500),
+        2 => Duration::from_secs(1),
+        3 => Duration::from_secs(2),
+        4 => Duration::from_secs(4),
+        _ => Duration::from_secs(5),
+    }
+}
+
+/// Arm a one-shot timer that attempts `recover_from_context_loss(node)` after
+/// `delay`. Mirrors `schedule_render`'s pattern (own `udev` clone, reaches
+/// `&mut RubixState` through calloop's shared data) so the borrow discipline
+/// stays in the same shape as every other udev entry point.
+fn schedule_gpu_recovery(udev: &Rc<RefCell<UdevData>>, node: DrmNode, delay: Duration) {
+    let loop_handle = udev.borrow().loop_handle.clone();
+    let udev = udev.clone();
+    let timer = if delay.is_zero() { Timer::immediate() } else { Timer::from_duration(delay) };
+    if let Err(e) = loop_handle.insert_source(timer, move |_, _, data| {
+        recover_from_context_loss(&udev, data, node);
+        TimeoutAction::Drop
+    }) {
+        tracing::warn!("failed to schedule context-loss recovery for {node}: {e}");
     }
 }
 
@@ -953,6 +1149,11 @@ fn connector_connected(
             hdr_encode_damage: DamageBag::default(),
             hdr_last_nits: None,
             applied_connector_hdr: None,
+            applied_connector_fullscreen: false,
+            fullscreen_gone_at: None,
+            color_state_deferred: false,
+            color_state_failures: 0,
+            color_state_failed_for: None,
             power_off: false,
             last_scanout_promoted: None,
             last_scanout_candidate: None,
@@ -1046,18 +1247,23 @@ fn connector_connected(
 /// stages `crate::hdr::default_hdr_color_state()` for the next commit via
 /// `use_color_state`. Never panics: any missing support or fork-call error is
 /// logged and the output is left on its current (SDR) color state.
-fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
+///
+/// Returns `true` if the desired HDR color state is now staged (or was
+/// already the pending state), `false` if staging did not happen for any
+/// reason. The caller uses this to decide whether it may record the state as
+/// applied -- see the postmortem at the top of this module's HDR section.
+fn set_hdr_output_properties(drm_output: &RubixDrmOutput) -> bool {
     drm_output.with_compositor(|comp| {
         let Some(conn) = comp.current_connectors().into_iter().next() else {
             tracing::warn!("HDR: output has no connectors attached; leaving HDR unset");
-            return;
+            return false;
         };
 
         let colorspaces = match comp.supported_colorspaces(conn) {
             Ok(cs) => cs,
             Err(e) => {
                 tracing::warn!("HDR: failed to query supported colorspaces for {conn:?}: {e}");
-                return;
+                return false;
             }
         };
         if !colorspaces.contains(&Colorspace::Bt2020Rgb) {
@@ -1065,7 +1271,7 @@ fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
                 "HDR requested for {conn:?} but BT.2020 RGB colorspace is unsupported \
                  (supported: {colorspaces:?}); leaving output SDR"
             );
-            return;
+            return false;
         }
 
         match comp.hdr_metadata_supported(conn) {
@@ -1075,11 +1281,11 @@ fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
                     "HDR requested for {conn:?} but HDR_OUTPUT_METADATA is unsupported; \
                      leaving output SDR"
                 );
-                return;
+                return false;
             }
             Err(e) => {
                 tracing::warn!("HDR: failed to query HDR metadata support for {conn:?}: {e}");
-                return;
+                return false;
             }
         }
 
@@ -1104,19 +1310,27 @@ fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
             }
             Err(e) => {
                 tracing::warn!("HDR: failed to query max bpc range for {conn:?}: {e}");
-                return;
+                return false;
             }
         }
 
         if comp.pending_color_state() != desired {
             match comp.use_color_state(desired) {
-                Ok(()) => tracing::info!("HDR: staged BT.2020/HDR color state for {conn:?}"),
-                Err(e) => tracing::warn!(
-                    "HDR: failed to stage color state for {conn:?}: {e}; leaving output SDR"
-                ),
+                Ok(()) => {
+                    tracing::info!("HDR: staged BT.2020/HDR color state for {conn:?}");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "HDR: failed to stage color state for {conn:?}: {e}; leaving output SDR"
+                    );
+                    false
+                }
             }
+        } else {
+            true
         }
-    });
+    })
 }
 
 /// Revert a connector to the SDR default color state (`Colorspace::Default`
@@ -1124,16 +1338,27 @@ fn set_hdr_output_properties(drm_output: &RubixDrmOutput) {
 /// `set_hdr_output_properties`'s `with_compositor` shape. `use_color_state`
 /// stages for the next atomic commit and is safe to call repeatedly at
 /// runtime -- no re-init needed.
-fn set_sdr_output_properties(drm_output: &RubixDrmOutput) {
+///
+/// Returns `true` if the SDR default color state is now staged (or was
+/// already the pending state), `false` if the revert failed.
+fn set_sdr_output_properties(drm_output: &RubixDrmOutput) -> bool {
     drm_output.with_compositor(|comp| {
         let desired = ConnectorColorState::default();
         if comp.pending_color_state() != desired {
             match comp.use_color_state(desired) {
-                Ok(()) => tracing::info!("HDR: reverted connector to SDR default color state"),
-                Err(e) => tracing::warn!("HDR: failed to revert to SDR color state: {e}"),
+                Ok(()) => {
+                    tracing::info!("HDR: reverted connector to SDR default color state");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("HDR: failed to revert to SDR color state: {e}");
+                    false
+                }
             }
+        } else {
+            true
         }
-    });
+    })
 }
 
 /// Toggle live HDR on/off on every HDR-capable output. Flips `SurfaceData::hdr`
@@ -1288,17 +1513,52 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, cr
         crate::screencopy::fulfill_pending(data, &mut renderer, &sc_output);
     }
 
+    // Set when this call is the *first* to observe context loss on `node`
+    // (as opposed to a repeat while recovery is already pending) -- that is
+    // the signal to arm the recovery timer below, once `guard` has dropped.
+    let mut trigger_recovery = false;
+
     let reschedule = match result {
         Ok(true) => {
             // Damage submitted; the flip's VBlank will schedule the next frame.
+            // A successful frame also means any prior recovery is behind us:
+            // reset the backoff counter so the next episode starts fresh.
+            if data.gpu_recovery_failures != 0 {
+                data.gpu_recovery_failures = 0;
+            }
             false
         }
         Ok(false) => {
             // Nothing to draw -- no flip, so nothing wakes us. Arm a heartbeat.
             true
         }
-      Err(ref err) => {
-            tracing::warn!("render error on {crtc:?}: {err}");
+        Err(ref err) => {
+            if matches!(err, SwapBuffersError::ContextLost(_)) {
+                // The EGL context behind this device is gone -- a page-flip
+                // that took the context with it, a driver reset, a flaky
+                // panel dropping mid-modeset. Smithay's own error text says
+                // "it needs to be recreated"; previously nothing did, and the
+                // output stayed wedged on its last frame until the user
+                // rebooted (445 repeats of this exact log in one incident,
+                // three minutes, no recovery attempt). `render` is holding
+                // `udev.borrow_mut()` right now, and every recovery function
+                // (`device_removed`/`device_added`) borrows it again, so
+                // recovery cannot happen here -- only recorded. A calloop
+                // timer armed after `drop(guard)` below does the actual work.
+                // Logged once per episode (not per frame): the old code hit
+                // this every retry with nothing changing between them.
+                if data.pending_gpu_recovery.as_ref().map(|(n, _, _)| *n) != Some(node) {
+                    tracing::warn!(
+                        "render error on {crtc:?}: {err} -- scheduling context-loss recovery for {node}"
+                    );
+                    data.pending_gpu_recovery = Some((node, backend.path.clone(), backend.generation));
+                    trigger_recovery = true;
+                } else {
+                    tracing::debug!("render error on {crtc:?}: {err} (recovery already pending)");
+                }
+            } else {
+                tracing::warn!("render error on {crtc:?}: {err}");
+            }
             !matches!(err, SwapBuffersError::ContextLost(_))
         }
     };
@@ -1329,6 +1589,14 @@ fn render(udev: &Rc<RefCell<UdevData>>, data: &mut RubixState, node: DrmNode, cr
     }
 
     drop(guard);
+
+    if trigger_recovery {
+        // `guard` is dropped now, so the recovery timer's callback is free to
+        // call `device_removed`/`device_added` (both re-borrow `udev`). Armed
+        // at the start of the backoff sequence -- `gpu_recovery_failures` is
+        // still whatever it was before this episode (0 for a fresh one).
+        schedule_gpu_recovery(udev, node, gpu_recovery_backoff(data.gpu_recovery_failures));
+    }
 
     if reschedule {
         // A window tween wants the next vblank; a border effect wants only its
@@ -1429,6 +1697,17 @@ fn render_surface(
         tween_backdrops,
     );
 
+    // Track when exclusive fullscreen last went away, independent of whether a
+    // colour change is wanted right now -- a manual HDR toggle seconds later
+    // must still be held off. Runs every frame, before the "is a change
+    // wanted" block below, so this clock is maintained even on frames where
+    // `desired_connector_hdr` hasn't moved.
+    if fullscreen_kind.is_some() {
+        surface.fullscreen_gone_at = None;
+    } else if surface.applied_connector_fullscreen && surface.fullscreen_gone_at.is_none() {
+        surface.fullscreen_gone_at = Some(std::time::Instant::now());
+    }
+
     // Connector color state follows the exclusive-fullscreen window's own
     // declared transfer function; on the desktop (no exclusive fullscreen) it
     // follows `surface.hdr` as before. `render_surface` is the sole owner of
@@ -1450,16 +1729,74 @@ fn render_surface(
             Some(_) => "fullscreen-hdr",
             None => "desktop",
         };
-        if desired_connector_hdr {
-            set_hdr_output_properties(&surface.drm_output);
-        } else {
-            set_sdr_output_properties(&surface.drm_output);
+
+        let since_fullscreen_gone = surface.fullscreen_gone_at.map(|t| t.elapsed());
+
+        // A new intent deserves a fresh budget. Without this, a value that
+        // exhausted its attempts leaves its successor with exactly one --
+        // and, because the give-up warning only fires on the `==` edge, that
+        // successor would then be abandoned silently.
+        if surface
+            .color_state_failed_for
+            .is_some_and(|failed| failed != desired_connector_hdr)
+        {
+            surface.color_state_failures = 0;
+            surface.color_state_failed_for = None;
         }
-        surface.applied_connector_hdr = Some(desired_connector_hdr);
-        tracing::info!(
-            "connector color state on {}: hdr = {desired_connector_hdr} ({reason})",
-            surface.output.name(),
-        );
+
+        let under_failure_limit = surface.color_state_failed_for != Some(desired_connector_hdr)
+            || surface.color_state_failures < COLOR_STATE_FAILURE_LIMIT;
+
+        if under_failure_limit
+            && crate::state::color_state_change_ready(since_fullscreen_gone, FULLSCREEN_COLOR_SETTLE)
+        {
+            surface.color_state_deferred = false;
+            let staged = if desired_connector_hdr {
+                set_hdr_output_properties(&surface.drm_output)
+            } else {
+                set_sdr_output_properties(&surface.drm_output)
+            };
+            if staged {
+                surface.applied_connector_hdr = Some(desired_connector_hdr);
+                surface.applied_connector_fullscreen = fullscreen_kind.is_some();
+                surface.fullscreen_gone_at = None;
+                surface.color_state_failures = 0;
+                surface.color_state_failed_for = None;
+                tracing::info!(
+                    "connector color state on {}: hdr = {desired_connector_hdr} ({reason})",
+                    surface.output.name(),
+                );
+            } else {
+                surface.color_state_failed_for = Some(desired_connector_hdr);
+                surface.color_state_failures = surface.color_state_failures.saturating_add(1);
+                if surface.color_state_failures == COLOR_STATE_FAILURE_LIMIT {
+                    tracing::warn!(
+                        "connector color state on {}: giving up on hdr = {desired_connector_hdr} \
+                         after {COLOR_STATE_FAILURE_LIMIT} failed attempts ({reason}); \
+                         output stays on its current color state",
+                        surface.output.name(),
+                    );
+                }
+            }
+        } else if under_failure_limit && !surface.color_state_deferred {
+            surface.color_state_deferred = true;
+            tracing::info!(
+                "connector color state on {}: holding hdr = {desired_connector_hdr} ({reason}) \
+                 until {}s after fullscreen teardown",
+                surface.output.name(),
+                FULLSCREEN_COLOR_SETTLE.as_secs(),
+            );
+        }
+    } else {
+        // Desired flipped back to the currently-applied value (e.g. a game
+        // alt-tabbing in and out during the debounce window) -- nothing
+        // pending to drop.
+        surface.color_state_deferred = false;
+        // The applied colour state is unchanged but its provenance is not: a
+        // fullscreen window can go away without changing the desired value
+        // (fullscreen HDR -> HDR desktop). Left stale, this would debounce
+        // every later desktop transition as though it were leaving fullscreen.
+        surface.applied_connector_fullscreen = fullscreen_kind.is_some();
     }
 
     // HDR Phase 2/1b: `hdr == true` outputs composite through a linear-light
@@ -2389,6 +2726,11 @@ pub(crate) fn set_screen_power(
                 if on {
                     surface.drm_output.with_compositor(|comp| comp.reset_buffer_ages());
                     surface.applied_connector_hdr = None;
+                    surface.applied_connector_fullscreen = false;
+                    surface.fullscreen_gone_at = None;
+                    surface.color_state_deferred = false;
+                    surface.color_state_failures = 0;
+                    surface.color_state_failed_for = None;
                     // The HDR encode path keeps its own damage tracker, separate
                     // from the swapchain buffer ages reset above. It survived the
                     // blank still believing the last frame's elements are on

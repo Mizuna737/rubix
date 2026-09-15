@@ -143,6 +143,22 @@ struct StateSnapshot {
     /// doc comment. A bar wanting per-output detail should use
     /// `Request::ScreenStatus` instead.
     screen_off: bool,
+    /// Mirrors `RubixState::idle_inhibited`: whether at least one client
+    /// currently holds an idle-inhibit lock. Exists so a bar or a debugging
+    /// client can tell "no client ever asked for an inhibitor" from "an
+    /// inhibitor is held" -- previously undiagnosable state (see
+    /// `handlers/idle.rs`'s new logging for the same motivation).
+    idle_inhibited: bool,
+    /// Count of live idle-inhibit locks. Distinguishes "one client is
+    /// inhibiting" from "several are" -- the latter matters when diagnosing
+    /// why releasing one client's lock (e.g. closing a video call) didn't
+    /// re-arm the idle timer: another inhibitor is still held.
+    idle_inhibitors: usize,
+    /// Whether any window is currently fullscreen (`RubixState::fullscreen_windows`
+    /// is non-empty). Exists so an external resource guard can free VRAM
+    /// *before* a game exhausts it rather than reacting to a 95%-full card --
+    /// see the 2026-09-04 postmortem. A bar can also use it to hide chrome.
+    fullscreen_active: bool,
 }
 
 #[derive(Serialize)]
@@ -198,6 +214,9 @@ fn build_snapshot(state: &RubixState) -> StateSnapshot {
             active_column: 0,
             columns: Vec::new(),
             screen_off: state.all_outputs_off(),
+            idle_inhibited: false,
+            idle_inhibitors: 0,
+            fullscreen_active: !state.fullscreen_windows.is_empty(),
         };
     };
     let columns = monitor
@@ -224,6 +243,9 @@ fn build_snapshot(state: &RubixState) -> StateSnapshot {
         active_column: monitor.active_column(),
         columns,
         screen_off: state.all_outputs_off(),
+        idle_inhibited: state.idle_inhibited,
+        idle_inhibitors: state.idle_inhibitors.len(),
+        fullscreen_active: !state.fullscreen_windows.is_empty(),
     }
 }
 
