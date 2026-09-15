@@ -1,9 +1,18 @@
+use std::os::unix::io::OwnedFd;
+
 use smithay::{
     desktop::Window,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Rectangle},
     wayland::{
         seat::WaylandFocus,
+        selection::{
+            data_device::{
+                clear_data_device_selection, current_data_device_selection_userdata,
+                request_data_device_client_selection, set_data_device_selection,
+            },
+            SelectionTarget,
+        },
         xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
     xwayland::{
@@ -13,6 +22,7 @@ use smithay::{
 };
 
 use crate::{
+    focus::KeyboardFocusTarget,
     model::{geometry::Rect, tiling::SplitDirection},
     RubixState,
 };
@@ -483,6 +493,60 @@ impl XwmHandler for RubixState {
         if let Some(id) = self.window_id_for_x11(&window) {
             self.focus_by_id(id);
             self.ipc_dirty = true;
+        }
+    }
+
+    // The other half of the bridge in handlers/mod.rs's `SelectionHandler`:
+    // that side forwards Wayland -> X11, these four forward X11 -> Wayland.
+    // Together they make CLIPBOARD one selection regardless of which side a
+    // client is on. Rubix has no primary-selection support anywhere (see
+    // `DataControlState::new` in state.rs), so only `Clipboard` is bridged.
+
+    // Only the X11 window currently holding keyboard focus may claim the
+    // selection -- otherwise a background XWayland client could hijack the
+    // clipboard out from under whatever the user is actually looking at.
+    fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionTarget) -> bool {
+        if selection != SelectionTarget::Clipboard {
+            return false;
+        }
+        let Some(keyboard) = self.seat.get_keyboard() else { return false };
+        matches!(
+            keyboard.current_focus(),
+            Some(KeyboardFocusTarget::X11(surface)) if surface.xwm_id() == Some(xwm)
+        )
+    }
+
+    // An X11 client wants to read the Wayland-owned clipboard -- pull it from
+    // whichever Wayland client currently owns the selection and hand the
+    // bytes back through `fd`.
+    fn send_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_type: String, fd: OwnedFd) {
+        if selection != SelectionTarget::Clipboard {
+            return;
+        }
+        if let Err(err) = request_data_device_client_selection(&self.seat, mime_type, fd) {
+            tracing::error!(?err, "failed to request wayland clipboard for an XWayland client");
+        }
+    }
+
+    // An X11 client just claimed CLIPBOARD -- mirror it into the Wayland data
+    // device so a Wayland client's next paste sees the X11 side's data.
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        if selection != SelectionTarget::Clipboard {
+            return;
+        }
+        set_data_device_selection(&self.display_handle, &self.seat, mime_types, ());
+    }
+
+    // X11 released CLIPBOARD. Only clear the Wayland side if X11 is still the
+    // one that owns it there -- a Wayland client claiming the selection in
+    // the meantime already replaced it, and clearing here would wipe that out
+    // from under it.
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        if selection != SelectionTarget::Clipboard {
+            return;
+        }
+        if current_data_device_selection_userdata(&self.seat).is_some() {
+            clear_data_device_selection(&self.display_handle, &self.seat);
         }
     }
 }

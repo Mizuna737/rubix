@@ -27,7 +27,7 @@ use smithay::wayland::selection::data_device::{
     set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
 use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::{SelectionHandler, SelectionTarget};
 
 impl SeatHandler for RubixState {
     type KeyboardFocus = KeyboardFocusTarget;
@@ -57,6 +57,44 @@ impl SeatHandler for RubixState {
 
 impl SelectionHandler for RubixState {
     type SelectionUserData = ();
+
+    // A Wayland client just set the clipboard. Forward it into XWM so X11
+    // apps see it as their own CLIPBOARD selection -- without this, focusing
+    // an X11 window after copying from a Wayland one pastes stale/empty data.
+    // Primary selection is unsupported anywhere in Rubix (see
+    // `DataControlState::new` in state.rs), so there's nothing to forward for
+    // that target.
+    fn new_selection(&mut self, ty: SelectionTarget, source: Option<smithay::wayland::selection::SelectionSource>, _seat: Seat<Self>) {
+        if ty != SelectionTarget::Clipboard {
+            return;
+        }
+        if let Some(xwm) = &mut self.xwm {
+            if let Err(err) = xwm.new_selection(ty, source.map(|s| s.mime_types())) {
+                tracing::error!(?err, "failed to forward wayland clipboard selection to XWayland");
+            }
+        }
+    }
+
+    // An X11 client (via XWM's `send_selection`, see handlers/xwayland.rs)
+    // wants the data behind a selection Rubix itself set from XWM's side.
+    // XWM owns fulfilling that read, so just hand the request through.
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: std::os::unix::io::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &Self::SelectionUserData,
+    ) {
+        if ty != SelectionTarget::Clipboard {
+            return;
+        }
+        if let Some(xwm) = &mut self.xwm {
+            if let Err(err) = xwm.send_selection(ty, mime_type, fd) {
+                tracing::error!(?err, "failed to read XWayland clipboard selection for a wayland client");
+            }
+        }
+    }
 }
 
 impl DataDeviceHandler for RubixState {
