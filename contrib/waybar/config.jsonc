@@ -18,7 +18,7 @@
   "margin-right": 24,
   "spacing": 4,
 
-  "modules-left": ["custom/waStatus"],
+  "modules-left": ["custom/waStatus", "custom/vramArbiter"],
   "modules-center": ["custom/rubix"],
   "modules-right": ["cpu", "memory", "network", "custom/volume", "tray", "custom/clock"],
 
@@ -33,6 +33,14 @@
   // --- Left: workAssistant status (REC / Transcribing / Notes) ---
   "custom/waStatus": {
     "exec": "python3 ~/Projects/rubix/contrib/waybar/waStatus.py",
+    "return-type": "json",
+    "escape": false,
+    "restart-interval": 2
+  },
+
+  // --- Left: vramArbiter GPU status ---
+  "custom/vramArbiter": {
+    "exec": "python3 ~/Projects/dotfiles-tools/Scripts/vramArbiterBar.py",
     "return-type": "json",
     "escape": false,
     "restart-interval": 2

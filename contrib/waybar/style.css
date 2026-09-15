@@ -26,6 +26,7 @@ window#waybar {
 /* Give every module a little breathing room. */
 #custom-rubix,
 #custom-waStatus,
+#custom-vramArbiter,
 #custom-focusedClass,
 #cpu,
 #memory,
@@ -41,11 +42,16 @@ window#waybar {
 #custom-rubix.empty { color: @muted; }
 #custom-rubix.disconnected { color: @border; }
 
-/* --- workAssistant status --- */
+/* --- workAssistant recording status --- */
 #custom-waStatus.recording { color: @red; font-weight: bold; }
-#custom-waStatus.transcribing { color: @yellow; }
-#custom-waStatus.notes { color: @blue; }
 #custom-waStatus.idle { padding: 0; }
+
+/* --- vramArbiter GPU status --- */
+#custom-vramArbiter.active { color: @yellow; }
+#custom-vramArbiter.paused { color: @red; font-weight: bold; }
+#custom-vramArbiter.queued { color: @muted; }
+#custom-vramArbiter.unreachable { color: @red; font-weight: bold; }
+#custom-vramArbiter.idle { padding: 0; }
 
 /* --- Focused class (center) --- */
 #custom-focusedClass {

@@ -1,37 +1,39 @@
 #!/usr/bin/env python3
-"""Waybar module: workAssistant status (REC / Transcribing / Notes).
+"""Waybar module: workAssistant recording status.
 
-Port of the AwesomeWM wibar `waWidget`. Polls the same /tmp marker files every
-2s and animates a braille spinner at ~0.15s while active. Persistent process:
-one JSON line per visual change; emits nothing-but-empty when idle so the slot
-collapses. Requires a compositor that delivers frame callbacks to layer
-surfaces (Rubix does, as of the layer send_frame fix)."""
+Polls the recording PID marker every POLL_INTERVAL, checking process
+liveness (not just file existence) so a marker left behind by a crashed
+recordToggle.sh run doesn't stick forever. "Transcribing" moved to
+vramArbiterBar.py once workAssistant's transcription paths started
+registering with vramArbiter. "Notes" was dropped: meetingIngest.py's lock
+file is deliberately never deleted after use (avoids an fcntl inode race
+for LOCK_EX waiters), so file-existence polling can never reflect its real
+state -- it was stuck showing "Notes" permanently as a result."""
 
 import json
 import os
 import sys
 import time
+from pathlib import Path
 
-SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
-
-# Marker file -> (state name, waybar class, label). Order = priority.
-MARKERS = [
-    ("/tmp/workAssistant-record.pid", "recording", "recording", "● REC"),
-    ("/tmp/workAssistant-transcribe.lock", "transcribing", "transcribing", "Transcribing"),
-    ("/tmp/workAssistant-notes.lock", "notes", "notes", "Notes"),
-]
-
+PID_FILE = Path("/tmp/workAssistant-record.pid")
 POLL_INTERVAL = 2.0
-SPINNER_INTERVAL = 0.15
 
 
-def currentState():
-    """Return (state, cssClass, label) for the highest-priority active marker,
-    or the idle tuple."""
-    for path, state, cssClass, label in MARKERS:
-        if os.path.exists(path):
-            return state, cssClass, label
-    return "idle", "idle", ""
+def isRecording() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().split()[0])
+    except (ValueError, IndexError, OSError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, just not signalable by us -- still alive
+    return True
 
 
 def emit(payload):
@@ -39,43 +41,21 @@ def emit(payload):
     sys.stdout.flush()
 
 
-def render(state, cssClass, label, spinnerIdx):
-    if state == "idle":
-        return {"text": "", "class": "idle"}
-    if state == "recording":
-        text = f" {label} "
-    else:
-        text = f" {SPINNER_FRAMES[spinnerIdx]} {label} "
-    return {"text": text, "class": cssClass}
+def render(recording: bool) -> dict:
+    if recording:
+        return {"text": " ● REC ", "class": "recording"}
+    return {"text": "", "class": "idle"}
 
 
 def main():
     sys.stdout.reconfigure(line_buffering=True)
-    state, cssClass, label = ("", "", "")
-    spinnerIdx = 0
-    lastPoll = 0.0
     lastText = None
-
     while True:
-        now = time.monotonic()
-        if now - lastPoll >= POLL_INTERVAL:
-            state, cssClass, label = currentState()
-            lastPoll = now
-
-        payload = render(state, cssClass, label, spinnerIdx)
-        # Only emit when the rendered text actually changes -- keeps waybar reads
-        # to one object each and avoids needless repaints.
+        payload = render(isRecording())
         if payload["text"] != lastText:
             emit(payload)
             lastText = payload["text"]
-
-        if state == "idle":
-            # Nothing animating: sleep until the next poll, no spinner churn.
-            time.sleep(POLL_INTERVAL)
-            lastPoll = 0.0
-        else:
-            spinnerIdx = (spinnerIdx + 1) % len(SPINNER_FRAMES)
-            time.sleep(SPINNER_INTERVAL)
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
