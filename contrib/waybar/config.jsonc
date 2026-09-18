@@ -11,6 +11,20 @@
   // and shoves every tiled window a few pixels.
   "reload_style_on_change": true,
 
+  // Only the ultrawide gets a bar. Without this, waybar puts this same bar on
+  // every connected output, including the 1280-wide portrait strip -- which is
+  // the dashboard panel and already shows system stats of its own.
+  //
+  // That strip is where this bar breaks down. The module set below does not fit
+  // its 1232px of usable width (1280 minus the two 24px margins), so waybar
+  // stops pinning the bar to the output and sizes it to its content instead --
+  // measured as wide as 1348px, wider than the screen. Every clock tick, CPU
+  // sample and volume change then resizes the bar, each resize makes the
+  // compositor re-configure the layer surface, and waybar leaks a file
+  // descriptor set per rebuild. It stalls after a day or two: ~4300
+  // reconfigures over two days on the strip, against 3 on DP-3.
+  "output": "DP-3",
+
   "layer": "top",
   "position": "top",
   "height": 24,
