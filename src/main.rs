@@ -49,6 +49,26 @@ enum Backend {
 /// nested when a host display is present (`WAYLAND_DISPLAY`/`DISPLAY` set) and drive
 /// the TTY when it isn't. Detection runs before `init_winit` clobbers
 /// `WAYLAND_DISPLAY` with our own socket, so it sees the host environment.
+/// Spawn a fire-and-forget child and reap it on a throwaway thread.
+///
+/// Nothing in the compositor handles SIGCHLD, so a child left unwaited sits as a
+/// zombie holding a pid slot for the life of the session. The keybind spawn path
+/// leaked 428 of them over a fortnight before it was fixed; the callers here leak
+/// far more slowly (a couple per XWayland start, one per startup command), but
+/// XWayland can restart, so they accumulate too. Same posture as
+/// `spawn_detached_shell` in state.rs -- never block the compositor thread on a
+/// user command.
+fn spawn_reaped(mut cmd: std::process::Command) {
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => tracing::warn!("spawn failed: {e}"),
+    }
+}
+
 fn detect_backend() -> Backend {
     match std::env::var("RUBIX_BACKEND").as_deref() {
         Ok("winit") => Backend::Winit,
@@ -180,16 +200,14 @@ pub(crate) fn init_xwayland(loop_handle: &LoopHandle<'static, RubixState>, displ
                     // subprocess, not set_var -- Ready fires mid-event-loop
                     // with other threads alive, where a global set_var is UB.
                     let display = format!("DISPLAY=:{display_number}");
-                    std::process::Command::new("systemctl")
-                        .args(["--user", "set-environment", &display])
-                        .spawn()
-                        .ok();
+                    let mut cmd = std::process::Command::new("systemctl");
+                    cmd.args(["--user", "set-environment", &display]);
+                    spawn_reaped(cmd);
                     // Same value for D-Bus-activated services (portals, and
                     // anything else launched by activation rather than by unit).
-                    std::process::Command::new("dbus-update-activation-environment")
-                        .args(["--systemd", &display])
-                        .spawn()
-                        .ok();
+                    let mut cmd = std::process::Command::new("dbus-update-activation-environment");
+                    cmd.args(["--systemd", &display]);
+                    spawn_reaped(cmd);
                     // A clean Ready means the new server is up and stable enough
                     // to have started the WM -- forgive whatever rapid-exit count
                     // a prior crash burst left behind, so it doesn't count against
@@ -214,7 +232,7 @@ pub(crate) fn init_xwayland(loop_handle: &LoopHandle<'static, RubixState>, displ
                             // Newly launched apps pick up the current wallpaper
                             // theme this way; see `RubixState::theme_env`.
                             cmd.envs(data.theme_env.iter().cloned());
-                            cmd.spawn().ok();
+                            spawn_reaped(cmd);
                             tracing::info!("ran startup command: {command}");
                         }
                     }
@@ -799,7 +817,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = args.next();
 
     if let (Some("-c") | Some("--command"), Some(command)) = (flag.as_deref(), arg) {
-        std::process::Command::new(command).envs(data.theme_env.iter().cloned()).spawn().ok();
+        let mut cmd = std::process::Command::new(command);
+        cmd.envs(data.theme_env.iter().cloned());
+        spawn_reaped(cmd);
     }
 
     // After every dispatch cycle: refresh the space (enter/leave bookkeeping),

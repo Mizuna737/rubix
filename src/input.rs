@@ -658,7 +658,22 @@ impl RubixState {
                 // Newly launched apps pick up the current wallpaper theme
                 // this way; see `RubixState::theme_env`.
                 cmd.envs(self.theme_env.iter().cloned());
-                cmd.spawn().ok();
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        // Nothing in the compositor handles SIGCHLD, so a child
+                        // left unreaped sits as a zombie for the life of the
+                        // session, holding a pid slot each time. Every keybind
+                        // spawn came through here unreaped: 428 zombies after a
+                        // fortnight's uptime, 308 of them pactl from the volume
+                        // binds and 32 rofi from the launcher. Same posture as
+                        // `spawn_detached_shell` -- reap on a throwaway thread,
+                        // so the compositor thread never waits on user commands.
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => tracing::warn!("spawn failed for {command:?}: {e}"),
+                }
             },
             NavAction::Quit => {
                 tracing::info!("quit requested; stopping event loop");
