@@ -93,6 +93,18 @@ enum Request {
     // The change is not written back to the config, so a reload restores
     // whatever the file says. See src/wallpaper.rs.
     SetWallpaper { path: String, output: Option<String> },
+    // Focus one window by id, revealing its slot if it is out of view. Ids come
+    // from `Reply::State`, whose per-group window list is the group's tree order
+    // (`Group::window_ids`), so a client can address a sweep across a group's
+    // windows directly instead of guessing which direction steps between them --
+    // the directional `Action` chords only move along one axis, so a group split
+    // the other way is unreachable with them:
+    //   printf '{"type":"focus_window","id":82}\n' | \
+    //     socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rubix.sock"
+    // Replies `Reply::Ok`, or `Reply::Error` when the id names no window on the
+    // active monitor -- a sweep addressing a window that has since closed gets
+    // told, rather than silently doing nothing.
+    FocusWindow { id: u32 },
     // Opt in to `Reply::Chord` (see `broadcast_chord`). Independent of
     // `Subscribe` -- a listen-mode editor wants chords, not the cube
     // snapshot stream, so the two are separate flags rather than one
@@ -299,6 +311,13 @@ fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
             Ok(Request::Action { action }) => {
                 data.dispatch_nav(action);
                 Reply::Ok
+            }
+            Ok(Request::FocusWindow { id }) => {
+                if data.focus_window_by_id(id) {
+                    Reply::Ok
+                } else {
+                    Reply::Error { message: format!("no window {id} on the active monitor") }
+                }
             }
             Ok(Request::Subscribe) => {
                 client.subscribed.set(true);

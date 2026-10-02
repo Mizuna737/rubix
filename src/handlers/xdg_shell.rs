@@ -535,6 +535,39 @@ impl RubixState {
         }
     }
 
+    /// Focus one named window, bringing its slot on screen first.
+    ///
+    /// The directional chords above answer "what is next to me"; this answers
+    /// "put me on that one", which is what an external client addressing the
+    /// cube by window id needs (see `Request::FocusWindow` in ipc.rs). A sweep
+    /// across a list of windows cannot be expressed as a run of directional
+    /// steps: the direction that reaches the next window depends on how its
+    /// group happens to be split, so a single row of windows is unreachable by
+    /// Up/Down and a single column by Left/Right.
+    ///
+    /// Returns whether the id named a window on the active monitor. Revealing
+    /// first matters for a target in a column that is scrolled or rotated out
+    /// of view -- `focus_window` on its own moves the three pointers without
+    /// moving the viewport, which parks the cursor off screen.
+    pub fn focus_window_by_id(&mut self, id: u32) -> bool {
+        let Some(monitor) = self.workspace.active_monitor_mut() else { return false };
+        let Some(kind) = monitor.reveal_window(id) else { return false };
+        if !monitor.focus_window(id) { return false }
+
+        // Armed before apply_layout, which consumes pending_transition via take().
+        match kind {
+            RevealKind::Scrolled { down } => self.pending_transition = Some(Transition::Scroll { down }),
+            RevealKind::Rotated => self.pending_transition = Some(Transition::Rotate),
+            RevealKind::Swapped => self.pending_transition = Some(Transition::Reveal),
+            RevealKind::AlreadyVisible => {}
+        }
+        self.apply_layout();
+        self.focus_by_id(id);
+        self.warp_pointer_to_focused_window();
+        self.ipc_dirty = true;
+        true
+    }
+
     pub fn move_focused_window_by_direction(&mut self,direction: Direction) {
         let Some(focused_id) = self.focused_window_id() else { return };
         // Read phase: two shared borrows of self (via active_monitor()) are
