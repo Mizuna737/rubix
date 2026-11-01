@@ -223,14 +223,11 @@ impl XdgShellHandler for RubixState {
         {
             let id = *id;
             self.fullscreen_windows.insert(id);
-            let bounds = self
-                .workspace
-                .active_monitor()
-                .and_then(|m| self.output_bounds_for(m.id));
+            let output_size = self.active_output_geometry().map(|geo| geo.size);
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
-                if let Some(bounds) = bounds {
-                    state.size = Some((bounds.width as i32, bounds.height as i32).into());
+                if let Some(size) = output_size {
+                    state.size = Some(size);
                 }
             });
             surface.send_pending_configure();
@@ -333,6 +330,17 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
 }
 
 impl RubixState {
+    /// Full output rectangle of the active monitor, ignoring layer-shell
+    /// exclusive zones -- what fullscreen windows must be sized to.
+    pub(crate) fn active_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let id = self.workspace.active_monitor()?.id;
+        let output = self
+            .space
+            .outputs()
+            .find(|o| o.user_data().get::<crate::state::MonitorId>().is_some_and(|m| m.0 == id))?;
+        self.space.output_geometry(output)
+    }
+
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;

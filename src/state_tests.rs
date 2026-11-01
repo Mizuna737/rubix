@@ -965,3 +965,74 @@ fn gpu_recovery_exhausted_is_true_at_the_limit() {
 fn gpu_recovery_exhausted_is_true_above_the_limit() {
     assert!(gpu_recovery_exhausted(13, 12));
 }
+
+// ---- feedback pulse ----
+
+use crate::state::{FeedbackPulse, PulseEdge};
+
+
+fn pulse_at(start: Instant, intensity: f32, ms: u64) -> FeedbackPulse {
+    FeedbackPulse::new("DP-1".into(), PulseEdge::Left, intensity, Duration::from_millis(ms), start)
+}
+
+#[test]
+fn pulse_is_active_before_expiry_and_inactive_after() {
+    let start = Instant::now();
+    let p = pulse_at(start, 1.0, 400);
+    assert!(p.is_active(start));
+    assert!(p.is_active(start + Duration::from_millis(399)));
+    assert!(!p.is_active(start + Duration::from_millis(400)));
+    assert!(!p.is_active(start + Duration::from_secs(60)));
+}
+
+#[test]
+fn pulse_zero_duration_is_never_active() {
+    let start = Instant::now();
+    assert!(!pulse_at(start, 1.0, 0).is_active(start));
+}
+
+#[test]
+fn pulse_intensity_decreases_monotonically_to_zero() {
+    let start = Instant::now();
+    let p = pulse_at(start, 0.8, 500);
+    assert!((p.current_intensity(start) - 0.8).abs() < 1e-6);
+    let mut prev = p.current_intensity(start);
+    for ms in 1..500 {
+        let v = p.current_intensity(start + Duration::from_millis(ms));
+        assert!(v <= prev, "intensity rose at {}ms", ms);
+        prev = v;
+    }
+    assert_eq!(p.current_intensity(start + Duration::from_millis(500)), 0.0);
+}
+
+#[test]
+fn pulse_clamps_duration_and_intensity() {
+    let start = Instant::now();
+    let p = pulse_at(start, 5.0, 60_000);
+    assert_eq!(p.duration, FeedbackPulse::MAX_DURATION);
+    assert_eq!(p.intensity, 1.0);
+    assert!(!p.is_active(start + FeedbackPulse::MAX_DURATION));
+    assert_eq!(pulse_at(start, -1.0, 100).intensity, 0.0);
+    assert_eq!(pulse_at(start, f32::NAN, 100).intensity, 0.0);
+}
+
+#[test]
+fn pulse_edge_parse_accepts_only_known_names() {
+    assert_eq!(PulseEdge::parse("all"), Some(PulseEdge::All));
+    assert_eq!(PulseEdge::parse("top"), Some(PulseEdge::Top));
+    assert_eq!(PulseEdge::parse("middle"), None);
+    assert_eq!(PulseEdge::parse("Left"), None);
+}
+
+#[test]
+fn step_animations_tracks_pulse_lifetime() {
+    let mut event_loop = smithay::reexports::calloop::EventLoop::try_new().unwrap();
+    let display = smithay::reexports::wayland_server::Display::new().unwrap();
+    let mut state = RubixState::new(&mut event_loop, display, crate::config::Config::load());
+    assert!(!state.step_animations());
+    state.feedback_pulse = Some(pulse_at(Instant::now(), 1.0, 1000));
+    assert!(state.step_animations());
+    state.feedback_pulse = Some(pulse_at(Instant::now() - Duration::from_secs(2), 1.0, 100));
+    assert!(!state.step_animations());
+    assert!(state.feedback_pulse.is_none());
+}

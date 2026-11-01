@@ -334,6 +334,17 @@ where
         WrapMode::Sdr { .. } => dnd_icon_elements,
     };
 
+    // Edge glow: above windows and bar, below the pointer. Compositor chrome,
+    // so the same `Decode(Sdr)` wrap as the cursor.
+    let pulse_elements = pulse_glow_elements::<R>(state, output, opts.scale);
+    let pulse_elements: Vec<RubixRenderElement<R>> = match opts.wrap {
+        WrapMode::HdrComposite { round, .. } => pulse_elements
+            .into_iter()
+            .map(|e| wrap_decode(e, round, DecodeKind::Sdr, opts.scale, state.sdr_white_nits))
+            .collect(),
+        WrapMode::Sdr { .. } => pulse_elements,
+    };
+
     // Cursor prepended -- front of the Vec is topmost, and it must draw above
     // everything else, including overlay layers. The DnD icon goes directly
     // after it (under the cursor, above everything else) and is never merged
@@ -341,6 +352,7 @@ where
     let mut elements: Vec<RubixRenderElement<R>> = Vec::new();
     elements.extend(cursor_elements);
     elements.extend(dnd_icon_elements);
+    elements.extend(pulse_elements);
     elements.extend(overlay);
     elements.extend(top);
     elements.extend(bar);
@@ -380,4 +392,81 @@ where
         elements.push(wallpaper);
     }
     elements
+}
+
+const PULSE_BANDS: i32 = 12;
+const PULSE_BAND_LOGICAL_PX: i32 = 6;
+const PULSE_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
+
+/// The pulse glow as stacked solid bands of falling alpha along each edge.
+/// `BorderRingElement` is a rounded ring around a window-sized hole and cannot
+/// express an output-sized one-sided gradient, so this reuses `Solid` instead of
+/// adding a shader stage.
+fn pulse_glow_elements<R>(
+    state: &RubixState,
+    output: &smithay::output::Output,
+    scale: f64,
+) -> Vec<RubixRenderElement<R>>
+where
+    R: Renderer + ImportAll + ImportMem + GlesAccess,
+    R::TextureId: Texture + Clone + Send + 'static,
+{
+    use crate::state::PulseEdge;
+    use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+    use smithay::backend::renderer::element::{Id, Kind};
+    use smithay::backend::renderer::utils::CommitCounter;
+    use smithay::backend::renderer::Color32F;
+    use smithay::utils::{Physical, Point, Rectangle, Size};
+
+    let Some(pulse) = state.feedback_pulse.as_ref() else { return Vec::new() };
+    let now = std::time::Instant::now();
+    if !pulse.is_active(now) || output.name() != pulse.output {
+        return Vec::new();
+    }
+    let level = pulse.current_intensity(now);
+    if level <= 0.0 {
+        return Vec::new();
+    }
+    let Some(geo) = state.space.output_geometry(output) else { return Vec::new() };
+    let size = geo.size.to_f64().to_physical_precise_round::<_, i32>(scale);
+    let band = ((PULSE_BAND_LOGICAL_PX as f64 * scale).round() as i32).max(1);
+
+    let edges: &[PulseEdge] = match pulse.edge {
+        PulseEdge::All => &[PulseEdge::Left, PulseEdge::Right, PulseEdge::Top, PulseEdge::Bottom],
+        PulseEdge::Left => &[PulseEdge::Left],
+        PulseEdge::Right => &[PulseEdge::Right],
+        PulseEdge::Top => &[PulseEdge::Top],
+        PulseEdge::Bottom => &[PulseEdge::Bottom],
+    };
+
+    let mut out = Vec::new();
+    // Each band is a full strip from its edge inward to the band's inner
+    // boundary, so overlapping alphas accumulate toward the edge.
+    for i in 0..PULSE_BANDS {
+        let depth = band * (PULSE_BANDS - i);
+        let falloff = 1.0 - i as f32 / PULSE_BANDS as f32;
+        let alpha = (level * falloff * falloff / PULSE_BANDS as f32 * 3.0).min(1.0);
+        let color = Color32F::new(
+            PULSE_COLOR[0] * alpha,
+            PULSE_COLOR[1] * alpha,
+            PULSE_COLOR[2] * alpha,
+            alpha,
+        );
+        for edge in edges {
+            let (loc, sz) = match edge {
+                PulseEdge::Left => ((0, 0), (depth.min(size.w), size.h)),
+                PulseEdge::Right => ((size.w - depth.min(size.w), 0), (depth.min(size.w), size.h)),
+                PulseEdge::Top => ((0, 0), (size.w, depth.min(size.h))),
+                _ => ((0, size.h - depth.min(size.h)), (size.w, depth.min(size.h))),
+            };
+            out.push(RubixRenderElement::Solid(SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::<i32, Physical>::new(Point::from(loc), Size::from(sz)),
+                CommitCounter::default(),
+                color,
+                Kind::Unspecified,
+            )));
+        }
+    }
+    out
 }

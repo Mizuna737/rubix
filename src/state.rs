@@ -89,6 +89,70 @@ pub(crate) struct ScaleTrack {
     to: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PulseEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    All,
+}
+
+impl PulseEdge {
+    pub(crate) const VALID: &'static str = "left, right, top, bottom, all";
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// A short-lived screen-edge glow. Expiry depends only on elapsed time, so a
+/// pulse can never keep frames flowing past `MAX_DURATION`.
+#[derive(Clone, Debug)]
+pub(crate) struct FeedbackPulse {
+    pub output: String,
+    pub edge: PulseEdge,
+    pub intensity: f32,
+    pub start: Instant,
+    pub duration: std::time::Duration,
+}
+
+impl FeedbackPulse {
+    pub(crate) const MAX_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
+
+    pub(crate) fn new(
+        output: String,
+        edge: PulseEdge,
+        intensity: f32,
+        duration: std::time::Duration,
+        start: Instant,
+    ) -> Self {
+        // NaN fails every comparison, so map it to 0 explicitly.
+        let intensity = if intensity.is_nan() { 0.0 } else { intensity.clamp(0.0, 1.0) };
+        Self { output, edge, intensity, start, duration: duration.min(Self::MAX_DURATION) }
+    }
+
+    pub(crate) fn is_active(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start) < self.duration
+    }
+
+    /// Eased intensity: blooms to full at once and fades with a cubic ease-out.
+    pub(crate) fn current_intensity(&self, now: Instant) -> f32 {
+        if !self.is_active(now) {
+            return 0.0;
+        }
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / self.duration.as_secs_f32();
+        self.intensity * (1.0 - RubixState::ease(t))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tween {
     kind: TweenKind,
@@ -271,6 +335,7 @@ pub struct RubixState {
     pub reserved_bounds: Option<Rect>,
 
     animations: HashMap<u32, Tween>,
+    pub(crate) feedback_pulse: Option<FeedbackPulse>,
     pub(crate) pending_transition: Option<Transition>,
     // The exiting-ghost render positions for the in-flight frame, rebuilt fresh
     // by `step_animations` each call. Consumed by the backends right after, to
@@ -631,6 +696,7 @@ impl RubixState {
             foreign_toplevel: Default::default(),
             reserved_bounds: None,
             animations: HashMap::new(),
+            feedback_pulse: None,
             pending_transition: None,
             active_ghosts: Vec::new(),
             active_scales: Vec::new(),
@@ -1760,7 +1826,8 @@ impl RubixState {
         // on every subsequent idle frame and the list never gets rebuilt.
         self.active_ghosts.clear();
         self.active_scales.clear();
-        if self.animations.is_empty() { return false; }
+        let pulse_live = self.step_feedback_pulse(Instant::now());
+        if self.animations.is_empty() { return pulse_live; }
         let duration_secs = self.config.animation_duration.as_secs_f32();
         let now = Instant::now();
         let mut done: Vec<u32> = Vec::new();
@@ -1801,7 +1868,19 @@ impl RubixState {
                 }
             }
         }
-        !self.animations.is_empty()
+        !self.animations.is_empty() || pulse_live
+    }
+
+    /// Drops the pulse once expired; true while it is still live.
+    fn step_feedback_pulse(&mut self, now: Instant) -> bool {
+        match &self.feedback_pulse {
+            Some(p) if p.is_active(now) => true,
+            Some(_) => {
+                self.feedback_pulse = None;
+                false
+            }
+            None => false,
+        }
     }
 
     /// Insert `id` into the active monitor's grid by splitting the focused

@@ -332,15 +332,9 @@ impl XwmHandler for RubixState {
         let rect = if let Some(id) = id {
             if self.fullscreen_windows.contains(&id) {
                 // Fullscreen: provide the full output geometry
-                self.workspace
-                    .active_monitor()
-                    .and_then(|m| self.output_bounds_for(m.id))
-                    .map(|bounds| {
-                        Rectangle::<i32, Logical>::new(
-                            (bounds.x as i32, bounds.y as i32).into(),
-                            (bounds.width as i32, bounds.height as i32).into(),
-                        )
-                    })
+                self.active_output_geometry().map(|geo| {
+                    Rectangle::<i32, Logical>::new(geo.loc, geo.size)
+                })
             } else {
                 // Tiled: provide the current tile rect
                 self.window_rect(id).map(|rect| {

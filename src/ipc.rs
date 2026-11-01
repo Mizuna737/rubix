@@ -110,6 +110,14 @@ enum Request {
     // snapshot stream, so the two are separate flags rather than one
     // subscription covering everything.
     SubscribeChords,
+    // Flash a glow along one edge (or all four) of the active monitor, e.g.
+    // to confirm a gesture:
+    //   printf '{"type":"feedback_pulse","edge":"left","intensity":0.8,"duration_ms":400}\n' | \
+    //     socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rubix.sock"
+    // `edge` is left|right|top|bottom|all; intensity is clamped to 0..1 and
+    // duration to one second. Replies `Reply::Ok`, or `Reply::Error` for an
+    // unknown edge.
+    FeedbackPulse { edge: String, intensity: f32, duration_ms: u64 },
 }
 
 #[derive(Serialize)]
@@ -348,6 +356,30 @@ fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
                         Reply::Ok
                     }
                     Err(message) => Reply::Error { message },
+                }
+            }
+            Ok(Request::FeedbackPulse { edge, intensity, duration_ms }) => {
+                match crate::state::PulseEdge::parse(&edge) {
+                    None => Reply::Error {
+                        message: format!(
+                            "unknown edge {edge:?}; valid values: {}",
+                            crate::state::PulseEdge::VALID
+                        ),
+                    },
+                    Some(edge) => match data.active_monitor_output() {
+                        None => Reply::Error { message: "no active output".into() },
+                        Some(output) => {
+                            data.feedback_pulse = Some(crate::state::FeedbackPulse::new(
+                                output.name(),
+                                edge,
+                                intensity,
+                                std::time::Duration::from_millis(duration_ms),
+                                std::time::Instant::now(),
+                            ));
+                            data.nudge_render();
+                            Reply::Ok
+                        }
+                    },
                 }
             }
             Err(e) => Reply::Error { message: e.to_string() },
@@ -608,5 +640,18 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         assert!(json.contains("\"id\":7"));
         assert!(json.contains("\"focused\":true"));
+    }
+
+    #[test]
+    fn feedback_pulse_request_deserializes() {
+        let line = r#"{"type":"feedback_pulse","edge":"left","intensity":0.5,"duration_ms":300}"#;
+        match serde_json::from_str::<Request>(line).unwrap() {
+            Request::FeedbackPulse { edge, intensity, duration_ms } => {
+                assert_eq!(edge, "left");
+                assert_eq!(intensity, 0.5);
+                assert_eq!(duration_ms, 300);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
