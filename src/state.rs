@@ -55,6 +55,14 @@ use crate::{
     },
 };
 
+/// Where a fullscreen window lives: the output it owns and when it last became
+/// (or was focused as) the fullscreen window there.
+#[derive(Clone, Debug)]
+pub(crate) struct FullscreenPlacement {
+    pub(crate) output: String,
+    pub(crate) stamp: u64,
+}
+
 // Stashed in an Output's user-data map at bind time (`bind_output_monitor`) so
 // any code holding an `Output` can recover which model `Monitor` it drives,
 // without a name-based lookup back through config.
@@ -350,6 +358,18 @@ pub struct RubixState {
 
     // Windows currently in fullscreen state (bypass normal tiling).
     pub(crate) fullscreen_windows: HashSet<u32>,
+    // Which output each fullscreen window owns, plus a recency stamp used to
+    // pick the winner when several share one. Keyed like `fullscreen_windows`
+    // and kept in lockstep with it; the output is an `Output::name`, so a
+    // hotplugged-away head degrades to `select_fullscreen_output`'s fallbacks
+    // instead of dangling.
+    pub(crate) fullscreen_outputs: HashMap<u32, FullscreenPlacement>,
+    pub(crate) fullscreen_stamp: u64,
+    // Latest geometry an X11 client asked for in a ConfigureRequest, keyed by
+    // the X11 window id (the request can predate the window's entry in
+    // `windows`). Wine/Proton parks a game on its target monitor this way
+    // around setting _NET_WM_STATE_FULLSCREEN.
+    pub(crate) x11_requested_geometry: HashMap<u32, Rectangle<i32, Logical>>,
 
     // Windows with an effects lock: forced to full opacity with no backdrop
     // blur/refraction regardless of decoration rules, and matchable by border
@@ -701,6 +721,9 @@ impl RubixState {
             active_ghosts: Vec::new(),
             active_scales: Vec::new(),
             fullscreen_windows: HashSet::new(),
+            fullscreen_outputs: HashMap::new(),
+            fullscreen_stamp: 0,
+            x11_requested_geometry: HashMap::new(),
             effects_locked_windows: HashSet::new(),
             iconified: HashSet::new(),
             pending_x11_focus: None,
@@ -1240,7 +1263,14 @@ impl RubixState {
                     .filter(|m| m.id >= base)
                     .count() as u32
             });
-        self.workspace.ensure_monitor(id, self.config.visible_columns);
+        let visible_columns = self
+            .config
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .and_then(|o| o.visible_columns)
+            .unwrap_or(self.config.visible_columns);
+        self.workspace.ensure_monitor(id, visible_columns);
         output.user_data().insert_if_missing(|| MonitorId(id));
         // The configured primary output claims active focus even if another head
         // bound first (connectors can enumerate in any order); otherwise the first
@@ -1269,6 +1299,52 @@ impl RubixState {
             return;
         }
         self.workspace.set_active_monitor(id);
+        self.ipc_dirty = true;
+    }
+
+    /// An output went away: fold its workspace monitor into a surviving one so
+    /// no window is left on a head nobody can see. Call after the output has
+    /// been unmapped from `space`.
+    ///
+    /// Tiles move to new rows of the destination's active column (see
+    /// `Workspace::migrate_monitor_windows`). Fullscreen windows live outside
+    /// the grid, so their owned output is retargeted here rather than left to
+    /// `fullscreen_output_for`'s fallback chain. A maximize that belonged to a
+    /// migrated tile is dropped: its rect was sized for the vanished head.
+    /// The emptied monitor entry stays so a reconnect binds to it again.
+    pub(crate) fn output_disconnected_migrate(&mut self, gone: &Output) {
+        let name = gone.name();
+        let Some(src_id) = gone.user_data().get::<MonitorId>().map(|m| m.0) else { return };
+        let remaining: Vec<String> = self.space.outputs().map(|o| o.name()).filter(|n| *n != name).collect();
+        let primary = self.config.outputs.iter().find(|o| o.primary).map(|o| o.name.as_str());
+        let Some(dest_name) = select_migration_target(primary, &remaining) else { return };
+        let Some(dest_id) = self
+            .space
+            .outputs()
+            .find(|o| o.name() == dest_name)
+            .and_then(|o| o.user_data().get::<MonitorId>().map(|m| m.0))
+        else {
+            return;
+        };
+
+        let focused = self.focused_window_id();
+        let migrated = self.workspace.migrate_monitor_windows(src_id, dest_id, focused);
+        if self.maximized.window().is_some_and(|w| migrated.contains(&w)) {
+            self.maximized = MaximizeState::None;
+        }
+        let stranded: Vec<u32> = self
+            .fullscreen_outputs
+            .iter()
+            .filter(|(_, p)| p.output == name)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stranded {
+            self.place_fullscreen(id, dest_name.clone());
+        }
+        if self.workspace.active_monitor_id() == src_id || self.workspace.active_monitor().is_none() {
+            self.set_active_monitor(dest_id);
+        }
+        self.apply_layout();
         self.ipc_dirty = true;
     }
 
@@ -1442,6 +1518,15 @@ impl RubixState {
                 new.visible_columns,
                 self.config.visible_columns,
             );
+        }
+        for o in &new.outputs {
+            let old = self.config.outputs.iter().find(|p| p.name == o.name);
+            if old.is_some_and(|p| p.visible_columns != o.visible_columns) {
+                tracing::info!(
+                    "config visible_columns for output {} changed; needs a restart to take effect",
+                    o.name,
+                );
+            }
         }
         let count = new.keybinds.len();
         self.config.keybinds = new.keybinds;
@@ -1926,9 +2011,33 @@ impl RubixState {
     }
 
     pub fn set_window_fullscreen(&mut self, id: u32, fullscreen: bool) {
+        self.set_window_fullscreen_on(id, fullscreen, None, None);
+    }
+
+    /// As `set_window_fullscreen`, with what the client said about which
+    /// monitor it wants: an output name (xdg `set_fullscreen(output)`) and/or
+    /// the rect it last asked for (X11). Both are ignored when leaving
+    /// fullscreen. See `select_fullscreen_output` for the resolution order.
+    pub(crate) fn set_window_fullscreen_on(
+        &mut self,
+        id: u32,
+        fullscreen: bool,
+        hint: Option<&str>,
+        requested: Option<Rectangle<i32, Logical>>,
+    ) {
         if fullscreen {
+            let output = self.resolve_fullscreen_output(id, hint, requested);
             if !self.fullscreen_windows.insert(id) {
+                // Already fullscreen: only an explicit hint moves it.
+                if (hint.is_some() || requested.is_some())
+                    && let Some(name) = output
+                {
+                    self.place_fullscreen(id, name);
+                }
                 return;
+            }
+            if let Some(name) = output {
+                self.place_fullscreen(id, name);
             }
             // A destroyed window may have been on any monitor, and
             // `remove_window` is id-based and a no-op when absent.
@@ -1939,6 +2048,12 @@ impl RubixState {
             if !self.fullscreen_windows.remove(&id) {
                 return;
             }
+            self.fullscreen_outputs.remove(&id);
+            // The request described where the game wanted to be fullscreen; a
+            // later compositor-initiated fullscreen must not replay it.
+            if let Some(WindowSurface::X11(x11)) = self.windows.get(&id).map(|w| w.underlying_surface()) {
+                self.x11_requested_geometry.remove(&x11.window_id());
+            }
             self.insert_into_grid(id);
         }
         // `idle_timer_delay` reads `fullscreen_windows`, so entering
@@ -1946,6 +2061,102 @@ impl RubixState {
         // the next unrelated input event to re-evaluate it), and leaving
         // fullscreen must re-arm one on the same terms as any other activity.
         self.rearm_idle_timer();
+    }
+
+    /// A client asking for fullscreen is user intent (a game launching from a
+    /// launcher on the same monitor): take focus so the per-output visibility
+    /// rule doesn't hide it behind whatever held focus there. If focus didn't
+    /// resolve (X11 `wl_surface` not associated yet), leave the intent for
+    /// `surface_associated`, as the map path does.
+    pub(crate) fn focus_fullscreen_requester(&mut self, id: u32) {
+        self.focus_by_id(id);
+        if self.focused_window_id() != Some(id) {
+            self.pending_x11_focus = Some(id);
+        }
+    }
+
+    /// Record `id` as owning the output called `name`, stamped as the most
+    /// recent fullscreen window.
+    pub(crate) fn place_fullscreen(&mut self, id: u32, name: String) {
+        self.fullscreen_stamp += 1;
+        self.fullscreen_outputs.insert(id, FullscreenPlacement { output: name, stamp: self.fullscreen_stamp });
+    }
+
+    pub(crate) fn output_geometries(&self) -> Vec<(String, Rectangle<i32, Logical>)> {
+        self.space
+            .outputs()
+            .filter_map(|o| self.space.output_geometry(o).map(|geo| (o.name(), geo)))
+            .collect()
+    }
+
+    /// Name of the output a window going fullscreen should own; see
+    /// `select_fullscreen_output`. `None` only when there are no outputs.
+    pub(crate) fn resolve_fullscreen_output(
+        &self,
+        id: u32,
+        hint: Option<&str>,
+        requested: Option<Rectangle<i32, Logical>>,
+    ) -> Option<String> {
+        let location = self.windows.get(&id).and_then(|w| self.space.element_location(w));
+        let active = self.active_monitor_output().map(|o| o.name());
+        select_fullscreen_output(hint, requested, location, active.as_deref(), &self.output_geometries())
+    }
+
+    /// The output a fullscreen window currently owns. Re-resolved through
+    /// `select_fullscreen_output` rather than trusted, so an output that has
+    /// since disappeared falls back to the window's location, then the active
+    /// monitor, then the first output.
+    pub(crate) fn fullscreen_output_for(&self, id: u32) -> Option<Output> {
+        let stored = self.fullscreen_outputs.get(&id).map(|p| p.output.as_str());
+        let name = self.resolve_fullscreen_output(id, stored, None)?;
+        self.space.outputs().find(|o| o.name() == name).cloned()
+    }
+
+    /// Whether `id` is fullscreen and owns `output`.
+    pub(crate) fn is_fullscreen_on(&self, id: u32, output: &Output) -> bool {
+        self.fullscreen_windows.contains(&id)
+            && self.fullscreen_output_for(id).is_some_and(|o| o.name() == output.name())
+    }
+
+    /// The output a window is on: a fullscreen window's owned output, else its
+    /// tile's monitor, else wherever it sits in the space.
+    fn output_name_of_window(&self, id: u32) -> Option<String> {
+        if self.fullscreen_windows.contains(&id) {
+            return self.fullscreen_output_for(id).map(|o| o.name());
+        }
+        self.workspace
+            .get_monitor_id_by_window_id(id)
+            .and_then(|mid| {
+                self.space
+                    .outputs()
+                    .find(|o| o.user_data().get::<MonitorId>().is_some_and(|m| m.0 == mid))
+                    .cloned()
+            })
+            .or_else(|| {
+                let loc = self.windows.get(&id).and_then(|w| self.space.element_location(w))?;
+                self.output_at(loc.to_f64())
+            })
+            .map(|o| o.name())
+    }
+
+    /// The fullscreen windows that should be on screen if `focused` holds
+    /// keyboard focus. See `visible_fullscreen_ids`.
+    pub(crate) fn visible_fullscreen_set(&self, focused: Option<u32>) -> HashSet<u32> {
+        let entries: Vec<(u32, String, u64)> = self
+            .fullscreen_windows
+            .iter()
+            .filter(|id| self.windows.contains_key(id))
+            .filter_map(|id| {
+                let name = self.fullscreen_output_for(*id)?.name();
+                let stamp = self.fullscreen_outputs.get(id).map_or(0, |p| p.stamp);
+                Some((*id, name, stamp))
+            })
+            .collect();
+        if entries.is_empty() {
+            return HashSet::new();
+        }
+        let focused_output = focused.and_then(|id| self.output_name_of_window(id).map(|name| (id, name)));
+        visible_fullscreen_ids(&entries, focused_output.as_ref().map(|(id, name)| (*id, name.as_str())))
     }
 
     /// Put the focused window into fullscreen, or take it out, on the
@@ -2071,12 +2282,16 @@ impl RubixState {
         self.focus_by_id(next);
     }
 
-    /// Whether the currently keyboard-focused window is fullscreen.
+    /// Whether the currently keyboard-focused window is fullscreen and the
+    /// pointer is on its output.
     ///
     /// Thin wrapper over `fullscreen_veto` -- see there for why the predicate
     /// itself is a free function.
-    pub(crate) fn focused_window_is_fullscreen(&self) -> bool {
-        fullscreen_veto(&self.fullscreen_windows, self.focused_window_id())
+    pub(crate) fn focused_window_is_fullscreen(&self, pointer: Point<f64, Logical>) -> bool {
+        let focused = self.focused_window_id();
+        let focused_output = focused.and_then(|id| self.output_name_of_window(id));
+        let pointer_output = self.output_at(pointer).map(|o| o.name());
+        fullscreen_veto(&self.fullscreen_windows, focused, focused_output.as_deref(), pointer_output.as_deref())
     }
 
     /// Give keyboard focus to the window now under the pointer, if
@@ -2099,7 +2314,7 @@ impl RubixState {
         // actually in (a game with a captured pointer). A backgrounded
         // fullscreen window no longer needs this protection -- it stays
         // fullscreen but hidden since focus loss no longer un-fullscreens it.
-        if self.focused_window_is_fullscreen() {
+        if self.focused_window_is_fullscreen(pos) {
             return;
         }
         // `element_under` only sees space elements, i.e. real toplevels, so
@@ -2371,6 +2586,7 @@ impl RubixState {
             self.space.unmap_elem(&win);
         }
         self.fullscreen_windows.remove(&id);
+        self.fullscreen_outputs.remove(&id);
         self.effects_locked_windows.remove(&id);
         self.iconified.remove(&id);
     }
@@ -2412,42 +2628,30 @@ impl RubixState {
 
         // Fullscreen windows are OUT of the grid (`set_window_fullscreen`), so
         // `compute_layout` never emits them and their rect comes from here --
-        // but only for the focused one. That is what makes navigating away
-        // actually leave a fullscreen game, rather than depending on its column
-        // happening to scroll off screen (which never happens when every column
-        // already fits). Anything left out is reported iconic below.
-        let focused = self.focused_window_id();
-        let fullscreen_ids: Vec<u32> = self.fullscreen_windows.iter().cloned().collect();
-        for id in fullscreen_ids {
-            if Some(id) != focused {
-                continue;
-            }
-            if let Some(window) = self.windows.get(&id) {
-                // Find which monitor this window is on by checking its current location
-                let output = self
-                    .space
-                    .element_location(window)
-                    .and_then(|loc| self.output_at(loc.to_f64()))
-                    .or_else(|| self.space.outputs().next().cloned());
-
-                if let Some(output) = output {
-                    if let Some(bounds) = self.space.output_geometry(&output) {
-                        let rect = Rect {
-                            x: bounds.loc.x as u32,
-                            y: bounds.loc.y as u32,
-                            width: bounds.size.w as u32,
-                            height: bounds.size.h as u32,
-                        };
-                        // Normally there is no entry to override, since the window
-                        // left the grid on going fullscreen. The override still
-                        // covers the transient case where a client requests
-                        // fullscreen in the same pass its tiled entry was built.
-                        if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
-                            entry.1 = rect;
-                        } else {
-                            targets.push((id, rect));
-                        }
-                    }
+        // the full geometry of the output each one owns. Visibility is per
+        // output (`visible_fullscreen_ids`): navigating to a tiled window on
+        // the SAME output leaves the fullscreen game behind, while focus on
+        // another monitor leaves it showing. Anything left out is reported
+        // iconic below.
+        let mut visible_fullscreen: Vec<u32> = self.visible_fullscreen_set(self.focused_window_id()).into_iter().collect();
+        visible_fullscreen.sort_unstable();
+        for id in visible_fullscreen {
+            let Some(output) = self.fullscreen_output_for(id) else { continue };
+            if let Some(bounds) = self.space.output_geometry(&output) {
+                let rect = Rect {
+                    x: bounds.loc.x as u32,
+                    y: bounds.loc.y as u32,
+                    width: bounds.size.w as u32,
+                    height: bounds.size.h as u32,
+                };
+                // Normally there is no entry to override, since the window
+                // left the grid on going fullscreen. The override still
+                // covers the transient case where a client requests
+                // fullscreen in the same pass its tiled entry was built.
+                if let Some(entry) = targets.iter_mut().find(|(tid, _)| *tid == id) {
+                    entry.1 = rect;
+                } else {
+                    targets.push((id, rect));
                 }
             }
         }
@@ -2674,14 +2878,89 @@ mod tests;
 /// Where the pointer should land for a window occupying `window_rect`, given
 /// the output layout and where the pointer is now. `None` means "do not warp".
 ///
-/// Whether `focused` is fullscreen, given the current fullscreen set.
+/// Whether hover focus must be suppressed: `focused` is fullscreen AND the
+/// pointer is on that window's own output.
 ///
 /// Split out of `focus_follows_pointer`'s veto (via `focused_window_is_fullscreen`)
 /// as a free function over plain data -- same reason as `mouse_follows_focus_target`
 /// below: it is the only part of that veto with a decision in it, and it must
-/// be testable without constructing a compositor.
-fn fullscreen_veto(fullscreen_windows: &HashSet<u32>, focused: Option<u32>) -> bool {
+/// be testable without constructing a compositor. Per output because a
+/// fullscreen window now owns one monitor rather than the whole desktop:
+/// hovering a window on another monitor is an ordinary focus change.
+fn fullscreen_veto(
+    fullscreen_windows: &HashSet<u32>,
+    focused: Option<u32>,
+    focused_output: Option<&str>,
+    pointer_output: Option<&str>,
+) -> bool {
     focused.is_some_and(|id| fullscreen_windows.contains(&id))
+        && (focused_output.is_none() || focused_output == pointer_output)
+}
+
+/// Which output a window going fullscreen should own, first match wins:
+/// the client's named output (xdg `set_fullscreen(output)`), the output holding
+/// the centre of the rect it asked for (Wine/Proton parks the window on the
+/// target monitor), the output at the window's current location, the active
+/// output, then the first output. Names that are not in `outputs` are skipped,
+/// so a hot-unplugged head falls through. `None` only when `outputs` is empty.
+pub(crate) fn select_fullscreen_output(
+    hint: Option<&str>,
+    requested: Option<Rectangle<i32, Logical>>,
+    location: Option<Point<i32, Logical>>,
+    active: Option<&str>,
+    outputs: &[(String, Rectangle<i32, Logical>)],
+) -> Option<String> {
+    let known = |name: &str| outputs.iter().any(|(n, _)| n == name);
+    hint.filter(|n| known(n))
+        .map(str::to_owned)
+        .or_else(|| requested.and_then(|r| output_containing_center(r, outputs)))
+        .or_else(|| location.and_then(|p| outputs.iter().find(|(_, g)| g.contains(p)).map(|(n, _)| n.clone())))
+        .or_else(|| active.filter(|n| known(n)).map(str::to_owned))
+        .or_else(|| outputs.first().map(|(n, _)| n.clone()))
+}
+
+/// Where an unplugged output's windows go: the configured primary when it is
+/// still connected, else the first remaining output. `None` when nothing
+/// remains, in which case the model is left alone.
+pub(crate) fn select_migration_target(primary: Option<&str>, remaining: &[String]) -> Option<String> {
+    primary
+        .filter(|p| remaining.iter().any(|n| n == p))
+        .map(str::to_owned)
+        .or_else(|| remaining.first().cloned())
+}
+
+/// The output whose geometry contains the centre of `rect`, if any.
+pub(crate) fn output_containing_center(
+    rect: Rectangle<i32, Logical>,
+    outputs: &[(String, Rectangle<i32, Logical>)],
+) -> Option<String> {
+    let centre = Point::<i32, Logical>::from((rect.loc.x + rect.size.w / 2, rect.loc.y + rect.size.h / 2));
+    outputs.iter().find(|(_, g)| g.contains(centre)).map(|(n, _)| n.clone())
+}
+
+/// Which fullscreen windows should be on screen. `entries` is
+/// `(id, owned output, recency stamp)`; `focused` is the focused window and the
+/// output it is on.
+///
+/// Per output: if the focused window is on that output, only it may show (a
+/// fullscreen focused window wins its output; a tiled one hides the fullscreen
+/// windows there). Otherwise the most recently stamped fullscreen window wins,
+/// ties broken by the higher id so the choice never depends on set order.
+/// Focus on a different output never hides anything.
+pub(crate) fn visible_fullscreen_ids(entries: &[(u32, String, u64)], focused: Option<(u32, &str)>) -> HashSet<u32> {
+    let mut outputs: Vec<&str> = entries.iter().map(|(_, o, _)| o.as_str()).collect();
+    outputs.sort_unstable();
+    outputs.dedup();
+    outputs
+        .into_iter()
+        .filter_map(|output| {
+            let mut here = entries.iter().filter(|(_, o, _)| o == output);
+            match focused {
+                Some((fid, foutput)) if foutput == output => here.find(|(id, _, _)| *id == fid).map(|(id, _, _)| *id),
+                _ => here.max_by_key(|(id, _, stamp)| (*stamp, *id)).map(|(id, _, _)| *id),
+            }
+        })
+        .collect()
 }
 
 /// Whether a connector colour-state change may be staged now.

@@ -1433,6 +1433,7 @@ fn connector_disconnected(
     };
 
     data.space.unmap_output(&surface.output);
+    data.output_disconnected_migrate(&surface.output);
     if let Some(global) = surface.global {
         data.display_handle.remove_global::<RubixState>(global);
     }
@@ -2140,23 +2141,27 @@ fn fullscreen_candidate_surface(
 
 /// The window id `fullscreen_scanout_target` would pick for `output`.
 ///
-/// Same containment test, returning the identity rather than the decode kind,
-/// so the diagnostic can tell "a different client is the candidate now" from
+/// Same ownership (fullscreen ON this output) and containment tests, returning
+/// the identity rather than the decode kind, so the diagnostic can tell "a different client is the candidate now" from
 /// "the same one is still failing".
 fn fullscreen_candidate_id(state: &RubixState, output: &Output) -> Option<u32> {
     let output_geo = state.space.output_geometry(output)?;
     state.fullscreen_windows.iter().copied().find(|id| {
-        state
-            .windows
-            .get(id)
-            .and_then(|window| state.space.element_bbox(window))
-            .is_some_and(|bbox| bbox.contains_rect(output_geo))
+        state.is_fullscreen_on(*id, output)
+            && state
+                .windows
+                .get(id)
+                .and_then(|window| state.space.element_bbox(window))
+                .is_some_and(|bbox| bbox.contains_rect(output_geo))
     })
 }
 
 fn fullscreen_scanout_target(state: &RubixState, output: &Output, hdr_capable: bool) -> Option<DecodeKind> {
     let output_geo = state.space.output_geometry(output)?;
     state.fullscreen_windows.iter().find_map(|id| {
+        if !state.is_fullscreen_on(*id, output) {
+            return None;
+        }
         let window = state.windows.get(id)?;
         let bbox = state.space.element_bbox(window)?;
         if !bbox.contains_rect(output_geo) {
@@ -2836,8 +2841,12 @@ fn log_scanout_format_mismatch(state: &RubixState, surface: &SurfaceData, states
     };
     for id in state.fullscreen_windows.iter() {
         let Some(window) = state.windows.get(id) else { continue };
-        // Same containment test `fullscreen_scanout_target` uses, so this
-        // reports on exactly the surface that was the promotion candidate.
+        // Same ownership and containment tests `fullscreen_scanout_target`
+        // uses, so this reports on exactly the surface that was the promotion
+        // candidate.
+        if !state.is_fullscreen_on(*id, &surface.output) {
+            continue;
+        }
         if !state.space.element_bbox(window).is_some_and(|bbox| bbox.contains_rect(output_geo)) {
             continue;
         }

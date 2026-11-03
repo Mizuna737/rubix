@@ -154,6 +154,7 @@ impl XwmHandler for RubixState {
         // at this point. The post-map `_NET_WM_STATE` ClientMessage path
         // (`fullscreen_request`) never fires for this case.
         let starts_fullscreen = window.is_fullscreen();
+        let requested = self.x11_requested_geometry.get(&window.window_id()).copied();
         let class = window.class();
         let title = window.title();
         let win = Window::new_x11_window(window);
@@ -161,7 +162,7 @@ impl XwmHandler for RubixState {
         self.windows.insert(id, win);
 
         if starts_fullscreen {
-            self.set_window_fullscreen(id, true);
+            self.set_window_fullscreen_on(id, true, None, requested);
             tracing::info!(
                 "X11 window {id} maps already fullscreen (pre-map _NET_WM_STATE): class={class:?} title={title:?}"
             );
@@ -180,8 +181,8 @@ impl XwmHandler for RubixState {
                 monitor.add_window(direction, id, focused_id.unwrap_or(0));
             }
         }
-        // Focus BEFORE laying out. `apply_layout` emits a rect for a fullscreen
-        // window only while it is focused, so laying out first hands a window
+        // Focus BEFORE laying out. A fullscreen window is hidden when another
+        // window on its output holds focus, so laying out first can hand a window
         // that mapped already fullscreen no rect at all -- it never reaches the
         // Space, and `sync_x11_iconic` immediately hides it for good measure.
         // Focus follows spawn (mirrors xdg_shell::new_toplevel): name the new id
@@ -241,6 +242,9 @@ impl XwmHandler for RubixState {
     }
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Kept across `unmapped_window` on purpose: a client that unmaps and
+        // remaps itself around going fullscreen still owes us its monitor choice.
+        self.x11_requested_geometry.remove(&window.window_id());
         remove_x11_window(self, &window);
     }
 
@@ -265,6 +269,7 @@ impl XwmHandler for RubixState {
             .map(|(id, _)| *id)
             .collect();
         let evicted = stale.len();
+        self.x11_requested_geometry.clear();
         for id in stale {
             self.remove_window_by_id(id);
         }
@@ -326,15 +331,46 @@ impl XwmHandler for RubixState {
 
         // Tiled: deny the client geometry, tiling owns it. Reply with our
         // current tile rect if we have one yet, else echo the request so the
-        // handshake completes. Fullscreen windows get the full output bounds.
+        // handshake completes. Fullscreen windows get their output's full bounds.
         let id = self.window_id_for_x11(&window);
+
+        // Remember what was asked, merged over the previous request (or where we
+        // last put the window) since either axis may be omitted. A game picks its
+        // monitor by positioning itself here, typically just before or after
+        // setting _NET_WM_STATE_FULLSCREEN.
+        let base = self
+            .x11_requested_geometry
+            .get(&window.window_id())
+            .copied()
+            .unwrap_or_else(|| window.last_configure());
+        let requested = Rectangle::<i32, Logical>::new(
+            (x.unwrap_or(base.loc.x), y.unwrap_or(base.loc.y)).into(),
+            (
+                w.map(|w| w as i32).unwrap_or(base.size.w),
+                h.map(|h| h as i32).unwrap_or(base.size.h),
+            )
+                .into(),
+        );
+        self.x11_requested_geometry.insert(window.window_id(), requested);
+
+        // An already-fullscreen game that repositions itself onto another
+        // monitor has changed its mind about which one it owns.
+        let mut retargeted = false;
+        if let Some(id) = id.filter(|i| self.fullscreen_windows.contains(i)) {
+            let outputs = self.output_geometries();
+            if let Some(name) = crate::state::output_containing_center(requested, &outputs)
+                && self.fullscreen_outputs.get(&id).map(|p| p.output.as_str()) != Some(name.as_str())
+            {
+                self.place_fullscreen(id, name);
+                retargeted = true;
+            }
+        }
 
         let rect = if let Some(id) = id {
             if self.fullscreen_windows.contains(&id) {
-                // Fullscreen: provide the full output geometry
-                self.active_output_geometry().map(|geo| {
-                    Rectangle::<i32, Logical>::new(geo.loc, geo.size)
-                })
+                // Fullscreen: provide the full geometry of the output it owns
+                self.fullscreen_output_for(id)
+                    .and_then(|output| self.space.output_geometry(&output))
             } else {
                 // Tiled: provide the current tile rect
                 self.window_rect(id).map(|rect| {
@@ -369,6 +405,10 @@ impl XwmHandler for RubixState {
         match rect {
             Some(rect) => {
                 let _ = window.configure(Some(rect));
+                if retargeted {
+                    self.apply_layout();
+                    self.ipc_dirty = true;
+                }
             }
             None => {
                 let current = window.geometry();
@@ -424,7 +464,9 @@ impl XwmHandler for RubixState {
             self.window_id_for_x11(&window),
         );
         if let Some(id) = self.window_id_for_x11(&window) {
-            self.set_window_fullscreen(id, true);
+            let requested = self.x11_requested_geometry.get(&window.window_id()).copied();
+            self.set_window_fullscreen_on(id, true, None, requested);
+            self.focus_fullscreen_requester(id);
             self.apply_layout();
             self.ipc_dirty = true;
         }

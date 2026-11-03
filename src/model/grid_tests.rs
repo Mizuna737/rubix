@@ -1229,3 +1229,76 @@
         assert_eq!(ws.monitors[1].active_window(), Some(1));
         assert_eq!(ws.monitors[0].count_windows(), 0);
     }
+
+    // ---- migrate_monitor_windows ----
+
+    fn column_ids(mon: &Monitor, col: usize) -> Vec<Vec<u32>> {
+        mon.columns[col].groups.iter().map(|g| g.window_ids()).collect()
+    }
+
+    #[test]
+    fn migrated_windows_stack_as_new_rows_in_the_active_column_in_source_order() {
+        let mut ws = Workspace::new();
+        ws.ensure_monitor(0, 2);
+        ws.ensure_monitor(1, 2);
+        ws.set_active_monitor(1);
+        ws.monitors[0].add_window(SplitDirection::Horizontal, 1, 0);
+        // Source: column 0 holds 10 then 11 (two rows), column 1 holds 12.
+        ws.monitors[1] = monitor_from(&[&[10, 11], &[12]], &[0, 0]);
+        ws.monitors[1].id = 1;
+
+        let moved = ws.migrate_monitor_windows(1, 0, None);
+
+        assert_eq!(moved, vec![10, 11, 12]);
+        assert_eq!(column_ids(&ws.monitors[0], 0), vec![vec![1], vec![10], vec![11], vec![12]]);
+        assert_eq!(ws.monitors[1].count_windows(), 0);
+        assert_eq!(ws.monitors[0].count_windows(), 4);
+    }
+
+    #[test]
+    fn migration_targets_the_destinations_active_column() {
+        let mut ws = Workspace::new();
+        ws.ensure_monitor(0, 2);
+        ws.ensure_monitor(1, 1);
+        ws.monitors[0].active_column = 1;
+        ws.monitors[1].add_window(SplitDirection::Horizontal, 5, 0);
+
+        ws.migrate_monitor_windows(1, 0, None);
+
+        assert_eq!(column_ids(&ws.monitors[0], 1), vec![vec![5]], "filled the empty active group in place");
+        assert_eq!(ws.monitors[0].active_column(), 1);
+        assert!(ws.monitors[0].columns[0].groups.iter().all(|g| g.layout.is_none()));
+    }
+
+    #[test]
+    fn migration_keeps_the_cursor_on_a_migrated_focused_window() {
+        let mut ws = two_head_workspace();
+        ws.monitors[1].grow_active_column();
+        ws.monitors[1].add_window(SplitDirection::Horizontal, 3, 0);
+        ws.migrate_monitor_windows(1, 0, Some(2));
+        assert_eq!(ws.monitors[0].active_window(), Some(2));
+    }
+
+    #[test]
+    fn migrating_an_empty_monitor_changes_nothing() {
+        let mut ws = Workspace::new();
+        ws.ensure_monitor(0, 1);
+        ws.ensure_monitor(1, 1);
+        ws.monitors[0].add_window(SplitDirection::Horizontal, 1, 0);
+        assert!(ws.migrate_monitor_windows(1, 0, None).is_empty());
+        assert_eq!(column_ids(&ws.monitors[0], 0), vec![vec![1]]);
+    }
+
+    #[test]
+    fn migrating_a_monitor_onto_itself_is_a_noop() {
+        let mut ws = two_head_workspace();
+        assert!(ws.migrate_monitor_windows(0, 0, None).is_empty());
+        assert_eq!(ws.monitors[0].count_windows(), 1);
+    }
+
+    #[test]
+    fn migrating_to_an_unknown_monitor_leaves_the_source_alone() {
+        let mut ws = two_head_workspace();
+        assert!(ws.migrate_monitor_windows(1, 9, None).is_empty());
+        assert_eq!(ws.monitors[1].count_windows(), 1);
+    }

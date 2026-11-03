@@ -35,6 +35,7 @@ inner_gap = 10
 # primary = true           # optional, defaults to false
 # hdr = true   # opt-in HDR (BT.2020/PQ) for this output; default false. Requires an HDR display.
 # wallpaper = "~/wallpapers/dp3.avif"   # optional; overrides [wallpaper] path for this output only
+# visible_columns = 1   # optional; overrides [layout] visible_columns for this output only
 #
 # [[output]]
 # name = "HDMI-A-1"

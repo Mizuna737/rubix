@@ -319,6 +319,7 @@ const OUTPUT_SCHEMA: &[(&str, Schema)] = &[
     ("transform", Schema::Leaf),
     ("hdr", Schema::Leaf),
     ("wallpaper", Schema::Leaf),
+    ("visible_columns", Schema::Leaf),
 ];
 
 const DECORATION_SCHEMA: &[(&str, Schema)] = &[

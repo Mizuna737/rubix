@@ -307,6 +307,48 @@
         assert!(parse_chord("Alt+Nonsense", NavAction::MoveToNewColumnRight).is_none());
     }
 
+    // ---- per-output visible_columns ----
+
+    #[test]
+    fn output_visible_columns_present_and_absent() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+
+            [[output]]
+            name = "DP-1"
+            position = [0, 0]
+            visible_columns = 1
+
+            [[output]]
+            name = "DP-3"
+            position = [3840, 0]
+        "#;
+        let raw: RawConfig = toml::from_str(text).expect("config parses");
+        let cfg = Config::resolve(raw);
+        assert_eq!(cfg.outputs[0].visible_columns, Some(1));
+        assert_eq!(cfg.outputs[1].visible_columns, None, "absent falls back to the global at bind time");
+        assert_eq!(cfg.visible_columns, 3);
+    }
+
+    #[test]
+    fn invalid_output_visible_columns_fails_parse_like_the_global() {
+        let text = r#"
+            [layout]
+            visible_columns = 3
+
+            [keybinds]
+
+            [[output]]
+            name = "DP-1"
+            position = [0, 0]
+            visible_columns = -1
+        "#;
+        assert!(toml::from_str::<RawConfig>(text).is_err());
+    }
+
     // ---- output config ----
 
     #[test]

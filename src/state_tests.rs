@@ -870,34 +870,182 @@ fn mouse_follows_focus_target_is_the_true_centre_when_fully_visible_on_one_outpu
 // exact reason (see `mouse_follows_focus_target` above). `fullscreen_veto`
 // follows the same pattern rather than introducing a new harness.
 
-use crate::state::fullscreen_veto;
+use crate::state::{fullscreen_veto, output_containing_center, select_fullscreen_output, visible_fullscreen_ids};
 use std::collections::HashSet;
 
 #[test]
-fn fullscreen_veto_suppresses_when_the_focused_window_is_fullscreen() {
+fn fullscreen_veto_suppresses_when_the_focused_window_is_fullscreen_under_the_pointer() {
     let mut fullscreen_windows = HashSet::new();
     fullscreen_windows.insert(7);
-    assert!(fullscreen_veto(&fullscreen_windows, Some(7)));
+    assert!(fullscreen_veto(&fullscreen_windows, Some(7), Some("DP-1"), Some("DP-1")));
+}
+
+#[test]
+fn fullscreen_veto_does_not_suppress_when_the_pointer_is_on_another_output() {
+    let mut fullscreen_windows = HashSet::new();
+    fullscreen_windows.insert(7);
+    assert!(!fullscreen_veto(&fullscreen_windows, Some(7), Some("DP-1"), Some("DP-3")));
 }
 
 #[test]
 fn fullscreen_veto_does_not_suppress_when_a_different_window_is_focused() {
     let mut fullscreen_windows = HashSet::new();
     fullscreen_windows.insert(7);
-    assert!(!fullscreen_veto(&fullscreen_windows, Some(3)));
+    assert!(!fullscreen_veto(&fullscreen_windows, Some(3), Some("DP-1"), Some("DP-1")));
 }
 
 #[test]
 fn fullscreen_veto_does_not_suppress_with_no_focused_window() {
     let mut fullscreen_windows = HashSet::new();
     fullscreen_windows.insert(7);
-    assert!(!fullscreen_veto(&fullscreen_windows, None));
+    assert!(!fullscreen_veto(&fullscreen_windows, None, None, Some("DP-1")));
 }
 
 #[test]
 fn fullscreen_veto_does_not_suppress_when_nothing_is_fullscreen() {
     let fullscreen_windows = HashSet::new();
-    assert!(!fullscreen_veto(&fullscreen_windows, Some(7)));
+    assert!(!fullscreen_veto(&fullscreen_windows, Some(7), Some("DP-1"), Some("DP-1")));
+}
+
+// ---- select_fullscreen_output (which monitor a fullscreen window owns) ----
+
+fn geo(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new((x, y).into(), (w, h).into())
+}
+
+fn two_outputs() -> Vec<(String, Rectangle<i32, Logical>)> {
+    vec![
+        ("DP-3".to_string(), geo(0, 0, 3440, 1440)),
+        ("DP-1".to_string(), geo(3440, 0, 3840, 2160)),
+    ]
+}
+
+fn at(x: i32, y: i32) -> Option<Point<i32, Logical>> {
+    Some(Point::from((x, y)))
+}
+
+#[test]
+fn select_output_prefers_the_named_output_over_everything() {
+    let picked = select_fullscreen_output(
+        Some("DP-3"),
+        Some(geo(3440, 0, 3840, 2160)),
+        at(3500, 10),
+        Some("DP-1"),
+        &two_outputs(),
+    );
+    assert_eq!(picked.as_deref(), Some("DP-3"));
+}
+
+#[test]
+fn select_output_uses_the_centre_of_the_requested_rect() {
+    let picked = select_fullscreen_output(None, Some(geo(3440, 0, 3840, 2160)), at(10, 10), Some("DP-3"), &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-1"));
+}
+
+#[test]
+fn select_output_requested_rect_straddling_outputs_goes_by_centre() {
+    // Mostly on DP-3 with its right edge poking into DP-1.
+    let picked = select_fullscreen_output(None, Some(geo(1000, 0, 3000, 1000)), None, None, &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-3"));
+}
+
+#[test]
+fn select_output_falls_to_location_when_request_centre_is_off_every_output() {
+    let picked = select_fullscreen_output(None, Some(geo(20000, 0, 100, 100)), at(3500, 10), Some("DP-3"), &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-1"));
+}
+
+#[test]
+fn select_output_uses_location_before_the_active_output() {
+    let picked = select_fullscreen_output(None, None, at(3500, 10), Some("DP-3"), &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-1"));
+}
+
+#[test]
+fn select_output_uses_the_active_output_without_location() {
+    let picked = select_fullscreen_output(None, None, None, Some("DP-1"), &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-1"));
+}
+
+#[test]
+fn select_output_falls_back_to_the_first_output() {
+    let picked = select_fullscreen_output(None, None, None, None, &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-3"));
+}
+
+#[test]
+fn select_output_skips_an_unplugged_hint_and_active_output() {
+    let picked = select_fullscreen_output(Some("HDMI-A-1"), None, None, Some("HDMI-A-1"), &two_outputs());
+    assert_eq!(picked.as_deref(), Some("DP-3"));
+}
+
+#[test]
+fn select_output_with_no_outputs_is_none() {
+    assert_eq!(select_fullscreen_output(Some("DP-1"), Some(geo(0, 0, 10, 10)), at(0, 0), Some("DP-1"), &[]), None);
+}
+
+#[test]
+fn output_containing_center_merges_to_the_right_monitor() {
+    // A partial X11 request (position only) merged over a 1920x1080 base: the
+    // centre lands on DP-1 even though the origin is on DP-3's right edge.
+    let merged = geo(3400, 0, 1920, 1080);
+    assert_eq!(output_containing_center(merged, &two_outputs()).as_deref(), Some("DP-1"));
+}
+
+// ---- visible_fullscreen_ids (per-output fullscreen visibility) ----
+
+fn entry(id: u32, output: &str, stamp: u64) -> (u32, String, u64) {
+    (id, output.to_string(), stamp)
+}
+
+#[test]
+fn fullscreen_stays_visible_when_focus_is_on_another_output() {
+    let entries = [entry(21, "DP-1", 1)];
+    let visible = visible_fullscreen_ids(&entries, Some((5, "DP-3")));
+    assert!(visible.contains(&21));
+}
+
+#[test]
+fn fullscreen_is_hidden_when_a_tiled_window_on_its_output_is_focused() {
+    let entries = [entry(21, "DP-1", 1)];
+    let visible = visible_fullscreen_ids(&entries, Some((5, "DP-1")));
+    assert!(visible.is_empty());
+}
+
+#[test]
+fn fullscreen_is_visible_when_it_is_focused_or_nothing_is_focused() {
+    let entries = [entry(21, "DP-1", 1)];
+    assert!(visible_fullscreen_ids(&entries, Some((21, "DP-1"))).contains(&21));
+    assert!(visible_fullscreen_ids(&entries, None).contains(&21));
+}
+
+#[test]
+fn two_fullscreen_on_one_output_the_focused_one_wins() {
+    let entries = [entry(21, "DP-1", 5), entry(22, "DP-1", 9)];
+    let visible = visible_fullscreen_ids(&entries, Some((21, "DP-1")));
+    assert_eq!(visible, HashSet::from([21]));
+}
+
+#[test]
+fn two_fullscreen_on_one_output_unfocused_the_most_recent_wins() {
+    let entries = [entry(21, "DP-1", 9), entry(22, "DP-1", 5)];
+    let visible = visible_fullscreen_ids(&entries, Some((5, "DP-3")));
+    assert_eq!(visible, HashSet::from([21]));
+}
+
+#[test]
+fn two_fullscreen_on_one_output_equal_stamps_break_ties_by_id() {
+    let entries = [entry(21, "DP-1", 3), entry(22, "DP-1", 3)];
+    assert_eq!(visible_fullscreen_ids(&entries, None), HashSet::from([22]));
+    let reversed = [entry(22, "DP-1", 3), entry(21, "DP-1", 3)];
+    assert_eq!(visible_fullscreen_ids(&reversed, None), HashSet::from([22]));
+}
+
+#[test]
+fn fullscreen_windows_on_different_outputs_are_each_visible() {
+    let entries = [entry(21, "DP-1", 1), entry(30, "DP-3", 2)];
+    let visible = visible_fullscreen_ids(&entries, Some((21, "DP-1")));
+    assert_eq!(visible, HashSet::from([21, 30]));
 }
 
 // ---- color_state_change_ready (the fullscreen-teardown colour debounce) ----
@@ -1035,4 +1183,24 @@ fn step_animations_tracks_pulse_lifetime() {
     state.feedback_pulse = Some(pulse_at(Instant::now() - Duration::from_secs(2), 1.0, 100));
     assert!(!state.step_animations());
     assert!(state.feedback_pulse.is_none());
+}
+
+// ---- select_migration_target ----
+
+#[test]
+fn migration_prefers_the_primary_when_connected() {
+    let remaining = vec!["HDMI-A-1".to_string(), "DP-3".to_string()];
+    assert_eq!(crate::state::select_migration_target(Some("DP-3"), &remaining).as_deref(), Some("DP-3"));
+}
+
+#[test]
+fn migration_falls_back_to_any_remaining_output_when_primary_is_gone() {
+    let remaining = vec!["HDMI-A-1".to_string()];
+    assert_eq!(crate::state::select_migration_target(Some("DP-3"), &remaining).as_deref(), Some("HDMI-A-1"));
+    assert_eq!(crate::state::select_migration_target(None, &remaining).as_deref(), Some("HDMI-A-1"));
+}
+
+#[test]
+fn migration_has_no_target_when_nothing_remains() {
+    assert_eq!(crate::state::select_migration_target(Some("DP-3"), &[]), None);
 }

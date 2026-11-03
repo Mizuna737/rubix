@@ -792,17 +792,28 @@ impl RubixState {
 
     fn focus_by_id_raising(&mut self, id: u32, raise: bool) {
         let Some(window) = self.windows.get(&id).cloned() else { return; };
-        // Captured before focus moves: `apply_layout` hands a fullscreen window
-        // a rect ONLY while it is focused, so focus entering or leaving the
-        // fullscreen set changes the layout even though the grid is untouched.
+        // Captured before focus moves: which fullscreen windows `apply_layout`
+        // shows depends on what is focused, so focus changing that set
+        // changes the layout even though the grid is untouched.
         let previous_focus = self.focused_window_id();
+        let visible_fullscreen_before = self.visible_fullscreen_set(previous_focus);
         // X11 windows focus as their X11Surface so input focus is actually
         // driven (XSetInputFocus/WM_TAKE_FOCUS); wayland windows as wl_surface.
         let Some(target) = KeyboardFocusTarget::from_window(&window) else { return; };
 
         // The window's own head becomes the active one, so nav chords act on
         // what the user just selected rather than wherever the cursor was left.
-        if let Some(monitor_id) = self.workspace.get_monitor_id_by_window_id(id) {
+        // A fullscreen window is outside the grid, so its monitor is the one
+        // whose output it owns.
+        if self.fullscreen_windows.contains(&id) {
+            if let Some(owned) = self.fullscreen_output_for(id) {
+                if let Some(monitor_id) = owned.user_data().get::<crate::state::MonitorId>().map(|m| m.0) {
+                    self.set_active_monitor(monitor_id);
+                }
+                // Focusing it makes it the one that wins a shared output.
+                self.place_fullscreen(id, owned.name());
+            }
+        } else if let Some(monitor_id) = self.workspace.get_monitor_id_by_window_id(id) {
             self.set_active_monitor(monitor_id);
         }
 
@@ -868,7 +879,7 @@ impl RubixState {
         self.reconcile_focus_state();
 
         // Re-lay-out when the reveal restructured something, OR when focus
-        // crossed the fullscreen set in either direction.
+        // changed which fullscreen windows are shown.
         //
         // The reveal half: AlreadyVisible and None leave the grid byte-identical,
         // and an unconditional apply_layout here would take the snap path --
@@ -878,8 +889,8 @@ impl RubixState {
         //
         // The fullscreen half: fullscreen windows are out of the grid, so the
         // reveal is always a no-op for them and the test above never fires. But
-        // `apply_layout` only emits a rect for the *focused* fullscreen window,
-        // so focus arriving at one is precisely when it needs a layout pass. Any
+        // `apply_layout` decides their visibility from focus (per output), so
+        // focus arriving at one is precisely when it may need a layout pass. Any
         // client that requested fullscreen before its first commit hits this: the
         // map path lays out first and focuses second, so the window is unfocused
         // at layout time, gets no rect, and never reaches the Space -- invisible
@@ -890,7 +901,8 @@ impl RubixState {
         // settle tweens on every focus change while a game sat unfocused in the
         // background, killing nav animation for the whole session.
         let crossed_fullscreen = self.fullscreen_windows.contains(&id)
-            || previous_focus.is_some_and(|prev| self.fullscreen_windows.contains(&prev));
+            || previous_focus.is_some_and(|prev| self.fullscreen_windows.contains(&prev))
+            || self.visible_fullscreen_set(Some(id)) != visible_fullscreen_before;
         if crossed_fullscreen
             || matches!(revealed, Some(RevealKind::Scrolled { .. }) | Some(RevealKind::Rotated) | Some(RevealKind::Swapped))
         {

@@ -457,6 +457,10 @@ pub struct OutputConfig {
     /// Wallpaper for this output specifically, overriding `[wallpaper] path`.
     /// `None` falls back to the global one; see src/wallpaper.rs.
     pub wallpaper: Option<PathBuf>,
+    /// Columns instantiated on this output's monitor, overriding `[layout]
+    /// visible_columns`. `None` falls back to the global one. Like the global
+    /// value it only seeds the monitor when it is created.
+    pub visible_columns: Option<usize>,
 }
 
 /// A resolved chord: the exact modifier set and keysym to match, plus its action.
@@ -589,6 +593,8 @@ struct RawOutput {
     hdr: bool,
     #[serde(default)]
     wallpaper: Option<String>,
+    #[serde(default)]
+    visible_columns: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -773,6 +779,7 @@ impl Config {
                 transform: o.transform.as_deref().and_then(parse_transform).unwrap_or(Transform::Normal),
                 hdr: o.hdr,
                 wallpaper: o.wallpaper.map(expand_tilde),
+                visible_columns: o.visible_columns,
             })
             .collect();
 

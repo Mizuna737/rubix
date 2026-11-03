@@ -81,6 +81,7 @@ impl XdgShellHandler for RubixState {
             // scanout target iterate it regardless of whether the id is
             // actually a live, tracked window.
             self.fullscreen_windows.remove(&id);
+            self.fullscreen_outputs.remove(&id);
             tracing::info!(
                 "unmapped toplevel destroyed -> window {id} ({} still pending)",
                 self.unmapped.len(),
@@ -196,11 +197,13 @@ impl XdgShellHandler for RubixState {
         // TODO popup grabs
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, _wl_output: Option<wl_output::WlOutput>) {
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, wl_output: Option<wl_output::WlOutput>) {
         let wl_surface = surface.wl_surface();
+        let hint = wl_output.as_ref().and_then(smithay::output::Output::from_resource).map(|o| o.name());
         if let Some((id, _)) = self.windows.iter().find(|(_, w)| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface)) {
             let id = *id;
-            self.set_window_fullscreen(id, true);
+            self.set_window_fullscreen_on(id, true, hint.as_deref(), None);
+            self.focus_fullscreen_requester(id);
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
             });
@@ -223,7 +226,15 @@ impl XdgShellHandler for RubixState {
         {
             let id = *id;
             self.fullscreen_windows.insert(id);
-            let output_size = self.active_output_geometry().map(|geo| geo.size);
+            let output = self.resolve_fullscreen_output(id, hint.as_deref(), None);
+            let output_size = output
+                .as_ref()
+                .and_then(|name| self.space.outputs().find(|o| &o.name() == name))
+                .and_then(|o| self.space.output_geometry(o))
+                .map(|geo| geo.size);
+            if let Some(name) = output {
+                self.place_fullscreen(id, name);
+            }
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
                 if let Some(size) = output_size {
@@ -256,6 +267,7 @@ impl XdgShellHandler for RubixState {
         {
             let id = *id;
             self.fullscreen_windows.remove(&id);
+            self.fullscreen_outputs.remove(&id);
             surface.with_pending_state(|state| {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
             });
@@ -330,17 +342,6 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
 }
 
 impl RubixState {
-    /// Full output rectangle of the active monitor, ignoring layer-shell
-    /// exclusive zones -- what fullscreen windows must be sized to.
-    pub(crate) fn active_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
-        let id = self.workspace.active_monitor()?.id;
-        let output = self
-            .space
-            .outputs()
-            .find(|o| o.user_data().get::<crate::state::MonitorId>().is_some_and(|m| m.0 == id))?;
-        self.space.output_geometry(output)
-    }
-
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
@@ -460,6 +461,23 @@ impl RubixState {
     pub fn move_focused_window_to_monitor(&mut self, motion: isize) {
         let Some(id) = self.focused_window_id() else { return };
         let Some(dest_id) = self.workspace.monitor_id_by_offset(motion) else { return };
+        if self.fullscreen_windows.contains(&id) {
+            // Fullscreen windows are outside the grid, so the model has nothing
+            // to move; hand the window the destination output and let
+            // apply_layout size and map it there.
+            let dest_output = self
+                .space
+                .outputs()
+                .find(|o| o.user_data().get::<crate::state::MonitorId>().is_some_and(|m| m.0 == dest_id))
+                .map(|o| o.name());
+            if let Some(name) = dest_output {
+                self.place_fullscreen(id, name);
+                self.set_active_monitor(dest_id);
+                self.apply_layout();
+                self.ipc_dirty = true;
+            }
+            return;
+        }
         // Split beside whatever is focused on the DESTINATION, along that
         // window's longer axis -- the rule new windows follow. Its rect has to be
         // computed against the destination's own output bounds, so `window_rect`

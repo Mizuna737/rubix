@@ -793,6 +793,50 @@ impl Workspace {
         true
     }
 
+    /// Empty `src_id` into `dest_id`, for an output that was unplugged.
+    ///
+    /// Every window of the source -- column-major, then row, then tree order --
+    /// lands in its own new row of the destination's active column, so the
+    /// source's reading order survives top-to-bottom. The destination's active
+    /// group is filled in place when it is empty (a fresh monitor's resting
+    /// state) rather than leaving a blank row above the migrants. The source
+    /// monitor itself stays in the list, empty, so the same output reconnecting
+    /// later binds to it cleanly.
+    ///
+    /// The cursor follows `focused` when it was one of the migrants; otherwise
+    /// the destination's own cursor is left on the last row written. Returns
+    /// the migrated ids in placement order. Does nothing for `src_id ==
+    /// dest_id` or an unknown id.
+    pub fn migrate_monitor_windows(&mut self, src_id: u32, dest_id: u32, focused: Option<u32>) -> Vec<u32> {
+        if src_id == dest_id {
+            return Vec::new();
+        }
+        let Some(src) = self.monitors.iter().find(|m| m.id == src_id) else { return Vec::new() };
+        if !self.monitors.iter().any(|m| m.id == dest_id) {
+            return Vec::new();
+        }
+        let ids: Vec<u32> = src
+            .columns
+            .iter()
+            .flat_map(|c| c.groups.iter())
+            .flat_map(|g| g.window_ids())
+            .collect();
+        for &id in &ids {
+            if let Some(src) = self.monitor_mut(src_id) {
+                src.remove_window(id);
+            }
+            let dest = self.monitor_mut(dest_id).expect("dest checked above");
+            if dest.active_group_mut().layout.is_some() {
+                dest.grow_active_column();
+            }
+            dest.active_group_mut().add_window(SplitDirection::Horizontal, id, 0);
+        }
+        if let Some(f) = focused.filter(|f| ids.contains(f)) {
+            self.monitor_mut(dest_id).expect("dest checked above").focus_window(f);
+        }
+        ids
+    }
+
     pub fn get_monitor_id_by_window_id(&self, window_id: u32) -> Option<u32> {
         for monitor in self.monitors.iter() {
             for column in monitor.columns.iter() {

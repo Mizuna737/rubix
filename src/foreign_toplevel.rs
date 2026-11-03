@@ -149,8 +149,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ToplevelHandleData> for RubixState {
             //
             //   fullscreen -- outside the grid entirely. Focusing a hidden X11
             //   fullscreen client is enough to restore it: `apply_layout` admits
-            //   a fullscreen window to the visible set exactly when it holds
-            //   focus, and `sync_x11_iconic` un-hides whatever is visible.
+            //   a fullscreen window to the visible set when it holds focus (or
+            //   nothing else on its output does), and `sync_x11_iconic` un-hides
+            //   whatever is visible.
             //
             //   tiled but off-screen -- `Monitor::reveal_window` scrolls its
             //   column to the right row, or trades its group into the active
