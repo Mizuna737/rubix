@@ -58,6 +58,12 @@ impl WlrLayerShellHandler for RubixState {
         }
     }
 
+    // The xdg new_popup hook fires before get_popup assigns the layer parent, so
+    // positioning there finds no root; this is the first point it can be done.
+    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: smithay::wayland::shell::xdg::PopupSurface) {
+        self.unconstrain_popup(&popup);
+    }
+
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         // If the dismissed layer (e.g. rofi) currently holds keyboard focus,
         // hand focus back to the model's active window rather than leaving it

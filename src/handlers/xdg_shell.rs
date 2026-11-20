@@ -1,5 +1,8 @@
 use smithay::{
-    desktop::{find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window},
+    desktop::{
+        find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, PopupKind, PopupManager, Space,
+        Window, WindowSurfaceType,
+    },
     input::{
         pointer::{Focus, GrabStartData as PointerGrabStartData},
         Seat,
@@ -342,7 +345,7 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
 }
 
 impl RubixState {
-    fn unconstrain_popup(&self, popup: &PopupSurface) {
+    pub(crate) fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
@@ -351,6 +354,7 @@ impl RubixState {
             .elements()
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
         else {
+            self.unconstrain_layer_popup(popup, &root);
             return;
         };
 
@@ -419,6 +423,32 @@ impl RubixState {
                 state.positioner.get_unconstrained_geometry(output_target)
             };
         });
+    }
+
+    // Popups rooted on a layer surface (waybar tooltips): no tile to prefer,
+    // so constrain to the layer's output. Layer geometry is output-local.
+    fn unconstrain_layer_popup(&self, popup: &PopupSurface, root: &WlSurface) {
+        for output in self.space.outputs() {
+            let map = layer_map_for_output(output);
+            let Some(layer) = map.layer_for_surface(root, WindowSurfaceType::TOPLEVEL) else {
+                continue;
+            };
+            let (Some(layer_geo), Some(output_geo)) = (map.layer_geometry(layer), self.space.output_geometry(output))
+            else {
+                return;
+            };
+            // Resolved outside with_pending_state: see the deadlock note in unconstrain_popup.
+            let toplevel_coords = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+            let target = Rectangle::<i32, Logical>::new(
+                Point::from((0, 0)) - layer_geo.loc - toplevel_coords,
+                output_geo.size,
+            );
+            drop(map);
+            popup.with_pending_state(|state| {
+                state.geometry = state.positioner.get_unconstrained_geometry(target);
+            });
+            return;
+        }
     }
 
     pub(crate) fn focused_window_id(& self) -> Option<u32> {
