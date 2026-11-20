@@ -32,7 +32,7 @@
   "margin-right": 24,
   "spacing": 4,
 
-  "modules-left": ["custom/waStatus", "custom/vramArbiter"],
+  "modules-left": ["custom/waStatus", "custom/vramArbiter", "custom/wearRetrain"],
   "modules-center": ["custom/rubix"],
   "modules-right": ["cpu", "memory", "network", "custom/volume", "tray", "custom/clock"],
 
@@ -58,6 +58,16 @@
     "return-type": "json",
     "escape": false,
     "restart-interval": 2
+  },
+
+  // --- Left: headphone wearable model retrain (click: train, right-click: promote) ---
+  "custom/wearRetrain": {
+    "exec": "python3 ~/Projects/dotfiles-tools/Scripts/wearRetrainBar.py",
+    "return-type": "json",
+    "escape": false,
+    "restart-interval": 2,
+    "on-click": "setsid -f ~/.local/share/gesturecontrol/venv/bin/python3 ~/gesturecontrol/tests/retrainWearable.py train",
+    "on-click-right": "setsid -f ~/.local/share/gesturecontrol/venv/bin/python3 ~/gesturecontrol/tests/retrainWearable.py promote"
   },
 
   // --- Right: system stats via built-ins ---
