@@ -118,6 +118,16 @@ enum Request {
     // duration to one second. Replies `Reply::Ok`, or `Reply::Error` for an
     // unknown edge.
     FeedbackPulse { edge: String, intensity: f32, duration_ms: u64 },
+    // Tell Rubix the user is active without any input event: restarts the idle
+    // screen-off countdown and pings ext-idle-notify listeners exactly like
+    // keyboard/pointer input (`RubixState::notify_activity`). Does NOT power a
+    // blanked screen back on -- use `set_screen_power` for that. For presence
+    // detectors that see the user when no input arrives (`rubix idle poke`
+    // sends this):
+    //   printf '{"type":"notify_activity"}\n' | \
+    //     socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rubix.sock"
+    // Replies `Reply::Ok`.
+    NotifyActivity,
 }
 
 #[derive(Serialize)]
@@ -337,6 +347,10 @@ fn handle_lines(client: &mut ClientIo, data: &mut RubixState) -> bool {
             }
             Ok(Request::SetScreenPower { on, output }) => {
                 data.set_screen_power(on, output.as_deref());
+                Reply::Ok
+            }
+            Ok(Request::NotifyActivity) => {
+                data.notify_activity();
                 Reply::Ok
             }
             Ok(Request::ScreenStatus) => Reply::ScreenStatus {
@@ -653,5 +667,11 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn notify_activity_request_deserializes() {
+        let request = serde_json::from_str::<Request>(r#"{"type":"notify_activity"}"#).unwrap();
+        assert!(matches!(request, Request::NotifyActivity));
     }
 }

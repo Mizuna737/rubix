@@ -586,6 +586,47 @@ fn handle_screen_subcommand(args: &[String]) -> Option<i32> {
     Some(code)
 }
 
+fn handle_idle_subcommand(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("idle") {
+        return None;
+    }
+    if args.get(1).map(String::as_str) != Some("poke") {
+        eprintln!("usage: rubix idle poke");
+        return Some(2);
+    }
+
+    let Some(socket_path) = resolve_rubix_socket() else {
+        eprintln!("rubix idle: no rubix*.sock found in $XDG_RUNTIME_DIR -- is the compositor running?");
+        return Some(1);
+    };
+    let mut stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rubix idle: failed to connect to {}: {e}", socket_path.display());
+            return Some(1);
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+
+    use std::io::Write;
+    if let Err(e) = stream.write_all(b"{\"type\":\"notify_activity\"}\n") {
+        eprintln!("rubix idle: write failed: {e}");
+        return Some(1);
+    }
+    match read_ipc_reply(&mut stream) {
+        Some(reply) if reply.get("type").and_then(|t| t.as_str()) == Some("error") => {
+            let msg = reply.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            eprintln!("rubix idle: compositor returned an error: {msg}");
+            Some(1)
+        }
+        Some(_) => Some(0),
+        None => {
+            eprintln!("rubix idle: no reply from compositor (timed out or connection closed)");
+            Some(1)
+        }
+    }
+}
+
 /// Locate Rubix's IPC socket. Mirrors `contrib/waybar/rubixBar.py`'s
 /// `socketPath()` exactly, so the CLI agrees with every other IPC client
 /// about which socket a running session actually bound: prefer the
@@ -696,6 +737,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // bring-up) is untouched by this.
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = handle_screen_subcommand(&cli_args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = handle_idle_subcommand(&cli_args) {
         std::process::exit(code);
     }
     if let Some(code) = handle_palette_subcommand(&cli_args) {
